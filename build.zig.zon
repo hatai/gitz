@@ -1,0 +1,17 @@
+.{
+    .name = .git_tui,
+    .version = "0.1.0",
+    .fingerprint = 0x56643ebf48ac5396,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zigzag = .{
+            .url = "https://github.com/meszmate/zigzag/archive/refs/tags/v0.1.5.tar.gz",
+            .hash = "zigzag-0.1.2-YXwYS17aEQBlpxPETTrhY5leFh7vV0DpnXJbHogs4Lsv",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
