@@ -8,7 +8,7 @@
 test {
     _ = @import("git/process.zig"); // Task 2
     _ = @import("git/status.zig"); // Task 3
-    // _ = @import("git/commands.zig");  // Task 4
+    _ = @import("git/commands.zig"); // Task 4
     // _ = @import("model.zig");         // Task 5
     // _ = @import("messages.zig");      // Task 6
     // _ = @import("update.zig");        // Task 7
