@@ -37,6 +37,11 @@ const Cwd = process.Cwd;
 const ResultQueue = struct {
     mutex: std.Io.Mutex = .init,
     items: std.ArrayList(Msg) = .empty,
+    /// ワーカー完了フラグ。キュー drain とは独立にワーカーの終端到達を通知する。
+    /// workerThread が結果 push 後に markWorkerDone で true にし、reapWorker が takeWorkerDone
+    /// で取得即 false に戻す（join 後）。キュー長で完了検出すると drain との競合で取りこぼし、
+    /// worker が恒久 non-null になり全副作用が固まる事故が起きる（review Issue 2）ため独立化。
+    worker_done: bool = false,
 
     fn push(self: *ResultQueue, io: std.Io, a: std.mem.Allocator, msg: Msg) void {
         self.mutex.lockUncancelable(io);
@@ -48,10 +53,20 @@ const ResultQueue = struct {
         };
     }
 
-    fn len(self: *ResultQueue, io: std.Io) usize {
+    /// ワーカーが終端に到達したことを通知する（push と同一 mutex 区間で呼ぶ）。
+    fn markWorkerDone(self: *ResultQueue, io: std.Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.items.items.len;
+        self.worker_done = true;
+    }
+
+    /// ワーカー完了フラグを取得しつつ false へ戻す（取りこぼし防止のため取得即クリア）。
+    fn takeWorkerDone(self: *ResultQueue, io: std.Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const done = self.worker_done;
+        self.worker_done = false;
+        return done;
     }
 
     /// drain した Msg を out に移し替える（呼び出し側が所有・各 deinit する）。
@@ -91,15 +106,23 @@ var g_app_ready: bool = false;
 
 /// ワーカースレッドのエントリ。AppCmd を実行し結果 Msg をキューへ push して終了する。
 /// `cmd` の所有権はワーカーが受け取り、ここで deinit する（メインは手放し済み）。
+/// スレッド本体。workerRun を実行し、**スレッド経路でのみ** 完了を通知する。
+/// markWorkerDone はここでだけ呼ぶ: 同期フォールバック（spawn 失敗時）は worker==null の
+/// まま workerRun を直接呼ぶため、そこで done を立てると次回の正規ワーカーを stale done で
+/// 即 join してしまい async 性が壊れる（review Issue 2 のリグレッション）。
+fn workerThread(app: *App, cmd: AppCmd) void {
+    workerRun(app, cmd);
+    app.queue.markWorkerDone(app.io);
+}
+
 fn workerRun(app: *App, cmd_in: AppCmd) void {
     var cmd = cmd_in;
     defer cmd.deinit(app.gpa);
     const result: Msg = appcmd.run(app.gpa, app.io, app.cwd, cmd) catch |err| {
         // appcmd.run 自体が失敗（OOM/spawn 不能等）。エラー文を git_error として返す。
         const text = std.fmt.allocPrint(app.gpa, "git 実行エラー: {s}", .{@errorName(err)}) catch {
-            // 文言確保すら失敗。固定文言（複製）で代替。これも失敗なら結果を諦める
-            // （reapWorker はキューが空なら join しないが、deinit 時に必ず join するので
-            //  ハングしない: worker は return して終了済み）。
+            // 文言確保すら失敗。固定文言（複製）で代替。これも失敗なら結果 push を諦める。
+            // 完了通知は呼び出し元 workerThread の markWorkerDone が担うのでハングしない。
             const fallback = app.gpa.dupe(u8, "git 実行エラー") catch return;
             app.queue.push(app.io, app.gpa, .{ .git_error = fallback });
             return;
@@ -120,8 +143,12 @@ fn dispatchSideEffect(app: *App, cmd: AppCmd) void {
         return;
     }
     app.model.busy = true; // reducer は busy を立てない（結果で false にするのみ）。ここで立てる。
-    app.worker = std.Thread.spawn(.{}, workerRun, .{ app, cmd }) catch {
+    app.worker = std.Thread.spawn(.{}, workerThread, .{ app, cmd }) catch {
         // spawn 失敗時はメインスレッドで同期実行（degraded だがクラッシュしない）。
+        // worker は null のままなので reapWorker は join せず、worker_done も触らない（＝
+        // 次回の正規ワーカーが stale done で誤 join される事故を避ける）。busy は結果 Msg を
+        // reducer が処理する際に下りる（status_loaded/diff_loaded/committed/git_error 全てが
+        // busy=false にする）ので、ここでは触らない。
         app.worker = null;
         workerRun(app, cmd);
         return;
@@ -170,11 +197,12 @@ fn syncCommitText(app: *App) void {
 /// ワーカー完了を回収する。完了していれば join し、pending があれば次を起動する。
 fn reapWorker(app: *App) void {
     if (app.worker) |w| {
-        // join はブロックするので、結果がキューに入った（＝ワーカーが終端に到達）ことを
-        // 確認してから join する。worker は push 直後に return するため、push 済みなら
-        // join は即時返る（ハングしない）。
-        const has_result = app.queue.len(app.io) > 0;
-        if (has_result) {
+        // join はブロックするので、ワーカーが終端に到達した（markWorkerDone 済み）ことを
+        // 確認してから join する。完了検出はキュー長ではなく独立フラグで行う: キュー drain
+        // とのインターリーブで完了を取りこぼし、worker が恒久的に non-null になる事故を防ぐ
+        //（review Issue 2）。worker は markWorkerDone 直後に return するため join は即時返る。
+        // takeWorkerDone は取得即クリアなので、結果が既に drain 済みでも完了を取りこぼさない。
+        if (app.queue.takeWorkerDone(app.io)) {
             w.join();
             app.worker = null;
             app.model.busy = false;
@@ -355,8 +383,11 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(root);
 
     // 2. Model 初期化 + has_head / branch を設定。以後 cwd は常に root 相対。
+    // 不変条件（重要・review Issue 1）: ここ（Model.init 成功）から g_app への浅いコピーまでの
+    // 間に **エラー経路（try）を挟まないこと**。挟む間に失敗すると m を解放する errdefer が
+    // 必要になる。現状の has_head/branch 設定は catch 吸収で try を使わないため、この区間に
+    // errdefer は不要。所有権 errdefer はコピー直後に g_app.model を対象として張る。
     var m = try Model.init(gpa, root);
-    errdefer m.deinit();
     m.mouse_enabled = !no_mouse;
     const cwd_root: Cwd = .{ .path = m.repo_root };
     m.has_head = cmds.hasHead(gpa, io, cwd_root) catch false;
@@ -374,6 +405,16 @@ pub fn main(init: std.process.Init) !void {
     };
     g_app_ready = true;
 
+    // 所有権ハンドオフ管理（review Issue 1）。浅いコピー後の**生きた所有者は g_app.model** で
+    // あり、m は同一ヒープを指す stale エイリアスになる（seedInitialStatus は g_app.model を
+    // 変異させ files/diff_text を確保し、setStr で再確保もする）。よって失敗時に解放すべきは
+    // g_app.model であって m ではない（m を解放すると live バッファの leak / 旧ポインタの
+    // 二重 free になる）。この窓では textarea は undefined・queue は空なので、解放対象は
+    // model だけに限定する（より広い g_app 後始末は呼ばない）。program 構築成功後は
+    // program.deinit が g_app.model を解放するので、その時点で handed_off を立て打ち切る。
+    var handed_off = false;
+    errdefer if (!handed_off) g_app.model.deinit();
+
     // 3. 初回 status を同期ロード（start() 前なので worker も TUI も未起動）。
     seedInitialStatus(&g_app);
 
@@ -386,6 +427,10 @@ pub fn main(init: std.process.Init) !void {
     );
     g_program = &program;
     defer program.deinit(); // RuntimeModel.deinit を呼び textarea/model/queue を後始末
+    // ここで model の所有権は program へ移譲された。以後の失敗（start/tick エラー）は
+    // program.deinit（上の defer）が g_app.model を 1 度だけ解放する。m への errdefer を
+    // 打ち切り、同一ポインタの二重 free を防ぐ（review Issue 1）。
+    handed_off = true;
 
     try program.start();
     while (program.isRunning()) {
