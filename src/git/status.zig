@@ -73,22 +73,20 @@ fn appendOrdinary(
     const x = xy[0];
     const y = xy[1];
     if (x != '.') {
-        const op = try list.addOne(a);
         const is_x_rename = (x == 'R' or x == 'C');
-        op.* = .{
-            .path = try a.dupe(u8, path),
-            .orig_path = if (is_x_rename) (if (orig_path) |o| try a.dupe(u8, o) else null) else null,
-            .section = .staged,
-        };
+        const p = try a.dupe(u8, path);
+        errdefer a.free(p);
+        const o: ?[]u8 = if (is_x_rename) (if (orig_path) |op| try a.dupe(u8, op) else null) else null;
+        errdefer if (o) |oo| a.free(oo);
+        try list.append(a, .{ .path = p, .orig_path = o, .section = .staged });
     }
     if (y != '.') {
-        const op = try list.addOne(a);
         const is_y_rename = (y == 'R' or y == 'C');
-        op.* = .{
-            .path = try a.dupe(u8, path),
-            .orig_path = if (is_y_rename) (if (orig_path) |o| try a.dupe(u8, o) else null) else null,
-            .section = .unstaged,
-        };
+        const p = try a.dupe(u8, path);
+        errdefer a.free(p);
+        const o: ?[]u8 = if (is_y_rename) (if (orig_path) |op| try a.dupe(u8, op) else null) else null;
+        errdefer if (o) |oo| a.free(oo);
+        try list.append(a, .{ .path = p, .orig_path = o, .section = .unstaged });
     }
 }
 
@@ -172,6 +170,24 @@ test "dual section: XY=MM yields both staged and unstaged entries" {
     try std.testing.expectEqual(Section.unstaged, entries[1].section);
     try std.testing.expectEqualStrings("both.txt", entries[0].path);
     try std.testing.expectEqualStrings("both.txt", entries[1].path);
+}
+
+fn parseAndFree(a: std.mem.Allocator, raw: []const u8) ParseError!void {
+    const entries = try parse(a, raw);
+    for (entries) |*e| e.deinit(a);
+    a.free(entries);
+}
+
+test "no invalid free / leak when allocation fails on any step (dual section)" {
+    // MM は staged/unstaged の 2 エントリを生成し dupe を複数回呼ぶ。
+    // どの dupe が OOM になっても errdefer が未初期化スロットを free しないことを保証する。
+    const raw = "1 MM N... 100644 100644 100644 0000000 0000000 both.txt\x00";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseAndFree, .{raw});
+}
+
+test "no invalid free / leak when allocation fails on any step (rename)" {
+    const raw = "2 R. N... 100644 100644 100644 0000000 0000000 R100 new.txt\x00old.txt\x00";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseAndFree, .{raw});
 }
 
 test "unstaged-side rename (XY=.R) puts orig_path on the unstaged entry" {
