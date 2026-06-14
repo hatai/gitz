@@ -32,10 +32,13 @@ pub fn unstageArgv(a: std.mem.Allocator, has_head: bool, path: []const u8, orig_
 pub fn diffArgv(a: std.mem.Allocator, section: Section, path: []const u8, orig_path: ?[]const u8) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(a);
+    // `-c core.quotePath=false` を git の直後に挿入し、日本語ファイル名の diff ヘッダ
+    // (`diff --git` / `---` / `+++`) を octal エスケープ（`\346` 等）せず raw UTF-8 で出す。
+    // 実 git で日本語ファイル名がエスケープされる問題への対処（受け入れ基準5）。
     switch (section) {
-        .staged => try list.appendSlice(a, &.{ "git", "diff", "--cached", "--", path }),
-        .unstaged => try list.appendSlice(a, &.{ "git", "diff", "--", path }),
-        .untracked => try list.appendSlice(a, &.{ "git", "diff", "--no-index", "--", "/dev/null", path }),
+        .staged => try list.appendSlice(a, &.{ "git", "-c", "core.quotePath=false", "diff", "--cached", "--", path }),
+        .unstaged => try list.appendSlice(a, &.{ "git", "-c", "core.quotePath=false", "diff", "--", path }),
+        .untracked => try list.appendSlice(a, &.{ "git", "-c", "core.quotePath=false", "diff", "--no-index", "--", "/dev/null", path }),
     }
     if (orig_path) |o| if (section != .untracked) try list.append(a, o);
     return list.toOwnedSlice(a);
@@ -117,24 +120,37 @@ test "diffArgv untracked uses --no-index against /dev/null" {
     const a = std.testing.allocator;
     const argv = try diffArgv(a, .untracked, "new.txt", null);
     defer a.free(argv);
-    try std.testing.expectEqualStrings("--no-index", argv[2]);
-    try std.testing.expectEqualStrings("/dev/null", argv[4]);
+    // git, -c, core.quotePath=false が先頭に入るため index は +2 シフト。
+    try std.testing.expectEqualStrings("--no-index", argv[4]);
+    try std.testing.expectEqualStrings("/dev/null", argv[6]);
 }
 
 test "diffArgv staged uses --cached" {
     const a = std.testing.allocator;
     const argv = try diffArgv(a, .staged, "f.txt", null);
     defer a.free(argv);
-    try std.testing.expectEqualStrings("diff", argv[1]);
-    try std.testing.expectEqualStrings("--cached", argv[2]);
+    try std.testing.expectEqualStrings("diff", argv[3]);
+    try std.testing.expectEqualStrings("--cached", argv[4]);
 }
 
 test "diffArgv untracked ignores orig_path" {
     const a = std.testing.allocator;
     const argv = try diffArgv(a, .untracked, "new.txt", "old.txt");
     defer a.free(argv);
-    // /dev/null + new.txt のみ。orig_path は untracked では無視される。
-    try std.testing.expectEqual(@as(usize, 6), argv.len);
+    // -c core.quotePath=false(+2) + /dev/null + new.txt のみ。orig_path は untracked では無視される。
+    try std.testing.expectEqual(@as(usize, 8), argv.len);
+}
+
+test "diffArgv injects -c core.quotePath=false right after git (all sections)" {
+    const a = std.testing.allocator;
+    inline for (.{ Section.staged, Section.unstaged, Section.untracked }) |sec| {
+        const argv = try diffArgv(a, sec, "日本語.txt", null);
+        defer a.free(argv);
+        try std.testing.expectEqualStrings("git", argv[0]);
+        try std.testing.expectEqualStrings("-c", argv[1]);
+        try std.testing.expectEqualStrings("core.quotePath=false", argv[2]);
+        try std.testing.expectEqualStrings("diff", argv[3]);
+    }
 }
 
 // 高レベル関数（実行系）はテスト未参照だと Zig のレイジー解析でボディが

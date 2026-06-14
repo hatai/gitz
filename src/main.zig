@@ -378,7 +378,8 @@ pub fn main(init: std.process.Init) !void {
     // 1. repoRoot 解決（.inherit = プロセスの cwd）。null なら TUI を起動せずエラー終了（spec §8）。
     const root = (try cmds.repoRoot(gpa, io, .inherit)) orelse {
         std.Io.File.stderr().writeStreamingAll(io, "git-tui: ここは git リポジトリではありません (git rev-parse --show-toplevel が失敗)\n") catch {};
-        return;
+        // 非リポジトリは異常終了として扱う（スクリプト互換: exit 1）。ここでは未確保なので defer 不要。
+        std.process.exit(1);
     };
     defer gpa.free(root);
 
@@ -423,7 +424,8 @@ pub fn main(init: std.process.Init) !void {
         gpa,
         io,
         init.environ_map,
-        .{ .mouse = g_app.model.mouse_enabled },
+        // fps=30 で既定 60 から半減（既存 everyMs(33)≒30fps ポーリングと整合）。アイドル CPU を下げる。
+        .{ .mouse = g_app.model.mouse_enabled, .fps = 30 },
     );
     g_program = &program;
     defer program.deinit(); // RuntimeModel.deinit を呼び textarea/model/queue を後始末

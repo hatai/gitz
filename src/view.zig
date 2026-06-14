@@ -114,10 +114,24 @@ pub fn changesRowLayout(model: *const Model, out: []ChangesRow) usize {
     return n;
 }
 
+/// 選択行を可視範囲に収めるスクロールオフセットを返す純粋関数（Item 5: ensure-visible）。
+/// `selected` は **visual row**（見出し含む表示行）、`visible` は表示可能行数（>=1 を渡すこと）。
+/// 選択が上にはみ出すなら scroll=selected、下にはみ出すなら scroll=selected-visible+1。
+pub fn ensureVisible(scroll: usize, selected: usize, visible: usize) usize {
+    const vis = if (visible == 0) 1 else visible;
+    if (selected < scroll) return selected;
+    if (selected >= scroll + vis) return selected - vis + 1;
+    return scroll;
+}
+
 /// Changes ペイン: Staged / Unstaged / Untracked のセクション見出しと各ファイル行。
-/// `height` 行を超えた分は描画しない（spec §5 の上段に収める）。0 のとき最低 1 行。
+/// `height` 行を超えた分は `model.changes_scroll` からのウィンドウとして描画する（Item 5）。0 のとき最低 1 行。
 /// 行の並びは `changesRowLayout`（純粋・テスト済み）に委譲し、当たり判定とのズレを防ぐ。
-fn renderChanges(model: *const Model, ctx: *const zz.Context, height: u16) []const u8 {
+///
+/// ⚠️ Item 5 の一貫性不変条件: 本関数が **`model.changes_scroll` の唯一の writer**。マウス adapter
+/// （input.fromZigzagMouse）は同フィールドを read するだけ。表示するオフセットと格納するオフセットが
+/// 同一関数で確定するため、クリック行解決と描画ウィンドウが構造的にズレない。そのため引数は `*Model`。
+fn renderChanges(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     const a = ctx.allocator;
     var lines: std.ArrayList([]const u8) = .empty;
     // arena なので deinit 不要（フレーム終端でまとめて解放される）。
@@ -125,11 +139,29 @@ fn renderChanges(model: *const Model, ctx: *const zz.Context, height: u16) []con
     const limit: usize = if (height == 0) 1 else height;
     const head_style = zz.Style{ .bold_attr = true };
 
-    // 行レイアウトを arena に確保（見出し 3 + ファイル数が上限）。limit でクランプ。
+    // 行レイアウトを arena に **全行** 確保（見出し 3 + ファイル数）。fold 下の selected も探せるよう
+    // limit でクランプせず全展開してから、ensure-visible でウィンドウ先頭を決める。
     const cap = model.files.items.len + 3;
     const rows = a.alloc(ChangesRow, @max(cap, 1)) catch return "(changes render error)";
-    const want = changesRowLayout(model, rows[0..@min(rows.len, limit)]);
-    for (rows[0..want]) |row| {
+    const want = changesRowLayout(model, rows);
+
+    // selected（格納 index）の **visual row** を探し、見えるよう changes_scroll を更新（唯一の writer）。
+    if (model.files.items.len > 0) {
+        for (rows[0..want], 0..) |row, vr| {
+            if (row.storage_index) |i| {
+                if (i == model.selected) {
+                    model.changes_scroll = ensureVisible(model.changes_scroll, vr, limit);
+                    break;
+                }
+            }
+        }
+    }
+    // changes_scroll が末尾超過にならないようクランプ（行数が減ったケース）。
+    if (model.changes_scroll >= want) model.changes_scroll = if (want == 0) 0 else want - 1;
+
+    const start = model.changes_scroll;
+    const end = @min(want, start + limit);
+    for (rows[start..end]) |row| {
         if (row.storage_index) |i| {
             const f = model.files.items[i];
             const sel = (i == model.selected) and (model.focus == .changes);
@@ -143,6 +175,14 @@ fn renderChanges(model: *const Model, ctx: *const zz.Context, height: u16) []con
     return zz.joinVertical(a, lines.items) catch "(changes render error)";
 }
 
+/// スクロールオフセットを総行数に対してクランプする純粋関数（Item 4: 末尾超過の空表示を防ぐ）。
+/// 上限は「総行数 - 1」（最終行が先頭に来るまで）。total==0 なら 0（saturating sub）。
+pub fn clampScroll(scroll: usize, total: usize) usize {
+    if (total == 0) return 0;
+    const max_off = total - 1;
+    return @min(scroll, max_off);
+}
+
 /// Diff ペイン: `model.diff_text` を `model.diff_scroll` を先頭行として描画。`+`/`-` を色分け。
 fn renderDiff(model: *const Model, ctx: *const zz.Context, height: u16) []const u8 {
     const a = ctx.allocator;
@@ -151,12 +191,22 @@ fn renderDiff(model: *const Model, ctx: *const zz.Context, height: u16) []const 
     const add_style = zz.Style{ .foreground = zz.Color.green };
     const del_style = zz.Style{ .foreground = zz.Color.red };
 
+    // Item 4: diff_scroll は reducer 側で無制限に増えうるため、描画側で総行数にクランプする
+    //（Model.diff_scroll 自体は据え置き、表示オフセットだけ min(scroll, total-1) に丸める）。
+    // 末尾超過で diff が空になる papercut を view 側で解消する。
+    var total_lines: usize = 0;
+    {
+        var cit = std.mem.splitScalar(u8, model.diff_text, '\n');
+        while (cit.next()) |_| total_lines += 1;
+    }
+    const scroll_off = clampScroll(model.diff_scroll, total_lines);
+
     var lines: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, model.diff_text, '\n');
     var idx: usize = 0;
     const limit: usize = if (height == 0) 1 else height;
     while (it.next()) |line| : (idx += 1) {
-        if (idx < model.diff_scroll) continue;
+        if (idx < scroll_off) continue;
         if (lines.items.len >= limit) break;
         const styled: []const u8 = if (line.len > 0 and line[0] == '+')
             (add_style.render(a, line) catch line)
@@ -232,7 +282,9 @@ fn fitPane(a: std.mem.Allocator, content: []const u8, r: Rect) []const u8 {
 /// 横分割と上段の高さが実際に enforce される（separator は不要 — 各ペインが自前の右パディングを
 /// 持つので join 時の隙間文字列を入れると合計幅が端末幅を超えて折り返す）。
 /// 幅は下限保証（`fitPane` の注記参照）。
-pub fn render(model: *const Model, ctx: *const zz.Context) []const u8 {
+/// `model` は **`*Model`**（renderChanges が ensure-visible で `changes_scroll` を更新する唯一の
+/// writer のため）。他の render ヘルパは `*const Model` のままで coerce される。
+pub fn render(model: *Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
     const layout = computeLayout(ctx.width, ctx.height, 5);
 
@@ -245,6 +297,27 @@ pub fn render(model: *const Model, ctx: *const zz.Context) []const u8 {
     // 各ペインは fitPane で幅を確保済みなので separator は入れない（入れると幅超過で折り返す）。
     const top = zz.joinHorizontal(a, &.{ changes, diff }) catch changes;
     return zz.joinVertical(a, &.{ top, commit, status }) catch top;
+}
+
+test "ensureVisible scrolls to reveal selection above/below/within window" {
+    // 上にはみ出す: scroll=5, selected=2 → scroll=2
+    try std.testing.expectEqual(@as(usize, 2), ensureVisible(5, 2, 4));
+    // 下にはみ出す: scroll=0, selected=10, visible=4 → 10-4+1 = 7
+    try std.testing.expectEqual(@as(usize, 7), ensureVisible(0, 10, 4));
+    // 範囲内: scroll=3, selected=4, visible=4（[3,7) に 4 が含まれる）→ 据え置き
+    try std.testing.expectEqual(@as(usize, 3), ensureVisible(3, 4, 4));
+    // 末尾ぴったり: scroll=3, selected=6, visible=4（[3,7) の最後）→ 据え置き
+    try std.testing.expectEqual(@as(usize, 3), ensureVisible(3, 6, 4));
+    // visible=0 は 1 に丸めて underflow しない
+    try std.testing.expectEqual(@as(usize, 5), ensureVisible(0, 5, 0));
+}
+
+test "clampScroll caps offset at total-1 and handles empty" {
+    try std.testing.expectEqual(@as(usize, 0), clampScroll(0, 0)); // 空
+    try std.testing.expectEqual(@as(usize, 0), clampScroll(5, 0)); // 空でも 0
+    try std.testing.expectEqual(@as(usize, 3), clampScroll(3, 10)); // 範囲内は据え置き
+    try std.testing.expectEqual(@as(usize, 9), clampScroll(100, 10)); // 超過は total-1 にクランプ
+    try std.testing.expectEqual(@as(usize, 0), clampScroll(100, 1)); // 1 行なら先頭固定
 }
 
 test "layout splits width 40/60 and reserves commit+status rows" {

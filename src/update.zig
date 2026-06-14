@@ -66,6 +66,8 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         },
         .request_refresh => return .refresh_status,
         .request_commit => {
+            // busy 中（直前の副作用が実行中）の Ctrl+S は無視する。二重コミットを防ぐ（基準7/UX）。
+            if (model.busy) return .none;
             if (model.commit_message.len == 0) {
                 try model.setStr(&model.error_text, "コミットメッセージが空です");
                 return .none;
@@ -169,6 +171,18 @@ test "commit_text_changed syncs TextArea value (incl. Japanese) and request_comm
     defer c1.deinit(a);
     try std.testing.expect(c1 == .commit);
     try std.testing.expectEqualStrings("1行目\n2行目 日本語", c1.commit);
+}
+
+test "request_commit while busy returns none and emits no commit" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.setStr(&m.commit_message, "msg"); // メッセージは非空（空エラーと区別する）
+    m.busy = true;
+    var cmd = try update(&m, .request_commit);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none); // busy ゲートで commit を発行しない
+    try std.testing.expect(m.error_text.len == 0); // 空メッセージエラーでもない
 }
 
 test "key_down requests diff reload for new selection" {

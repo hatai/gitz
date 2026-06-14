@@ -16,6 +16,7 @@ pub const Model = struct {
     branch: []u8,
     files: std.ArrayList(FileItem),
     selected: usize,
+    changes_scroll: usize, // Changes ペインの先頭表示**行**（見出し含む visual row オフセット）
     diff_text: []u8, // 選択ファイルの diff（空可）
     diff_scroll: usize, // diff ペインの先頭表示行（スクロールオフセット）
     commit_message: []u8, // TextArea の内容（空可）
@@ -32,6 +33,7 @@ pub const Model = struct {
             .branch = try a.dupe(u8, ""),
             .files = .empty,
             .selected = 0,
+            .changes_scroll = 0,
             .diff_text = try a.dupe(u8, ""),
             .diff_scroll = 0,
             .commit_message = try a.dupe(u8, ""),

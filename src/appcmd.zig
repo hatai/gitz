@@ -195,6 +195,27 @@ test "repoRoot resolves from a subdirectory cwd" {
     try std.testing.expect(m == .status_loaded);
 }
 
+test "load_diff on a Japanese filename returns raw UTF-8 (no octal escape)" {
+    // 受け入れ基準5: 日本語ファイル名の diff ヘッダが core.quotePath=false により
+    // octal エスケープ（\346 等）されず raw UTF-8 の `日本語.txt` で出ることを確認。
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "日本語.txt", "一行目\n");
+    try repo.git(a, io, &.{ "git", "add", "日本語.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    // 変更を加えて unstaged diff を取得する。
+    try repo.writeFile(io, "日本語.txt", "一行目\n二行目\n");
+    var m = try runOwned(a, io, repo.cwd(), .{ .load_diff = .{ .path = try a.dupe(u8, "日本語.txt"), .orig_path = null, .section = .unstaged } });
+    defer m.deinit(a);
+    try std.testing.expect(m == .diff_loaded);
+    // raw UTF-8 のファイル名がそのまま含まれる。
+    try std.testing.expect(std.mem.indexOf(u8, m.diff_loaded, "日本語.txt") != null);
+    // octal エスケープ（"\346" のリテラル4バイト列）を含まないこと。
+    try std.testing.expect(std.mem.indexOf(u8, m.diff_loaded, "\\346") == null);
+}
+
 test "load_diff failure preserves no crash and surfaces git_error path" {
     // 不正な section/パスでも握り潰さない（tracked diff で存在しないパスは exit!=0 → git_error or 空）
     const a = std.testing.allocator;

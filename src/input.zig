@@ -195,8 +195,10 @@ pub fn fromZigzagMouse(
         if (pointInRect(ev.x, ev.y, layout.changes)) .changes else if (on_diff) .diff else if (pointInRect(ev.x, ev.y, layout.commit)) .commit else null;
 
     // changes ペイン内クリックなら表示行→格納インデックスを解決（見出し行/範囲外は null）。
+    // Item 5: ペインは model.changes_scroll からのウィンドウを描くため、クリックのペイン相対行 vr に
+    // changes_scroll を足して **絶対 visual row** に直してから格納 index を引く（描画 writer と read を一致）。
     const file_row: ?usize = if (pane == .changes)
-        (if (changesVisualRow(ev.y, layout.changes)) |vr| fileRowFromVisual(model, vr, scratch) else null)
+        (if (changesVisualRow(ev.y, layout.changes)) |vr| fileRowFromVisual(model, model.changes_scroll + vr, scratch) else null)
     else
         null;
 
@@ -480,6 +482,28 @@ test "fromZigzagMouse: left press then release on same row -> exactly one select
     try std.testing.expect(mouseToMsg(m1).? == .select_index);
     try std.testing.expectEqual(@as(usize, 0), mouseToMsg(m1).?.select_index);
     try std.testing.expect(mouseToMsg(m2) == null);
+}
+
+test "fromZigzagMouse: click resolves against changes_scroll offset (windowed pane)" {
+    // Item 5: ペインが changes_scroll=2 からのウィンドウを描いているとき、
+    // ペイン相対行 0 のクリックは絶対 visual row 2（= Unstaged 見出し）に解決される。
+    // 絶対 visual row: [0 Staged head][1 B][2 Unstaged head][3 A][4 C][5 Untracked head]
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    m.changes_scroll = 2;
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    // ペイン相対行 0（y=0） → 絶対 2（Unstaged 見出し = file_row null）。set_focus になる。
+    const head_ev = zz.MouseEvent{ .x = 5, .y = 0, .button = .left, .event_type = .press };
+    const head_me = fromZigzagMouse(head_ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(?usize, null), head_me.file_row);
+    try std.testing.expect(mouseToMsg(head_me).? == .set_focus);
+    // ペイン相対行 1（y=1） → 絶対 3 = A（格納 index 0）。select_index 0。
+    const file_ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .left, .event_type = .press };
+    const file_me = fromZigzagMouse(file_ev, &m, mouse_test_layout, &cs, 2000, &scratch);
+    try std.testing.expectEqual(@as(?usize, 0), file_me.file_row);
+    try std.testing.expect(mouseToMsg(file_me).? == .select_index);
+    try std.testing.expectEqual(@as(usize, 0), mouseToMsg(file_me).?.select_index);
 }
 
 test "fromZigzagMouse: left press on header row focuses changes pane (no select)" {
