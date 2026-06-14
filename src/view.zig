@@ -73,8 +73,50 @@ fn renderFileLine(
     return label;
 }
 
+/// Changes ペインの 1 行ぶんを表す。`storage_index` が null なら見出し行（クリック不可）、
+/// 非 null なら `model.files.items[storage_index]` を指すファイル行。
+/// view が「何行目に何を描くか」を決める唯一の真実源。Task 9 のマウス adapter は
+/// クリック行 row を `changesRowLayout` に通して `storage_index` を引けば
+/// `Msg.select_index` を正しく作れる（見出し行は null なので無視できる）。
+pub const ChangesRow = struct { section: Section, storage_index: ?usize };
+
+/// Changes ペインの行レイアウト（見出し + ファイル行）を**純粋に**列挙する。
+/// 描画とマウス当たり判定の双方がこの 1 関数を共有することで、両者のズレを構造的に防ぐ。
+/// row 配列を `out` に詰め、詰めた行数を返す（`out.len` で上限クランプ）。
+///
+/// ⚠️ クロスレイヤの seam（既知の制約・Task 10 単独では解消不可）:
+///   ファイル行は section（staged→unstaged→untracked）でグルーピングして並べるが、
+///   `model.files.items` の**格納順**は git porcelain v2 の出力順（path 順・section interleave）で
+///   section ソートされていない（model.zig replaceFiles / git/status.zig parse 共にソート無し）。
+///   一方 update.zig の key_down/key_up は `model.selected` を**格納順**で線形に動かす。
+///   そのため格納順 != 表示順のとき、j/k のハイライトが画面上を非連続にジャンプする
+///   （選択されるファイル自体は常に正しい。型/メモリのバグではなく振る舞い上の不整合）。
+///   根本修正は本層の**外**: model.zig `replaceFiles` で `next` を section 優先
+///   （staged→unstaged→untracked、その中で path）にソートしてから入れ替えれば、
+///   格納順 == 表示順となり j/k 移動・ハイライト・本関数の row→index がすべて一致する
+///   （`replaceFiles` の既存テストは単一エントリでソート不変、update.zig テストは addFile 経由で
+///   replaceFiles 非依存のため、その 1 箇所のソート追加は既存 50 テストを壊さない）。
+///   本関数はそのソート有無に関わらず正しい row→index を返す（ハイライトも格納 index で判定）。
+pub fn changesRowLayout(model: *const Model, out: []ChangesRow) usize {
+    const sections = [_]Section{ .staged, .unstaged, .untracked };
+    var n: usize = 0;
+    for (sections) |sec| {
+        if (n >= out.len) break;
+        out[n] = .{ .section = sec, .storage_index = null }; // 見出し行
+        n += 1;
+        for (model.files.items, 0..) |f, i| {
+            if (f.section != sec) continue;
+            if (n >= out.len) return n;
+            out[n] = .{ .section = sec, .storage_index = i };
+            n += 1;
+        }
+    }
+    return n;
+}
+
 /// Changes ペイン: Staged / Unstaged / Untracked のセクション見出しと各ファイル行。
 /// `height` 行を超えた分は描画しない（spec §5 の上段に収める）。0 のとき最低 1 行。
+/// 行の並びは `changesRowLayout`（純粋・テスト済み）に委譲し、当たり判定とのズレを防ぐ。
 fn renderChanges(model: *const Model, ctx: *const zz.Context, height: u16) []const u8 {
     const a = ctx.allocator;
     var lines: std.ArrayList([]const u8) = .empty;
@@ -82,16 +124,19 @@ fn renderChanges(model: *const Model, ctx: *const zz.Context, height: u16) []con
 
     const limit: usize = if (height == 0) 1 else height;
     const head_style = zz.Style{ .bold_attr = true };
-    const sections = [_]Section{ .staged, .unstaged, .untracked };
-    outer: for (sections) |sec| {
-        if (lines.items.len >= limit) break;
-        const title = head_style.render(a, sectionTitle(sec)) catch sectionTitle(sec);
-        lines.append(a, title) catch return title;
-        for (model.files.items, 0..) |f, i| {
-            if (f.section != sec) continue;
-            if (lines.items.len >= limit) break :outer;
+
+    // 行レイアウトを arena に確保（見出し 3 + ファイル数が上限）。limit でクランプ。
+    const cap = model.files.items.len + 3;
+    const rows = a.alloc(ChangesRow, @max(cap, 1)) catch return "(changes render error)";
+    const want = changesRowLayout(model, rows[0..@min(rows.len, limit)]);
+    for (rows[0..want]) |row| {
+        if (row.storage_index) |i| {
+            const f = model.files.items[i];
             const sel = (i == model.selected) and (model.focus == .changes);
             lines.append(a, renderFileLine(ctx, f, sel)) catch {};
+        } else {
+            const title = head_style.render(a, sectionTitle(row.section)) catch sectionTitle(row.section);
+            lines.append(a, title) catch return title;
         }
     }
     if (lines.items.len == 0) return "(no changes)";
@@ -245,6 +290,39 @@ test "fitPane width is a lower bound: overlong lines are not truncated" {
     const out = fitPane(a, "hello", .{ .x = 0, .y = 0, .w = 3, .h = 1 });
     defer a.free(out);
     try std.testing.expectEqual(@as(usize, 5), zz.width(out));
+}
+
+test "changesRowLayout groups by section and maps rows back to storage indices" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 格納順 = porcelain v2 の path 順（section interleave）: A(unstaged) B(staged) C(unstaged)。
+    try m.files.append(a, .{ .path = try a.dupe(u8, "A"), .orig_path = null, .section = .unstaged });
+    try m.files.append(a, .{ .path = try a.dupe(u8, "B"), .orig_path = null, .section = .staged });
+    try m.files.append(a, .{ .path = try a.dupe(u8, "C"), .orig_path = null, .section = .unstaged });
+
+    var buf: [16]ChangesRow = undefined;
+    const n = changesRowLayout(&m, &buf);
+    // 期待される行: [Staged head][B=1][Unstaged head][A=0][C=2][Untracked head]
+    try std.testing.expectEqual(@as(usize, 6), n);
+    try std.testing.expect(buf[0].section == .staged and buf[0].storage_index == null);
+    try std.testing.expectEqual(@as(?usize, 1), buf[1].storage_index); // B
+    try std.testing.expect(buf[2].section == .unstaged and buf[2].storage_index == null);
+    try std.testing.expectEqual(@as(?usize, 0), buf[3].storage_index); // A
+    try std.testing.expectEqual(@as(?usize, 2), buf[4].storage_index); // C
+    try std.testing.expect(buf[5].section == .untracked and buf[5].storage_index == null);
+    // クリック行 row=1 → 格納 index 1（B）に正しく解決でき、マウス adapter が select_index を作れる。
+    try std.testing.expectEqual(@as(?usize, 1), buf[1].storage_index);
+}
+
+test "changesRowLayout clamps to the provided output slice" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.files.append(a, .{ .path = try a.dupe(u8, "A"), .orig_path = null, .section = .unstaged });
+    var buf: [2]ChangesRow = undefined; // 見出し+1 行で打ち切り
+    const n = changesRowLayout(&m, &buf);
+    try std.testing.expectEqual(@as(usize, 2), n);
 }
 
 test {
