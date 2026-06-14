@@ -6,7 +6,7 @@
 //! Task 1 only has main.zig, so the rest stay commented out for now.
 
 test {
-    // _ = @import("git/process.zig");   // Task 2
+    _ = @import("git/process.zig"); // Task 2
     // _ = @import("git/status.zig");    // Task 3
     // _ = @import("git/commands.zig");  // Task 4
     // _ = @import("model.zig");         // Task 5
