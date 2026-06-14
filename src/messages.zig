@@ -77,3 +77,91 @@ test "AppCmd.commit owns its message and frees on deinit" {
     defer cmd.deinit(a);
     try std.testing.expectEqualStrings("hello", cmd.commit);
 }
+
+// --- Msg.status_loaded: 複数要素 + orig_path 有無の混在を確保し deinit でリークなし ---
+
+/// status_loaded 用フィクスチャを確保して Msg を組み立て、deinit で全解放する。
+/// dupe が途中で OOM になっても確保済みスロットだけを正しく free する（errdefer）。
+/// checkAllAllocationFailures から呼ぶことで部分確保失敗時の不正 free/leak を検証する。
+fn buildStatusLoadedAndFree(a: std.mem.Allocator) !void {
+    const entries = try a.alloc(status.StatusEntry, 3);
+    // 確保途中で失敗した場合、初期化済みスロットの path/orig_path だけを解放する。
+    // 各スロットは path を入れた直後に initialized を増やし、orig_path は
+    // 先に null を入れてから上書きする（block errdefer が未初期化 orig_path を触らない）。
+    var initialized: usize = 0;
+    errdefer {
+        for (entries[0..initialized]) |*e| {
+            a.free(e.path);
+            if (e.orig_path) |p| a.free(p);
+        }
+        a.free(entries);
+    }
+
+    // 要素0: orig_path なし
+    entries[0] = .{ .path = try a.dupe(u8, "src/main.zig"), .orig_path = null, .section = .unstaged };
+    initialized = 1;
+
+    // 要素1: orig_path あり（rename）
+    entries[1] = .{ .path = try a.dupe(u8, "new.txt"), .orig_path = null, .section = .staged };
+    initialized = 2;
+    entries[1].orig_path = try a.dupe(u8, "old.txt");
+
+    // 要素2: orig_path なし（untracked）
+    entries[2] = .{ .path = try a.dupe(u8, "新規ファイル.txt"), .orig_path = null, .section = .untracked };
+    initialized = 3;
+
+    var msg = Msg{ .status_loaded = entries };
+    msg.deinit(a); // deinit が slice と各 path/orig_path を所有・解放する
+}
+
+test "Msg.status_loaded deinit frees mixed entries without leak" {
+    try buildStatusLoadedAndFree(std.testing.allocator);
+}
+
+test "Msg.status_loaded no invalid free / leak on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, buildStatusLoadedAndFree, .{});
+}
+
+test "Msg.diff_loaded deinit frees owned slice without leak" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .diff_loaded = try a.dupe(u8, "diff --git a/x b/x\n") };
+    msg.deinit(a);
+}
+
+test "Msg.git_error deinit frees owned slice without leak" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .git_error = try a.dupe(u8, "fatal: boom") };
+    msg.deinit(a);
+}
+
+// --- AppCmd: stage / unstage / load_diff の所有パスを deinit が解放する ---
+
+test "AppCmd.stage deinit frees path and orig_path without leak" {
+    const a = std.testing.allocator;
+    var cmd = AppCmd{ .stage = .{
+        .path = try a.dupe(u8, "new.txt"),
+        .orig_path = try a.dupe(u8, "old.txt"),
+        .section = .staged,
+    } };
+    cmd.deinit(a);
+}
+
+test "AppCmd.unstage deinit frees path with null orig_path without leak" {
+    const a = std.testing.allocator;
+    var cmd = AppCmd{ .unstage = .{
+        .path = try a.dupe(u8, "f.txt"),
+        .orig_path = null,
+        .section = .staged,
+    } };
+    cmd.deinit(a);
+}
+
+test "AppCmd.load_diff deinit frees path and orig_path without leak" {
+    const a = std.testing.allocator;
+    var cmd = AppCmd{ .load_diff = .{
+        .path = try a.dupe(u8, "new.txt"),
+        .orig_path = try a.dupe(u8, "old.txt"),
+        .section = .unstaged,
+    } };
+    cmd.deinit(a);
+}
