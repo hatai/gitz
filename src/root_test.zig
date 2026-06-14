@@ -12,7 +12,7 @@ test {
     _ = @import("model.zig"); // Task 5
     _ = @import("messages.zig"); // Task 6
     _ = @import("update.zig"); // Task 7
-    // _ = @import("appcmd.zig");        // Task 8
+    _ = @import("appcmd.zig"); // Task 8
     // _ = @import("input.zig");         // Task 9
     // _ = @import("view.zig");          // Task 10
 }
