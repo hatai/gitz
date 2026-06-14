@@ -1,0 +1,130 @@
+const std = @import("std");
+const status = @import("git/status.zig");
+
+pub const Focus = enum { changes, diff, commit };
+
+pub const FileItem = struct {
+    path: []u8,
+    orig_path: ?[]u8,
+    section: status.Section,
+};
+
+pub const Model = struct {
+    allocator: std.mem.Allocator,
+    repo_root: []u8,
+    has_head: bool,
+    branch: []u8,
+    files: std.ArrayList(FileItem),
+    selected: usize,
+    diff_text: []u8, // 選択ファイルの diff（空可）
+    diff_scroll: usize, // diff ペインの先頭表示行（スクロールオフセット）
+    commit_message: []u8, // TextArea の内容（空可）
+    focus: Focus,
+    busy: bool,
+    error_text: []u8, // 直近エラー（空可）
+    mouse_enabled: bool,
+
+    pub fn init(a: std.mem.Allocator, repo_root: []const u8) !Model {
+        return .{
+            .allocator = a,
+            .repo_root = try a.dupe(u8, repo_root),
+            .has_head = false,
+            .branch = try a.dupe(u8, ""),
+            .files = .empty,
+            .selected = 0,
+            .diff_text = try a.dupe(u8, ""),
+            .diff_scroll = 0,
+            .commit_message = try a.dupe(u8, ""),
+            .focus = .changes,
+            .busy = false,
+            .error_text = try a.dupe(u8, ""),
+            .mouse_enabled = true,
+        };
+    }
+
+    pub fn deinit(self: *Model) void {
+        const a = self.allocator;
+        a.free(self.repo_root);
+        a.free(self.branch);
+        for (self.files.items) |*f| {
+            a.free(f.path);
+            if (f.orig_path) |p| a.free(p);
+        }
+        self.files.deinit(a);
+        a.free(self.diff_text);
+        a.free(self.commit_message);
+        a.free(self.error_text);
+    }
+
+    /// files を新しいエントリ集合で置換。entries は**複製**する（借用しない）。entries 自体の所有権は
+    /// 呼び出し側に残り、Msg.status_loaded の deinit で解放する（spec §4: 二重 free 防止）。
+    /// **トランザクショナル**: 新リストを完全に構築してから既存と入れ替える。途中で確保失敗しても
+    /// 既存の Model 状態は壊さない（中途半端な破壊を避ける）。
+    pub fn replaceFiles(self: *Model, entries: []const status.StatusEntry) !void {
+        const a = self.allocator;
+        var next: std.ArrayList(FileItem) = .empty;
+        errdefer {
+            for (next.items) |*f| {
+                a.free(f.path);
+                if (f.orig_path) |p| a.free(p);
+            }
+            next.deinit(a);
+        }
+        for (entries) |e| {
+            const path = try a.dupe(u8, e.path);
+            errdefer a.free(path);
+            const orig: ?[]u8 = if (e.orig_path) |p| try a.dupe(u8, p) else null;
+            errdefer if (orig) |o| a.free(o);
+            try next.append(a, .{ .path = path, .orig_path = orig, .section = e.section });
+        }
+        // ここまで来れば成功。旧 files を解放して入れ替える。
+        for (self.files.items) |*f| {
+            a.free(f.path);
+            if (f.orig_path) |p| a.free(p);
+        }
+        self.files.deinit(a);
+        self.files = next;
+        if (self.selected >= self.files.items.len) self.selected = if (self.files.items.len == 0) 0 else self.files.items.len - 1;
+    }
+
+    /// 文字列フィールドを置換するヘルパ（旧を free して dup）。
+    pub fn setStr(self: *Model, field: *[]u8, value: []const u8) !void {
+        const a = self.allocator;
+        const dup = try a.dupe(u8, value);
+        a.free(field.*);
+        field.* = dup;
+    }
+};
+
+test "init/deinit leaves no leaks" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/tmp/repo");
+    defer m.deinit();
+    try std.testing.expectEqualStrings("/tmp/repo", m.repo_root);
+    try std.testing.expectEqual(Focus.changes, m.focus);
+}
+
+test "setStr frees old and stores new without leak" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/tmp/repo");
+    defer m.deinit();
+    try m.setStr(&m.diff_text, "diff A");
+    try std.testing.expectEqualStrings("diff A", m.diff_text);
+    try m.setStr(&m.diff_text, "diff B");
+    try std.testing.expectEqualStrings("diff B", m.diff_text);
+}
+
+test "replaceFiles copies entries (caller still owns originals)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/tmp/repo");
+    defer m.deinit();
+    const entries = try a.alloc(status.StatusEntry, 1);
+    defer {
+        a.free(entries[0].path);
+        a.free(entries);
+    } // 呼び出し側が originals を解放
+    entries[0] = .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .unstaged };
+    try m.replaceFiles(entries); // Model は複製を持つ（二重 free しない）
+    try std.testing.expectEqual(@as(usize, 1), m.files.items.len);
+    try std.testing.expectEqualStrings("f.txt", m.files.items[0].path);
+}
