@@ -74,18 +74,22 @@ fn renderFileLine(
 }
 
 /// Changes ペイン: Staged / Unstaged / Untracked のセクション見出しと各ファイル行。
-fn renderChanges(model: *const Model, ctx: *const zz.Context) []const u8 {
+/// `height` 行を超えた分は描画しない（spec §5 の上段に収める）。0 のとき最低 1 行。
+fn renderChanges(model: *const Model, ctx: *const zz.Context, height: u16) []const u8 {
     const a = ctx.allocator;
     var lines: std.ArrayList([]const u8) = .empty;
     // arena なので deinit 不要（フレーム終端でまとめて解放される）。
 
+    const limit: usize = if (height == 0) 1 else height;
     const head_style = zz.Style{ .bold_attr = true };
     const sections = [_]Section{ .staged, .unstaged, .untracked };
-    for (sections) |sec| {
+    outer: for (sections) |sec| {
+        if (lines.items.len >= limit) break;
         const title = head_style.render(a, sectionTitle(sec)) catch sectionTitle(sec);
         lines.append(a, title) catch return title;
         for (model.files.items, 0..) |f, i| {
             if (f.section != sec) continue;
+            if (lines.items.len >= limit) break :outer;
             const sel = (i == model.selected) and (model.focus == .changes);
             lines.append(a, renderFileLine(ctx, f, sel)) catch {};
         }
@@ -148,20 +152,53 @@ fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
     return std.fmt.allocPrint(a, "{s}{s}", .{ base, hint }) catch base;
 }
 
+/// 各ペインの内容を矩形 `r` のセル数に合わせて整形する。
+/// - 高さ: `r.h` 行を超える行は捨てる（行単位なので ANSI を壊さない）。
+/// - 幅: `zz.place.place` で `r.w` 桁まで右パディングする（ANSI 幅は無視して計測）。
+///   ⚠️ `place` は切り詰めをしない。`r.w` 桁を**超える**行はそのまま残る（幅は下限保証）。
+///   個々のスタイル付き行を表示桁で安全に切る術が無い（ANSI エスケープを割らずに桁で切るのは
+///   非自明）ため、MVP では幅は下限のみ強制し、極端に長い行のオーバーフローは許容する。
+fn fitPane(a: std.mem.Allocator, content: []const u8, r: Rect) []const u8 {
+    // 高さクランプ: 先頭 r.h 行だけ残す（r.h==0 は 1 行に丸める）。
+    const max_lines: usize = if (r.h == 0) 1 else r.h;
+    var clamped = content;
+    var nl_count: usize = 0;
+    var cut: usize = content.len;
+    for (content, 0..) |c, i| {
+        if (c == '\n') {
+            nl_count += 1;
+            if (nl_count == max_lines) {
+                cut = i;
+                break;
+            }
+        }
+    }
+    if (nl_count >= max_lines) clamped = content[0..cut];
+    // 幅クランプ（下限のみ）: r.w 桁まで右パディング。
+    return zz.place.place(a, r.w, max_lines, .left, .top, clamped) catch clamped;
+}
+
 /// `Model` を端末 1 画面分の文字列に描画する（zigzag view 規約: 非エラーの `[]const u8`）。
 /// すべての一時文字列は `ctx.allocator`（フレーム arena）で確保し、内部の `!` は catch で
 /// フォールバック文字列に落とす。Task 11 のランタイムがこれを `Model.view` から呼ぶ想定。
+///
+/// spec §5 のレイアウト適用: `computeLayout` が返す 4 矩形（changes / diff / commit / status）を
+/// すべて `fitPane` で各ペインのセル数に整形してから結合する。これにより左 40% / 右 60% の
+/// 横分割と上段の高さが実際に enforce される（separator は不要 — 各ペインが自前の右パディングを
+/// 持つので join 時の隙間文字列を入れると合計幅が端末幅を超えて折り返す）。
+/// 幅は下限保証（`fitPane` の注記参照）。
 pub fn render(model: *const Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
     const layout = computeLayout(ctx.width, ctx.height, 5);
 
-    const changes = renderChanges(model, ctx);
-    const diff = renderDiff(model, ctx, layout.diff.h);
-    const commit = renderCommit(model, ctx);
-    const status = renderStatus(model, ctx);
+    const changes = fitPane(a, renderChanges(model, ctx, layout.changes.h), layout.changes);
+    const diff = fitPane(a, renderDiff(model, ctx, layout.diff.h), layout.diff);
+    const commit = fitPane(a, renderCommit(model, ctx), layout.commit);
+    const status = fitPane(a, renderStatus(model, ctx), layout.status);
 
     // 上段（Changes | Diff）を横結合し、その下に Commit / Status を縦結合する。
-    const top = zz.joinHorizontal(a, &.{ changes, "  ", diff }) catch changes;
+    // 各ペインは fitPane で幅を確保済みなので separator は入れない（入れると幅超過で折り返す）。
+    const top = zz.joinHorizontal(a, &.{ changes, diff }) catch changes;
     return zz.joinVertical(a, &.{ top, commit, status }) catch top;
 }
 
@@ -187,6 +224,27 @@ test "layout zero width yields zero panes" {
     const l = computeLayout(0, 30, 5);
     try std.testing.expectEqual(@as(u16, 0), l.changes.w);
     try std.testing.expectEqual(@as(u16, 0), l.diff.w);
+}
+
+test "fitPane clamps height to rect and pads each line to rect width" {
+    const a = std.testing.allocator;
+    // 4 行を高さ 3 の矩形に収める → 先頭 3 行のみ、各行 10 桁に右パディング。
+    const out = fitPane(a, "ab\ncd\nef\ngh", .{ .x = 0, .y = 0, .w = 10, .h = 3 });
+    defer a.free(out);
+    var it = std.mem.splitScalar(u8, out, '\n');
+    var n: usize = 0;
+    while (it.next()) |line| : (n += 1) {
+        try std.testing.expectEqual(@as(usize, 10), zz.width(line));
+    }
+    try std.testing.expectEqual(@as(usize, 3), n); // 3 行ちょうど（4 行目は捨てる）
+}
+
+test "fitPane width is a lower bound: overlong lines are not truncated" {
+    const a = std.testing.allocator;
+    // 幅 3 の矩形に 5 桁の行 → place は切り詰めないので 5 桁のまま（ドキュメント済みの契約）。
+    const out = fitPane(a, "hello", .{ .x = 0, .y = 0, .w = 3, .h = 1 });
+    defer a.free(out);
+    try std.testing.expectEqual(@as(usize, 5), zz.width(out));
 }
 
 test {
