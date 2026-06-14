@@ -28,7 +28,10 @@ pub const Msg = union(enum) {
     committed,
 
     pub fn deinit(self: *Msg, a: std.mem.Allocator) void {
+        // 網羅的 switch: 所有バリアントを追加したら必ずここに解放処理を書く
+        // （else を使わないことでコンパイラが新バリアントの判断を強制する）。
         switch (self.*) {
+            // 所有: 複製済みペイロードを解放する
             .status_loaded => |entries| {
                 for (entries) |*e| {
                     a.free(e.path);
@@ -38,7 +41,22 @@ pub const Msg = union(enum) {
             },
             .diff_loaded => |s| a.free(s),
             .git_error => |s| a.free(s),
-            else => {},
+            // 借用 / 単純: 解放不要（commit_text_changed は reducer 側が複製するため借用）
+            .key_down,
+            .key_up,
+            .toggle_stage,
+            .focus_next,
+            .focus_commit,
+            .request_refresh,
+            .request_commit,
+            .scroll_diff_down,
+            .scroll_diff_up,
+            .quit,
+            .select_index,
+            .set_focus,
+            .commit_text_changed,
+            .committed,
+            => {},
         }
     }
 };
@@ -56,7 +74,10 @@ pub const AppCmd = union(enum) {
     pub const LoadDiff = struct { path: []u8, orig_path: ?[]u8, section: Section };
 
     pub fn deinit(self: *AppCmd, a: std.mem.Allocator) void {
+        // 網羅的 switch: 所有バリアントを追加したら必ずここに解放処理を書く
+        // （else を使わないことでコンパイラが新バリアントの判断を強制する）。
         switch (self.*) {
+            // 所有: 複製済みペイロードを解放する
             .stage, .unstage => |op| {
                 a.free(op.path);
                 if (op.orig_path) |p| a.free(p);
@@ -66,7 +87,11 @@ pub const AppCmd = union(enum) {
                 if (ld.orig_path) |p| a.free(p);
             },
             .commit => |m| a.free(m),
-            else => {},
+            // 単純: 解放不要
+            .none,
+            .refresh_status,
+            .quit,
+            => {},
         }
     }
 };
