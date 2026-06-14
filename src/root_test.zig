@@ -10,7 +10,7 @@ test {
     _ = @import("git/status.zig"); // Task 3
     _ = @import("git/commands.zig"); // Task 4
     _ = @import("model.zig"); // Task 5
-    // _ = @import("messages.zig");      // Task 6
+    _ = @import("messages.zig"); // Task 6
     // _ = @import("update.zig");        // Task 7
     // _ = @import("appcmd.zig");        // Task 8
     // _ = @import("input.zig");         // Task 9
