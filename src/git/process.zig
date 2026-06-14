@@ -6,6 +6,11 @@ const std = @import("std");
 
 pub const Cwd = std.process.Child.Cwd; // .inherit / .path / .dir
 
+/// 明示エラーセット規約への準拠。薄いラッパゆえ std の `std.process.run` の
+/// エラーセットをそのまま再エクスポートして使う（手書きで再現すると std 内部
+/// 実装に密結合するため、再エクスポートが最も簡潔で結合度も低い）。
+pub const RunError = std.process.RunError;
+
 pub const RunResult = struct {
     stdout: []u8,
     stderr: []u8,
@@ -19,13 +24,13 @@ pub const RunResult = struct {
 
 /// argv を cwd で実行し、stdout/stderr と正規化した exit code を返す。
 /// 返り値の stdout/stderr の所有権は呼び出し側（`RunResult.deinit` で解放）。
-/// エラーセットは std の `std.process.run` のものを推論する（薄いラッパのため）。
+/// エラーセットは `RunError`（= `std.process.RunError` の再エクスポート）で明示する。
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
     argv: []const []const u8,
     cwd: Cwd,
-) !RunResult {
+) RunError!RunResult {
     const result = try std.process.run(allocator, io, .{
         .argv = argv,
         .cwd = cwd,
