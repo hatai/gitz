@@ -3,8 +3,12 @@
 //! 設計（spec §6: フォーカス時のキー捕捉）:
 //! - **マッピング判断は純粋関数**（`keyToMsg` / `mouseToMsg` と幾何ヘルパ）にして単体テストする。
 //! - zigzag イベント型からの取り出しだけ薄く zigzag 依存のアダプタ（`fromZigzagKey` /
-//!   `fromZigzagMouse`）にする。これらは zigzag 依存・自動 test なし。`test { refAllDecls }` で
-//!   型検査だけ強制し、実イベントの確認は Task 11 のヘッドレス/手動検証でカバーする（非 tty では unverified）。
+//!   `fromZigzagMouse`）にする。`fromZigzagKey` は zigzag 依存・自動 test なし（`test { refAllDecls }`
+//!   で型検査だけ強制、実イベント確認は Task 11 のヘッドレス/手動検証）。
+//! - ⚠️ `fromZigzagMouse` は tty も Io も不要な純粋関数（`now_ms` は注入、`zz.MouseEvent` は素の struct）
+//!   なので **behavioral test を持つ**（press/release/drag/move/右クリック/ホイールの分岐を検証）。
+//!   mode 1003 で全マウスイベントが届く前提下で release/drag/move を `select_index`/`set_focus` に
+//!   誤爆させないことを構造的に守るため、ここは refAllDecls だけに頼らない。
 //!
 //! ⚠️ 検証ゲートは `zig build test`（root_test.zig が本ファイルを import し、`test { refAllDecls }`
 //!   で zigzag 依存アダプタも型検査される）。`zig build` は main.zig が Task 11 スタブで本ファイルを
@@ -63,7 +67,11 @@ pub fn keyToMsg(focus: Focus, key: Key) ?Msg {
 }
 
 pub const MouseEvent = struct {
-    kind: enum { left_click, left_double, wheel_up, wheel_down },
+    /// `ignore` = アクション無し（reducer に渡さない）。zigzag は mouse mode 1003 で
+    /// press/release/drag/move を全部報告するため（zig-pkg .../terminal.zig:336 が
+    /// "\x1b[?1003h\x1b[?1006h" を書く）、左クリックの release や bare motion を
+    /// `left_click` に潰すと select_index/set_focus が誤爆する。これらは `ignore` にする。
+    kind: enum { left_click, left_double, wheel_up, wheel_down, ignore },
     /// クリックされたペイン（フォーカス変更に使う。null=どのペイン外でもない）
     pane: ?Focus = null,
     /// ファイル一覧ペイン内で計算済みの**格納インデックス**（`Model.files.items` の添字）。
@@ -81,6 +89,8 @@ pub fn mouseToMsg(ev: MouseEvent) ?Msg {
         .left_double => if (ev.file_row != null) .toggle_stage else null,
         .wheel_down => if (ev.on_diff) .scroll_diff_down else null,
         .wheel_up => if (ev.on_diff) .scroll_diff_up else null,
+        // press 以外のマウスイベント（release/drag/move）と非左/非ホイールボタンは無視。
+        .ignore => null,
     };
 }
 
@@ -191,18 +201,21 @@ pub fn fromZigzagMouse(
         null;
 
     return switch (ev.button) {
+        // ホイールは event_type に関係なく honor する（SGR では wheel も press 扱いで来る）。
         .wheel_up => .{ .kind = .wheel_up, .pane = pane, .file_row = file_row, .on_diff = on_diff },
         .wheel_down => .{ .kind = .wheel_down, .pane = pane, .file_row = file_row, .on_diff = on_diff },
         .left => blk: {
-            // press のみダブルクリック判定（drag/move/release は単発クリック扱いにしない）。
-            if (ev.event_type != .press) break :blk .{ .kind = .left_click, .pane = pane, .file_row = file_row, .on_diff = on_diff };
+            // press のみ click/double として扱う。release/drag/move は `ignore`（select_index/set_focus を誤爆させない）。
+            // mode 1003 では単一の物理クリックでも press と release が来るため、両方を click にすると 2 回選択される。
+            if (ev.event_type != .press) break :blk .{ .kind = .ignore, .pane = pane, .file_row = file_row, .on_diff = on_diff };
             const kind: @FieldType(MouseEvent, "kind") = switch (classifyClick(cs, now_ms, file_row)) {
                 .double => .left_double,
                 .single => .left_click,
             };
             break :blk .{ .kind = kind, .pane = pane, .file_row = file_row, .on_diff = on_diff };
         },
-        else => .{ .kind = .left_click, .pane = pane, .file_row = file_row, .on_diff = on_diff },
+        // 中/右/wheel_left/wheel_right/button_8..11/none と bare motion は何もしない。
+        else => .{ .kind = .ignore, .pane = pane, .file_row = file_row, .on_diff = on_diff },
     };
 }
 
@@ -334,6 +347,153 @@ test "fileRowFromVisual resolves visual rows to storage indices (header rows -> 
     try std.testing.expectEqual(@as(?usize, 2), fileRowFromVisual(&m, 4, &scratch)); // C
     try std.testing.expectEqual(@as(?usize, null), fileRowFromVisual(&m, 5, &scratch)); // 見出し
     try std.testing.expectEqual(@as(?usize, null), fileRowFromVisual(&m, 6, &scratch)); // 範囲外
+}
+
+// --- fromZigzagMouse の behavioral test（純粋: tty/Io 不要。zz.MouseEvent を直接組む） ---
+//
+// mode 1003 では単一クリックでも press+release が、ドラッグ/ホバーで drag/move が届く。
+// これらを select_index/set_focus に潰さないことを検証する（レビュー指摘 #1/#2 の回帰防止）。
+
+/// 表示行 [0 Staged head][1 B][2 Unstaged head][3 A][4 C][5 Untracked head] になる Model を組む。
+/// 呼び出し側が deinit する。
+fn buildMouseTestModel(a: std.mem.Allocator) !Model {
+    var m = try Model.init(a, "/r");
+    errdefer m.deinit();
+    try m.files.append(a, .{ .path = try a.dupe(u8, "A"), .orig_path = null, .section = .unstaged });
+    try m.files.append(a, .{ .path = try a.dupe(u8, "B"), .orig_path = null, .section = .staged });
+    try m.files.append(a, .{ .path = try a.dupe(u8, "C"), .orig_path = null, .section = .unstaged });
+    return m;
+}
+
+/// changes ペインは y in [0,6)（上記6表示行を覆う）、diff は右側、commit は下。x は重ならない。
+const mouse_test_layout = view.Layout{
+    .changes = .{ .x = 0, .y = 0, .w = 40, .h = 6 },
+    .diff = .{ .x = 40, .y = 0, .w = 40, .h = 6 },
+    .commit = .{ .x = 0, .y = 6, .w = 80, .h = 2 },
+    .status = .{ .x = 0, .y = 8, .w = 80, .h = 1 },
+};
+
+test "fromZigzagMouse: left press on file row B yields left_click -> select_index" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    // 表示行 1 = B（格納 index 1）。changes ペイン内 (x=5, y=1)。
+    const ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .left, .event_type = .press };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
+    const msg = mouseToMsg(me);
+    try std.testing.expect(msg.? == .select_index);
+    try std.testing.expectEqual(@as(usize, 1), msg.?.select_index);
+}
+
+test "fromZigzagMouse: left RELEASE on file row is ignored (no double select)" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .left, .event_type = .release };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me.kind);
+    try std.testing.expect(mouseToMsg(me) == null);
+}
+
+test "fromZigzagMouse: left DRAG on file row is ignored" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 5, .y = 4, .button = .left, .event_type = .drag };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me.kind);
+    try std.testing.expect(mouseToMsg(me) == null);
+}
+
+test "fromZigzagMouse: bare MOTION over changes pane is ignored (no hover churn)" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    // bare motion: button=.none, event_type=.move（parseSgr の bare motion 表現）。
+    const ev = zz.MouseEvent{ .x = 5, .y = 3, .button = .none, .event_type = .move };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me.kind);
+    try std.testing.expect(mouseToMsg(me) == null);
+}
+
+test "fromZigzagMouse: RIGHT press on file row is ignored" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .right, .event_type = .press };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me.kind);
+    try std.testing.expect(mouseToMsg(me) == null);
+}
+
+test "fromZigzagMouse: MIDDLE press on file row is ignored" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .middle, .event_type = .press };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me.kind);
+    try std.testing.expect(mouseToMsg(me) == null);
+}
+
+test "fromZigzagMouse: wheel_up over diff pane scrolls regardless of event_type" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    // diff ペイン (x=50, y=2)。SGR では wheel は press 扱いで来るが、event_type に依らず honor する。
+    const ev = zz.MouseEvent{ .x = 50, .y = 2, .button = .wheel_up, .event_type = .press };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .wheel_up), me.kind);
+    try std.testing.expect(me.on_diff);
+    try std.testing.expect(mouseToMsg(me).? == .scroll_diff_up);
+}
+
+test "fromZigzagMouse: wheel_down over diff pane scrolls down" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 50, .y = 2, .button = .wheel_down, .event_type = .press };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .wheel_down), me.kind);
+    try std.testing.expect(mouseToMsg(me).? == .scroll_diff_down);
+}
+
+test "fromZigzagMouse: left press then release on same row -> exactly one select" {
+    // 物理クリック1回 = press + release。press だけが select_index を出し、release は無視。
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    const press = zz.MouseEvent{ .x = 5, .y = 3, .button = .left, .event_type = .press }; // 表示行3 = A(0)
+    const release = zz.MouseEvent{ .x = 5, .y = 3, .button = .left, .event_type = .release };
+    const m1 = fromZigzagMouse(press, &m, mouse_test_layout, &cs, 1000, &scratch);
+    const m2 = fromZigzagMouse(release, &m, mouse_test_layout, &cs, 1005, &scratch);
+    try std.testing.expect(mouseToMsg(m1).? == .select_index);
+    try std.testing.expectEqual(@as(usize, 0), mouseToMsg(m1).?.select_index);
+    try std.testing.expect(mouseToMsg(m2) == null);
+}
+
+test "fromZigzagMouse: left press on header row focuses changes pane (no select)" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    // 表示行 0 = Staged 見出し → file_row null だが pane=.changes。
+    const ev = zz.MouseEvent{ .x = 5, .y = 0, .button = .left, .event_type = .press };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
+    const msg = mouseToMsg(me);
+    try std.testing.expect(msg.? == .set_focus);
+    try std.testing.expectEqual(Focus.changes, msg.?.set_focus);
 }
 
 // zigzag 依存の pub 関数（fromZigzagKey/fromZigzagMouse）も型検査されるよう refAllDecls する。
