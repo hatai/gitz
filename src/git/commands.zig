@@ -44,6 +44,17 @@ pub fn diffArgv(a: std.mem.Allocator, section: Section, path: []const u8, orig_p
     return list.toOwnedSlice(a);
 }
 
+/// "git apply --cached [--reverse] <file_path>"。呼び出し側が free。
+/// file_path は cwd 相対（appcmd が cwd 配下の .git/ に書く）。-p1 は git diff 既定と一致するため不要。
+pub fn applyPatchArgv(a: std.mem.Allocator, reverse: bool, file_path: []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(a);
+    try list.appendSlice(a, &.{ "git", "apply", "--cached" });
+    if (reverse) try list.append(a, "--reverse");
+    try list.append(a, file_path);
+    return list.toOwnedSlice(a);
+}
+
 // --- 高レベル関数（実行系・Zig 0.16 Io API） ---
 
 /// cwd を起点にリポジトリルートを返す。cwd を明示できるのでサブディレクトリ起動もテスト可能。
@@ -151,6 +162,26 @@ test "diffArgv injects -c core.quotePath=false right after git (all sections)" {
         try std.testing.expectEqualStrings("core.quotePath=false", argv[2]);
         try std.testing.expectEqualStrings("diff", argv[3]);
     }
+}
+
+test "applyPatchArgv: forward has no --reverse, file_path last" {
+    const a = std.testing.allocator;
+    const argv = try applyPatchArgv(a, false, ".git/git-tui-stage.patch");
+    defer a.free(argv);
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("apply", argv[1]);
+    try std.testing.expectEqualStrings("--cached", argv[2]);
+    try std.testing.expectEqualStrings(".git/git-tui-stage.patch", argv[3]);
+    try std.testing.expectEqual(@as(usize, 4), argv.len);
+}
+
+test "applyPatchArgv: reverse inserts --reverse before file_path" {
+    const a = std.testing.allocator;
+    const argv = try applyPatchArgv(a, true, ".git/git-tui-stage.patch");
+    defer a.free(argv);
+    try std.testing.expectEqualStrings("--reverse", argv[3]);
+    try std.testing.expectEqualStrings(".git/git-tui-stage.patch", argv[4]);
+    try std.testing.expectEqual(@as(usize, 5), argv.len);
 }
 
 // 高レベル関数（実行系）はテスト未参照だと Zig のレイジー解析でボディが
