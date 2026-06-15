@@ -19,6 +19,7 @@ pub const Model = struct {
     changes_scroll: usize, // Changes ペインの先頭表示**行**（見出し含む visual row オフセット）
     diff_text: []u8, // 選択ファイルの diff（空可）
     diff_scroll: usize, // diff ペインの先頭表示行（スクロールオフセット）
+    selected_hunk: usize, // diff ペインの現在ハンク（0始まり）。ファイル切替で 0、diff 再読込で clamp。
     commit_message: []u8, // TextArea の内容（空可）
     focus: Focus,
     busy: bool,
@@ -36,6 +37,7 @@ pub const Model = struct {
             .changes_scroll = 0,
             .diff_text = try a.dupe(u8, ""),
             .diff_scroll = 0,
+            .selected_hunk = 0,
             .commit_message = try a.dupe(u8, ""),
             .focus = .changes,
             .busy = false,
