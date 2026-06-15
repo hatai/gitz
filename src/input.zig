@@ -231,8 +231,11 @@ pub fn fromZigzagMouse(
     else
         null;
 
-    // diff ペイン内クリックなら、ペイン相対行に diff_scroll を足した絶対 diff 行を作る
-    // （renderDiff が diff_scroll を ensure-visible 済みで書き戻すため、描画と一致する）。
+    // diff ペイン内クリックなら、ペイン相対行に diff_scroll を足した絶対 diff 行を作る。
+    // focus==.diff のフレームでは renderDiff（Task7）が ensureVisible で diff_scroll を選択ハンクの
+    // 可視範囲へ書き戻すため、表示先頭行 == diff_scroll となりクリックが描画と一致する。
+    // Ctrl+d/u でハンク外へ over-scroll した場合のみ、表示が clampScroll で丸められ diff_scroll と
+    // 乖離してクリックが別ハンク/no-op になり得る（spec §11 の既知 seam。phase 1 は許容）。
     const diff_line: ?usize = if (on_diff)
         model.diff_scroll + @as(usize, ev.y - layout.diff.y)
     else
@@ -460,6 +463,23 @@ test "fromZigzagMouse: click on diff pane yields select_hunk_at_line with scroll
     const msg = mouseToMsg(me);
     try std.testing.expect(msg.? == .select_hunk_at_line);
     try std.testing.expectEqual(@as(usize, 5), msg.?.select_hunk_at_line);
+}
+
+test "fromZigzagMouse: release/drag on diff pane is ignored (no hunk select)" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    m.diff_scroll = 3;
+    // diff ペイン座標 (x=50, y=2)。release と drag はどちらも ignore（select_hunk_at_line を出さない）。
+    const rel = zz.MouseEvent{ .x = 50, .y = 2, .button = .left, .event_type = .release };
+    const me_rel = fromZigzagMouse(rel, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me_rel.kind);
+    try std.testing.expect(mouseToMsg(me_rel) == null);
+    const drg = zz.MouseEvent{ .x = 50, .y = 2, .button = .left, .event_type = .drag };
+    const me_drg = fromZigzagMouse(drg, &m, mouse_test_layout, &cs, 1100, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me_drg.kind);
+    try std.testing.expect(mouseToMsg(me_drg) == null);
 }
 
 test "fromZigzagMouse: left RELEASE on file row is ignored (no double select)" {
