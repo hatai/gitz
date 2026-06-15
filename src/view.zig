@@ -188,8 +188,8 @@ pub fn clampScroll(scroll: usize, total: usize) usize {
 }
 
 /// Diff ペイン: `model.diff_text` を `model.diff_scroll` を先頭行として描画。`+`/`-` を色分け。
-/// focus==.diff かつ hunk>0 のとき、選択ハンクの @@ ヘッダ行を反転＋マーカー強調し、
-/// その行が可視範囲に入るよう `model.diff_scroll` を ensure-visible で書き戻す（diff_scroll の唯一 writer）。
+/// focus==.diff のとき選択ハンクの @@ ヘッダ行を反転＋マーカー強調し、選択ハンクが画面に
+/// 掛かるよう `model.diff_scroll` を調整する（diff_scroll の唯一 writer）。
 fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     const a = ctx.allocator;
     if (model.diff_text.len == 0) return "(no diff)";
@@ -200,20 +200,28 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
 
     const limit: usize = if (height == 0) 1 else height;
 
-    // ハンク境界を取得（arena）。失敗時は空スライスでハイライト無しの従来描画にフォールバック。
-    const parsed = hunk.parse(a, model.diff_text) catch hunk.ParsedDiff{ .file_header = "", .hunks = &[_]hunk.Hunk{} };
-    const hunks = parsed.hunks;
-
-    // 選択ハンクが可視になるよう diff_scroll を ensure-visible（focus==.diff かつ hunk>0 のときのみ）。
+    // focus==.diff のときだけハンク境界を解析（changes/commit フォーカス中は parse を走らせない）。
+    // 選択ハンクが画面に全く掛かっていなければ先頭をトップに合わせる（j/k で遠いハンクへ移動した時）。
+    // 一部でも見えている間は diff_scroll を据え置き、Ctrl+d/u で大きいハンクの末尾まで読める。
+    // diff_scroll はこのブロックが唯一の writer で、常にハンク範囲内＝diff 行数内に収まるため、
+    // 表示先頭行 == diff_scroll となりマウス当たり判定（diff_scroll + ペイン相対行）と一致する。
     var sel_header_line: ?usize = null;
-    if (model.focus == .diff and hunks.len > 0) {
-        const sel = @min(model.selected_hunk, hunks.len - 1);
-        sel_header_line = hunks[sel].start_line;
-        model.diff_scroll = ensureVisible(model.diff_scroll, hunks[sel].start_line, limit);
+    if (model.focus == .diff) {
+        const parsed = hunk.parse(a, model.diff_text) catch hunk.ParsedDiff{ .file_header = "", .hunks = &[_]hunk.Hunk{} };
+        if (parsed.hunks.len > 0) {
+            const sel = @min(model.selected_hunk, parsed.hunks.len - 1);
+            const h = parsed.hunks[sel];
+            sel_header_line = h.start_line;
+            const hunk_top = h.start_line;
+            const hunk_bot = h.start_line + h.line_count; // exclusive
+            const view_top = model.diff_scroll;
+            const view_bot = model.diff_scroll + limit; // exclusive
+            const overlaps = hunk_top < view_bot and hunk_bot > view_top;
+            if (!overlaps) model.diff_scroll = hunk_top;
+        }
     }
 
-    // 総行数で clamp（末尾超過の空表示を防ぐ）。`diff_scroll` の writer は上の ensureVisible、
-    // 表示オフセットはこの clampScroll の二段（spec §11 の seam: Ctrl+d/u はハンク外で引き戻される）。
+    // 総行数で clamp（末尾超過の空表示を防ぐ）。
     var total_lines: usize = 0;
     {
         var cit = std.mem.splitScalar(u8, model.diff_text, '\n');
@@ -228,10 +236,12 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
         if (idx < scroll_off) continue;
         if (lines.items.len >= limit) break;
         // 選択ハンクの @@ ヘッダ行は反転＋左マーカーで強調する。
-        if (sel_header_line != null and idx == sel_header_line.?) {
-            const marked = std.fmt.allocPrint(a, "\u{258C}{s}", .{line}) catch line;
-            lines.append(a, sel_style.render(a, marked) catch marked) catch break;
-            continue;
+        if (sel_header_line) |t| {
+            if (idx == t) {
+                const marked = std.fmt.allocPrint(a, "\u{258C}{s}", .{line}) catch line;
+                lines.append(a, sel_style.render(a, marked) catch marked) catch break;
+                continue;
+            }
         }
         const styled: []const u8 = if (line.len > 0 and line[0] == '+')
             (add_style.render(a, line) catch line)
@@ -242,7 +252,6 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
         lines.append(a, styled) catch break;
     }
     if (lines.items.len == 0) return "";
-    // プレーン改行で結合（zz.joinVertical の最長行パディングを避ける。理由は renderChanges 参照）。
     return std.mem.join(a, "\n", lines.items) catch "(diff render error)";
 }
 
