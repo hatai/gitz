@@ -57,6 +57,8 @@ zig build test --summary all
 | `Ctrl+D` | diff ペインを下へスクロール |
 | `Ctrl+U` | diff ペインを上へスクロール |
 | `q` | 終了 |
+| `j` / `k`（diff フォーカス時） | ハンクカーソルを上下に移動 |
+| `s` / `space` / `Enter`（diff フォーカス時） | 選択中ハンクを stage / unstage |
 | `Ctrl+S` | コミット実行（コミットメッセージ欄フォーカス時） |
 | `Esc` / `Tab` | コミット欄からフォーカスを戻す |
 
@@ -66,5 +68,7 @@ zig build test --summary all
 - ファイル行ダブルクリック: stage / unstage トグル
 - diff ペイン上でホイール: diff スクロール
 - 各ペインクリック: そのペインへフォーカス
+- diff ペイン上でクリック: そのハンクを選択
+- untracked / rename ファイルはハンク単位 stage 非対応（`space`/`s` でファイル単位 stage）
 
 コミットメッセージ欄にフォーカス中は、文字入力・改行・カーソル移動などの編集キーはテキストエリアが処理し、グローバルキー（`q` 等）は無効化されます（日本語入力中の誤爆防止）。

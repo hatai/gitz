@@ -20,17 +20,22 @@ MVP ではファイル単位でしか stage できないが、実用上は「同
 stage / unstage する。
 
 ### Sub Tasks
-- [ ] diff のハンク（`@@ ... @@` 単位）を構造化してモデルに保持
-- [ ] diff ペインでハンク選択 UI（ハイライト・カーソル）を追加
-- [ ] 選択ハンクから `git apply --cached`（or `--cached --reverse`）用のパッチを生成
-- [ ] `git apply --cached -` に stdin でパッチを渡して stage / unstage
-- [ ] 行単位選択（複数行レンジ）→ 部分パッチ生成
-- [ ] untracked ファイルのハンク stage（intent-to-add `git add -N` の検討）
-- [ ] パッチ生成のユニットテスト（コンテキスト行・改行末尾・日本語を含む差分）
+- [x] diff のハンク（`@@ ... @@` 単位）を構造化してモデルに保持
+- [x] diff ペインでハンク選択 UI（ハイライト・カーソル）を追加
+- [x] 選択ハンクから `git apply --cached`（or `--cached --reverse`）用のパッチを生成
+- [x] `git apply --cached <tmpfile>` でパッチを適用して stage / unstage（stdin 不可のため一時ファイル方式）
+- [ ] 行単位選択（複数行レンジ）→ 部分パッチ生成（phase 2）
+- [ ] untracked ファイルのハンク stage（intent-to-add `git add -N`）（phase 2）
+- [x] パッチ生成のユニットテスト（コンテキスト行・改行末尾・日本語を含む差分）
+- [ ] rename ファイルのハンク stage（phase 2: file_header の rename 行を扱う）
 
 ### 留意点
 - パッチのコンテキスト行・`\ No newline at end of file`・CRLF の扱いに注意。
 - 日本語を含む行でもバイトオフセットではなく行単位でパッチを組む。
+- **phase 1 の既知の制約（phase 2 で対応）**:
+  - 一時パッチを `<repo_root>/.git/` に書くため、linked worktree / submodule（`.git` がファイル）ではハンク stage が失敗する。実 git-dir 解決（`git rev-parse --absolute-git-dir`）またはシステム tmpdir 絶対パス書込で対応予定。
+  - `focus!=.diff`（changes フォーカス）で `Ctrl+d/u` を多用すると `diff_scroll` が diff 行数を超え得る。その状態の diff ペインクリックは範囲外で no-op（誤選択にはならない）。根治は reducer の `scroll_diff_down` で diff 行数クランプ。
+  - `input.fromZigzagMouse` の戻り値 MouseEvent リテラルが分岐ごとに重複しており、フィールド追加時に漏れやすい。ベースを 1 度組んで `.kind` だけ差し替える factoring を検討。
 
 ---
 
