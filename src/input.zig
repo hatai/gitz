@@ -47,6 +47,26 @@ pub fn keyToMsg(focus: Focus, key: Key) ?Msg {
             else => null,
         };
     }
+    if (focus == .diff) {
+        return switch (key) {
+            .char => |c| switch (c) {
+                'j' => .hunk_next,
+                'k' => .hunk_prev,
+                's', ' ' => .stage_hunk,
+                'c' => .focus_commit,
+                'r' => .request_refresh,
+                'q' => .quit,
+                else => null,
+            },
+            .down => .hunk_next,
+            .up => .hunk_prev,
+            .enter => .stage_hunk,
+            .tab => .focus_next,
+            .ctrl_d => .scroll_diff_down,
+            .ctrl_u => .scroll_diff_up,
+            else => null,
+        };
+    }
     return switch (key) {
         .char => |c| switch (c) {
             'j' => .key_down,
@@ -79,13 +99,22 @@ pub const MouseEvent = struct {
     file_row: ?usize = null,
     /// diff ペイン上のイベントか（ホイール対象判定）
     on_diff: bool = false,
+    /// diff ペインクリック時の **絶対 diff 行番号**（diff_scroll + ペイン相対行）。null=diff 外。
+    diff_line: ?usize = null,
 };
 
 pub fn mouseToMsg(ev: MouseEvent) ?Msg {
     return switch (ev.kind) {
         // ファイル行クリック→選択（reducer 側で focus も changes に移る）。
         // ファイル行以外のペインクリック→そのペインへフォーカス。
-        .left_click => if (ev.file_row) |r| .{ .select_index = r } else if (ev.pane) |p| .{ .set_focus = p } else null,
+        .left_click => if (ev.file_row) |r|
+            .{ .select_index = r }
+        else if (ev.diff_line) |dl|
+            .{ .select_hunk_at_line = dl }
+        else if (ev.pane) |p|
+            .{ .set_focus = p }
+        else
+            null,
         .left_double => if (ev.file_row != null) .toggle_stage else null,
         .wheel_down => if (ev.on_diff) .scroll_diff_down else null,
         .wheel_up => if (ev.on_diff) .scroll_diff_up else null,
@@ -202,22 +231,29 @@ pub fn fromZigzagMouse(
     else
         null;
 
+    // diff ペイン内クリックなら、ペイン相対行に diff_scroll を足した絶対 diff 行を作る
+    // （renderDiff が diff_scroll を ensure-visible 済みで書き戻すため、描画と一致する）。
+    const diff_line: ?usize = if (on_diff)
+        model.diff_scroll + @as(usize, ev.y - layout.diff.y)
+    else
+        null;
+
     return switch (ev.button) {
         // ホイールは event_type に関係なく honor する（SGR では wheel も press 扱いで来る）。
-        .wheel_up => .{ .kind = .wheel_up, .pane = pane, .file_row = file_row, .on_diff = on_diff },
-        .wheel_down => .{ .kind = .wheel_down, .pane = pane, .file_row = file_row, .on_diff = on_diff },
+        .wheel_up => .{ .kind = .wheel_up, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line },
+        .wheel_down => .{ .kind = .wheel_down, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line },
         .left => blk: {
             // press のみ click/double として扱う。release/drag/move は `ignore`（select_index/set_focus を誤爆させない）。
             // mode 1003 では単一の物理クリックでも press と release が来るため、両方を click にすると 2 回選択される。
-            if (ev.event_type != .press) break :blk .{ .kind = .ignore, .pane = pane, .file_row = file_row, .on_diff = on_diff };
+            if (ev.event_type != .press) break :blk .{ .kind = .ignore, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line };
             const kind: @FieldType(MouseEvent, "kind") = switch (classifyClick(cs, now_ms, file_row)) {
                 .double => .left_double,
                 .single => .left_click,
             };
-            break :blk .{ .kind = kind, .pane = pane, .file_row = file_row, .on_diff = on_diff };
+            break :blk .{ .kind = kind, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line };
         },
         // 中/右/wheel_left/wheel_right/button_8..11/none と bare motion は何もしない。
-        else => .{ .kind = .ignore, .pane = pane, .file_row = file_row, .on_diff = on_diff },
+        else => .{ .kind = .ignore, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line },
     };
 }
 
@@ -253,6 +289,29 @@ test "changes focus: navigation and command keys map" {
 }
 test "changes focus: unmapped char returns null" {
     try std.testing.expect(keyToMsg(.changes, .{ .char = 'z' }) == null);
+}
+
+test "diff focus: hunk navigation and stage keys map" {
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 'j' }).? == .hunk_next);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 'k' }).? == .hunk_prev);
+    try std.testing.expect(keyToMsg(.diff, .down).? == .hunk_next);
+    try std.testing.expect(keyToMsg(.diff, .up).? == .hunk_prev);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 's' }).? == .stage_hunk);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = ' ' }).? == .stage_hunk);
+    try std.testing.expect(keyToMsg(.diff, .enter).? == .stage_hunk);
+    try std.testing.expect(keyToMsg(.diff, .ctrl_d).? == .scroll_diff_down);
+    try std.testing.expect(keyToMsg(.diff, .ctrl_u).? == .scroll_diff_up);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 'c' }).? == .focus_commit);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 'r' }).? == .request_refresh);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 'q' }).? == .quit);
+    try std.testing.expect(keyToMsg(.diff, .tab).? == .focus_next);
+}
+
+test "changes focus mapping is unchanged (regression)" {
+    try std.testing.expect(keyToMsg(.changes, .{ .char = 'j' }).? == .key_down);
+    try std.testing.expect(keyToMsg(.changes, .{ .char = 's' }).? == .toggle_stage);
+    try std.testing.expect(keyToMsg(.changes, .{ .char = ' ' }).? == .toggle_stage);
+    try std.testing.expect(keyToMsg(.changes, .enter) == null); // enter は changes では無命令
 }
 
 test "double click on file row toggles stage" {
@@ -387,6 +446,20 @@ test "fromZigzagMouse: left press on file row B yields left_click -> select_inde
     const msg = mouseToMsg(me);
     try std.testing.expect(msg.? == .select_index);
     try std.testing.expectEqual(@as(usize, 1), msg.?.select_index);
+}
+
+test "fromZigzagMouse: click on diff pane yields select_hunk_at_line with scroll offset" {
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    m.diff_scroll = 3; // 表示オフセットを合算する検証
+    // diff ペイン (x=50, y=2)。ペイン相対行 = 2 - layout.diff.y(=0) = 2 → 絶対 diff 行 = 3 + 2 = 5。
+    const ev = zz.MouseEvent{ .x = 50, .y = 2, .button = .left, .event_type = .press };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    const msg = mouseToMsg(me);
+    try std.testing.expect(msg.? == .select_hunk_at_line);
+    try std.testing.expectEqual(@as(usize, 5), msg.?.select_hunk_at_line);
 }
 
 test "fromZigzagMouse: left RELEASE on file row is ignored (no double select)" {
