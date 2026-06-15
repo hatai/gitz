@@ -79,6 +79,10 @@ pub const Model = struct {
             errdefer if (orig) |o| a.free(o);
             try next.append(a, .{ .path = path, .orig_path = orig, .section = e.section });
         }
+        // 表示順（section: staged→unstaged→untracked、その中で path 昇順）に並べ替え、
+        // **格納順 == 表示順** にする。これにより j/k（model.selected を格納順で線形移動）の
+        // ハイライトが画面上を連続的に動く（view.changesRowLayout の表示順と一致する）。
+        std.mem.sort(FileItem, next.items, {}, lessThanForDisplay);
         // ここまで来れば成功。旧 files を解放して入れ替える。
         for (self.files.items) |*f| {
             a.free(f.path);
@@ -95,6 +99,23 @@ pub const Model = struct {
         const dup = try a.dupe(u8, value);
         a.free(field.*);
         field.* = dup;
+    }
+
+    /// 表示順の section ランク（staged が先頭、untracked が末尾）。
+    fn sectionRank(s: status.Section) u8 {
+        return switch (s) {
+            .staged => 0,
+            .unstaged => 1,
+            .untracked => 2,
+        };
+    }
+
+    /// 表示順比較: section ランク優先、同 section 内は path 昇順。
+    fn lessThanForDisplay(_: void, a: FileItem, b: FileItem) bool {
+        const ra = sectionRank(a.section);
+        const rb = sectionRank(b.section);
+        if (ra != rb) return ra < rb;
+        return std.mem.lessThan(u8, a.path, b.path);
     }
 };
 
@@ -129,4 +150,31 @@ test "replaceFiles copies entries (caller still owns originals)" {
     try m.replaceFiles(entries); // Model は複製を持つ（二重 free しない）
     try std.testing.expectEqual(@as(usize, 1), m.files.items.len);
     try std.testing.expectEqualStrings("f.txt", m.files.items[0].path);
+}
+
+test "replaceFiles sorts by section (staged<unstaged<untracked) then path" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/tmp/repo");
+    defer m.deinit();
+    // 入力は git 出力順を模した section interleave・path 不同順。
+    const entries = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "z.txt"), .orig_path = null, .section = .unstaged },
+        .{ .path = try a.dupe(u8, "a.txt"), .orig_path = null, .section = .untracked },
+        .{ .path = try a.dupe(u8, "m.txt"), .orig_path = null, .section = .staged },
+        .{ .path = try a.dupe(u8, "b.txt"), .orig_path = null, .section = .unstaged },
+    };
+    defer for (entries) |e| {
+        a.free(e.path);
+        if (e.orig_path) |p| a.free(p);
+    };
+    try m.replaceFiles(&entries);
+    // 期待: staged(m) → unstaged(b, z 昇順) → untracked(a)。格納順 == 表示順。
+    try std.testing.expectEqual(@as(usize, 4), m.files.items.len);
+    try std.testing.expectEqualStrings("m.txt", m.files.items[0].path);
+    try std.testing.expectEqual(status.Section.staged, m.files.items[0].section);
+    try std.testing.expectEqualStrings("b.txt", m.files.items[1].path);
+    try std.testing.expectEqualStrings("z.txt", m.files.items[2].path);
+    try std.testing.expectEqual(status.Section.unstaged, m.files.items[2].section);
+    try std.testing.expectEqualStrings("a.txt", m.files.items[3].path);
+    try std.testing.expectEqual(status.Section.untracked, m.files.items[3].section);
 }
