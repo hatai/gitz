@@ -15,4 +15,5 @@ test {
     _ = @import("appcmd.zig"); // Task 8
     _ = @import("input.zig"); // Task 9
     _ = @import("view.zig"); // Task 10
+    _ = @import("diff/hunk.zig"); // 部分ステージング
 }
