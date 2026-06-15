@@ -163,7 +163,7 @@ fn applyAppCmd(app: *App, program: anytype, cmd: AppCmd) void {
     switch (cmd) {
         .none => {},
         .quit => program.quit(),
-        .refresh_status, .stage, .unstage, .load_diff, .commit => dispatchSideEffect(app, cmd),
+        .refresh_status, .stage, .unstage, .load_diff, .commit, .apply_patch => dispatchSideEffect(app, cmd),
     }
 }
 
@@ -355,7 +355,7 @@ fn seedInitialStatus(app: *App) void {
             second.deinit(app.gpa);
             cmd2.deinit(app.gpa); // 連鎖はここで打ち切り（busy=false のまま起動）
         },
-        .none, .quit => {},
+        .none, .quit, .apply_patch => {},
     }
     app.model.busy = false;
 }

@@ -15,6 +15,10 @@ pub const Msg = union(enum) {
     request_commit, // Ctrl+S
     scroll_diff_down, // Ctrl+d / ホイール下（diff ペイン）
     scroll_diff_up, // Ctrl+u / ホイール上（diff ペイン）
+    hunk_next, // diff フォーカス時 j / ↓（ハンクカーソルを次へ）
+    hunk_prev, // diff フォーカス時 k / ↑（ハンクカーソルを前へ）
+    stage_hunk, // diff フォーカス時 s / space / Enter（section で stage/unstage 決定）
+    select_hunk_at_line: usize, // diff ペインクリックの絶対 diff 行（reducer がハンクに解決）
     quit,
     select_index: usize, // マウスでファイル行クリック
     set_focus: Focus, // ペインクリックでフォーカス変更
@@ -51,6 +55,10 @@ pub const Msg = union(enum) {
             .request_commit,
             .scroll_diff_down,
             .scroll_diff_up,
+            .hunk_next,
+            .hunk_prev,
+            .stage_hunk,
+            .select_hunk_at_line,
             .quit,
             .select_index,
             .set_focus,
@@ -68,10 +76,14 @@ pub const AppCmd = union(enum) {
     unstage: OwnedPath,
     load_diff: LoadDiff,
     commit: []u8, // 所有: メッセージ複製
+    apply_patch: ApplyPatch,
     quit,
 
     pub const OwnedPath = struct { path: []u8, orig_path: ?[]u8, section: Section };
     pub const LoadDiff = struct { path: []u8, orig_path: ?[]u8, section: Section };
+    /// 部分ステージング: 単一ハンクのパッチ（所有）と適用方向。
+    /// reverse=false: stage（git apply --cached）。reverse=true: unstage（--reverse）。
+    pub const ApplyPatch = struct { patch: []u8, reverse: bool };
 
     pub fn deinit(self: *AppCmd, a: std.mem.Allocator) void {
         // 網羅的 switch: 所有バリアントを追加したら必ずここに解放処理を書く
@@ -87,6 +99,7 @@ pub const AppCmd = union(enum) {
                 if (ld.orig_path) |p| a.free(p);
             },
             .commit => |m| a.free(m),
+            .apply_patch => |ap| a.free(ap.patch),
             // 単純: 解放不要
             .none,
             .refresh_status,
@@ -101,6 +114,14 @@ test "AppCmd.commit owns its message and frees on deinit" {
     var cmd = AppCmd{ .commit = try a.dupe(u8, "hello") };
     defer cmd.deinit(a);
     try std.testing.expectEqualStrings("hello", cmd.commit);
+}
+
+test "AppCmd.apply_patch owns its patch and frees on deinit" {
+    const a = std.testing.allocator;
+    var cmd = AppCmd{ .apply_patch = .{ .patch = try a.dupe(u8, "@@ -1 +1 @@\n-a\n+b\n"), .reverse = true } };
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd.apply_patch.reverse);
+    try std.testing.expectEqualStrings("@@ -1 +1 @@\n-a\n+b\n", cmd.apply_patch.patch);
 }
 
 // --- Msg.status_loaded: 複数要素 + orig_path 有無の混在を確保し deinit でリークなし ---

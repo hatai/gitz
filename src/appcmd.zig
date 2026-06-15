@@ -54,6 +54,33 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
             if (res.exit_code != 0) return .{ .git_error = try a.dupe(u8, res.stderr) };
             return .committed;
         },
+        .apply_patch => |ap| {
+            // 書込先 Dir を cwd から解決（.dir=借用 / .path=open / .inherit=process cwd）。
+            var owned_dir = false;
+            var base: std.Io.Dir = switch (cwd) {
+                .dir => |d| d,
+                .path => |p| blk: {
+                    owned_dir = true;
+                    break :blk try std.Io.Dir.openDirAbsolute(io, p, .{});
+                },
+                .inherit => std.Io.Dir.cwd(),
+            };
+            defer if (owned_dir) base.close(io);
+            // .git/ 配下に書く（worktree に出さず status を汚さない）。副作用は worker で
+            // 直列化されるため固定名で衝突しない。
+            const rel = ".git/git-tui-stage.patch";
+            try base.writeFile(io, .{ .sub_path = rel, .data = ap.patch });
+            const argv = try cmds.applyPatchArgv(a, ap.reverse, rel);
+            defer a.free(argv);
+            var res = try process.run(a, io, argv, cwd);
+            defer res.deinit(a);
+            base.deleteFile(io, rel) catch {}; // status を読む前に消す
+            if (res.exit_code != 0) return .{ .git_error = try a.dupe(u8, res.stderr) };
+            var sres = try cmds.statusRaw(a, io, cwd);
+            defer sres.deinit(a);
+            if (sres.exit_code != 0) return .{ .git_error = try a.dupe(u8, sres.stderr) };
+            return .{ .status_loaded = try statusmod.parse(a, sres.stdout) };
+        },
     }
 }
 
@@ -231,4 +258,104 @@ test "load_diff failure preserves no crash and surfaces git_error path" {
     defer m.deinit(a);
     try std.testing.expect(m == .diff_loaded);
     try std.testing.expect(std.mem.indexOf(u8, m.diff_loaded, "changed") != null);
+}
+
+test "apply_patch stages a single hunk (partial stage), leaving the rest unstaged" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    // 先頭と末尾を変更 → 2 ハンクの unstaged diff（3 行コンテキストで離れているため分離）。
+    try repo.writeFile(io, "f.txt", "1x\n2\n3\n4\n5\n6\n7\n8\n9\n10x\n");
+    var dmsg = try runOwned(a, io, repo.cwd(), .{ .load_diff = .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .unstaged } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.hunks.len >= 2);
+    const patch = try hunk.buildPatch(a, parsed, 0);
+    var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{ .patch = patch, .reverse = false } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded);
+    var has_staged = false;
+    var has_unstaged = false;
+    for (msg.status_loaded) |e| {
+        if (std.mem.eql(u8, e.path, "f.txt")) {
+            if (e.section == .staged) has_staged = true;
+            if (e.section == .unstaged) has_unstaged = true;
+        }
+    }
+    try std.testing.expect(has_staged and has_unstaged);
+}
+
+test "apply_patch with reverse=true unstages a single staged hunk" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    try repo.writeFile(io, "f.txt", "1x\n2\n3\n4\n5\n6\n7\n8\n9\n10x\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" }); // 全 stage → staged diff に 2 ハンク
+    var dmsg = try runOwned(a, io, repo.cwd(), .{ .load_diff = .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .staged } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.hunks.len >= 2);
+    const patch = try hunk.buildPatch(a, parsed, 0);
+    var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{ .patch = patch, .reverse = true } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded);
+    var has_staged = false;
+    var has_unstaged = false;
+    for (msg.status_loaded) |e| {
+        if (std.mem.eql(u8, e.path, "f.txt")) {
+            if (e.section == .staged) has_staged = true;
+            if (e.section == .unstaged) has_unstaged = true;
+        }
+    }
+    try std.testing.expect(has_staged and has_unstaged);
+}
+
+test "apply_patch succeeds on a hunk with No-newline-at-eof" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "f.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    try repo.writeFile(io, "f.txt", "a"); // 末尾改行を削る → "\ No newline at end of file"
+    var dmsg = try runOwned(a, io, repo.cwd(), .{ .load_diff = .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .unstaged } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.hunks.len >= 1);
+    const patch = try hunk.buildPatch(a, parsed, 0);
+    var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{ .patch = patch, .reverse = false } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded); // git_error にならず apply 成功
+}
+
+test "apply_patch surfaces git_error on a corrupt patch" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "f.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    const bad = try a.dupe(u8, "--- a/f.txt\n+++ b/f.txt\n@@ -100,1 +100,1 @@\n-zzz\n+yyy\n");
+    var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{ .patch = bad, .reverse = false } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .git_error); // 握り潰さない
 }
