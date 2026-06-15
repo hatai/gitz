@@ -172,7 +172,10 @@ fn renderChanges(model: *Model, ctx: *const zz.Context, height: u16) []const u8 
         }
     }
     if (lines.items.len == 0) return "(no changes)";
-    return zz.joinVertical(a, lines.items) catch "(changes render error)";
+    // プレーン改行で結合する（zz.joinVertical は全行を最長行幅にパディングするため使わない）。
+    // パディングは fitPane の place が担う。joinVertical を使うと短い行も最長行幅になり、
+    // fitPane が全行をペイン幅に切り詰めて余計な "..." を付けてしまう。
+    return std.mem.join(a, "\n", lines.items) catch "(changes render error)";
 }
 
 /// スクロールオフセットを総行数に対してクランプする純粋関数（Item 4: 末尾超過の空表示を防ぐ）。
@@ -217,7 +220,8 @@ fn renderDiff(model: *const Model, ctx: *const zz.Context, height: u16) []const 
         lines.append(a, styled) catch break;
     }
     if (lines.items.len == 0) return "";
-    return zz.joinVertical(a, lines.items) catch "(diff render error)";
+    // プレーン改行で結合（zz.joinVertical の最長行パディングを避ける。理由は renderChanges 参照）。
+    return std.mem.join(a, "\n", lines.items) catch "(diff render error)";
 }
 
 /// Commit ペイン: キャッシュ済み `model.commit_message` を描く。
@@ -249,10 +253,12 @@ fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
 
 /// 各ペインの内容を矩形 `r` のセル数に合わせて整形する。
 /// - 高さ: `r.h` 行を超える行は捨てる（行単位なので ANSI を壊さない）。
-/// - 幅: `zz.place.place` で `r.w` 桁まで右パディングする（ANSI 幅は無視して計測）。
-///   ⚠️ `place` は切り詰めをしない。`r.w` 桁を**超える**行はそのまま残る（幅は下限保証）。
-///   個々のスタイル付き行を表示桁で安全に切る術が無い（ANSI エスケープを割らずに桁で切るのは
-///   非自明）ため、MVP では幅は下限のみ強制し、極端に長い行のオーバーフローは許容する。
+/// - 幅: 各行を `r.w` 桁に**切り詰めてから** `zz.place.place` で `r.w` 桁に右パディングする。
+///   切り詰めは `zz.measure.truncate`（ANSI エスケープを割らず、全角は 2 桁として計測）を使う。
+///   ⚠️ これは表示崩れの根本対処: 切り詰めないと長い diff 行/パスがペイン幅を超え、
+///   `joinHorizontal` 連結後に端末幅を超えてターミナルが行を折り返す。折り返しで各行が複数
+///   物理行を占有し、フレーム全体が端末高を超えて上段がスクロールアウトする（実機で確認した
+///   「上段が空白」の原因）。各行を幅に収めれば 1 論理行 = 1 物理行となり崩れない。
 fn fitPane(a: std.mem.Allocator, content: []const u8, r: Rect) []const u8 {
     // 高さクランプ: 先頭 r.h 行だけ残す（r.h==0 は 1 行に丸める）。
     const max_lines: usize = if (r.h == 0) 1 else r.h;
@@ -269,8 +275,25 @@ fn fitPane(a: std.mem.Allocator, content: []const u8, r: Rect) []const u8 {
         }
     }
     if (nl_count >= max_lines) clamped = content[0..cut];
-    // 幅クランプ（下限のみ）: r.w 桁まで右パディング。
-    return zz.place.place(a, r.w, max_lines, .left, .top, clamped) catch clamped;
+
+    // 幅クランプ（上限）: 各行を r.w 桁に切り詰める。
+    const w: usize = r.w;
+    var tl: std.ArrayList([]const u8) = .empty; // arena なので deinit 不要
+    var lit = std.mem.splitScalar(u8, clamped, '\n');
+    while (lit.next()) |line| {
+        if (zz.width(line) <= w) {
+            tl.append(a, line) catch {};
+        } else {
+            const cut_line = zz.measure.truncate(a, line, w) catch line;
+            // 切り詰めで閉じスタイル(ESC[0m)が落ちると色がパディングへ漏れるため reset を付す
+            //（reset は表示幅 0 なので桁計算に影響しない）。
+            const safe = std.fmt.allocPrint(a, "{s}\x1b[0m", .{cut_line}) catch cut_line;
+            tl.append(a, safe) catch {};
+        }
+    }
+    const fitted = if (tl.items.len == 0) clamped else (zz.joinVertical(a, tl.items) catch clamped);
+    // 幅パディング（下限）: 切り詰め済みの各行を r.w 桁まで右パディング。
+    return zz.place.place(a, r.w, max_lines, .left, .top, fitted) catch fitted;
 }
 
 /// `Model` を端末 1 画面分の文字列に描画する（zigzag view 規約: 非エラーの `[]const u8`）。
@@ -344,11 +367,14 @@ test "layout zero width yields zero panes" {
     try std.testing.expectEqual(@as(u16, 0), l.diff.w);
 }
 
+// fitPane は本番では ctx.allocator（フレーム arena）で動き、中間確保はフレーム終端で
+// まとめて解放される契約。テストもその契約に合わせ arena を渡す（中間確保を個別 free しない）。
 test "fitPane clamps height to rect and pads each line to rect width" {
-    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     // 4 行を高さ 3 の矩形に収める → 先頭 3 行のみ、各行 10 桁に右パディング。
     const out = fitPane(a, "ab\ncd\nef\ngh", .{ .x = 0, .y = 0, .w = 10, .h = 3 });
-    defer a.free(out);
     var it = std.mem.splitScalar(u8, out, '\n');
     var n: usize = 0;
     while (it.next()) |line| : (n += 1) {
@@ -357,12 +383,23 @@ test "fitPane clamps height to rect and pads each line to rect width" {
     try std.testing.expectEqual(@as(usize, 3), n); // 3 行ちょうど（4 行目は捨てる）
 }
 
-test "fitPane width is a lower bound: overlong lines are not truncated" {
-    const a = std.testing.allocator;
-    // 幅 3 の矩形に 5 桁の行 → place は切り詰めないので 5 桁のまま（ドキュメント済みの契約）。
-    const out = fitPane(a, "hello", .{ .x = 0, .y = 0, .w = 3, .h = 1 });
-    defer a.free(out);
-    try std.testing.expectEqual(@as(usize, 5), zz.width(out));
+test "fitPane truncates overlong lines to rect width (no overflow/wrap)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 幅 8 の矩形に長い行 → ペイン幅を超えないよう切り詰める（端末折り返し防止）。
+    const out = fitPane(a, "hello world this is long", .{ .x = 0, .y = 0, .w = 8, .h = 1 });
+    try std.testing.expectEqual(@as(usize, 8), zz.width(out));
+}
+
+test "fitPane truncates a styled overlong line without exceeding width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 40 桁の緑スタイル行を幅 10 に → ANSI を割らずに 10 桁へ収める。
+    const styled = "\x1b[32m" ++ ("g" ** 40) ++ "\x1b[0m";
+    const out = fitPane(a, styled, .{ .x = 0, .y = 0, .w = 10, .h = 1 });
+    try std.testing.expectEqual(@as(usize, 10), zz.width(out));
 }
 
 test "changesRowLayout groups by section and maps rows back to storage indices" {
@@ -396,6 +433,25 @@ test "changesRowLayout clamps to the provided output slice" {
     var buf: [2]ChangesRow = undefined; // 見出し+1 行で打ち切り
     const n = changesRowLayout(&m, &buf);
     try std.testing.expectEqual(@as(usize, 2), n);
+}
+
+// 短い行と長い行が混在しても、短い行には省略記号が付かず、長い行だけが
+// ペイン幅に切り詰められることを保証する回帰テスト（joinVertical パディング由来の
+// 「全行 "..."」バグの再発防止）。
+test "fitPane keeps short lines intact and only truncates long ones (no spurious ellipsis)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const content = "short header\n" ++ ("x" ** 120);
+    const out = fitPane(a, content, .{ .x = 0, .y = 0, .w = 20, .h = 5 });
+    var it = std.mem.splitScalar(u8, out, '\n');
+    const row0 = it.next().?;
+    // 短い行は省略記号を含まない（末尾は空白パディング）。
+    try std.testing.expect(std.mem.indexOf(u8, row0, "...") == null);
+    try std.testing.expectEqual(@as(usize, 20), zz.width(row0));
+    const row1 = it.next().?;
+    // 長い行は 20 桁に収まる（切り詰め）。
+    try std.testing.expectEqual(@as(usize, 20), zz.width(row1));
 }
 
 test {
