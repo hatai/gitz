@@ -74,6 +74,67 @@ pub fn parse(a: std.mem.Allocator, diff_text: []const u8) !ParsedDiff {
     };
 }
 
+/// 選択ハンク 1 つ分のパッチ文字列を組む（file_header ＋ hunk.text、末尾改行を保証）。
+/// ハンク単位では選択行の変換が無く @@ の行数は git 値をそのまま使える（再計算不要）。
+/// forward / reverse でパッチ内容は同一（方向は appcmd の --reverse フラグで切り替える）。
+/// 返り値は呼び出し側所有（update が AppCmd.apply_patch へ move する）。
+pub fn buildPatch(a: std.mem.Allocator, parsed: ParsedDiff, hunk_index: usize) ![]u8 {
+    std.debug.assert(hunk_index < parsed.hunks.len);
+    const h = parsed.hunks[hunk_index];
+    const ends_nl = h.text.len > 0 and h.text[h.text.len - 1] == '\n';
+    if (ends_nl) {
+        return std.fmt.allocPrint(a, "{s}{s}", .{ parsed.file_header, h.text });
+    }
+    return std.fmt.allocPrint(a, "{s}{s}\n", .{ parsed.file_header, h.text });
+}
+
+/// 絶対 diff 行番号（splitScalar の要素 index）が属するハンク index を返す。
+/// どのハンクにも属さない（file_header / 範囲外）なら null。純粋・allocator 不要。
+pub fn hunkIndexForLine(parsed: ParsedDiff, abs_line: usize) ?usize {
+    for (parsed.hunks, 0..) |h, i| {
+        if (abs_line >= h.start_line and abs_line < h.start_line + h.line_count) return i;
+    }
+    return null;
+}
+
+test "buildPatch emits only the selected hunk plus file_header, newline-terminated" {
+    const a = std.testing.allocator;
+    const diff =
+        "diff --git a/f.txt b/f.txt\n" ++
+        "--- a/f.txt\n" ++
+        "+++ b/f.txt\n" ++
+        "@@ -1,2 +1,2 @@\n" ++
+        " a\n-b\n+B\n" ++
+        "@@ -10,2 +10,3 @@\n" ++
+        " x\n+Y\n z\n";
+    var p = try parse(a, diff);
+    defer p.deinit(a);
+    const patch = try buildPatch(a, p, 1); // 2 番目のハンクのみ
+    defer a.free(patch);
+    try std.testing.expect(std.mem.startsWith(u8, patch, "diff --git a/f.txt b/f.txt\n"));
+    try std.testing.expect(std.mem.indexOf(u8, patch, "@@ -10,2 +10,3 @@") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "@@ -1,2 +1,2 @@") == null);
+    try std.testing.expect(patch[patch.len - 1] == '\n');
+}
+
+test "hunkIndexForLine maps absolute diff line to hunk (header rows -> null outside)" {
+    const a = std.testing.allocator;
+    const diff =
+        "--- a/f\n+++ b/f\n" ++ // 行 0,1（file_header）
+        "@@ -1,1 +1,2 @@\n" ++ //   行 2  hunk0 開始
+        " a\n+B\n" ++ //            行 3,4
+        "@@ -9,1 +10,2 @@\n" ++ //  行 5  hunk1 開始
+        " x\n+Y\n"; //             行 6,7
+    var p = try parse(a, diff);
+    defer p.deinit(a);
+    try std.testing.expectEqual(@as(?usize, null), hunkIndexForLine(p, 0)); // file_header
+    try std.testing.expectEqual(@as(?usize, 0), hunkIndexForLine(p, 2)); // hunk0 ヘッダ
+    try std.testing.expectEqual(@as(?usize, 0), hunkIndexForLine(p, 4)); // hunk0 本文
+    try std.testing.expectEqual(@as(?usize, 1), hunkIndexForLine(p, 5)); // hunk1 ヘッダ
+    try std.testing.expectEqual(@as(?usize, 1), hunkIndexForLine(p, 7)); // hunk1 本文
+    try std.testing.expectEqual(@as(?usize, null), hunkIndexForLine(p, 99)); // 範囲外
+}
+
 test "parse splits two hunks and captures file_header" {
     const a = std.testing.allocator;
     const diff =
