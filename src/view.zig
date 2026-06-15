@@ -17,6 +17,7 @@ const zz = @import("zigzag");
 const Model = @import("model.zig").Model;
 const Focus = @import("model.zig").Focus;
 const Section = @import("git/status.zig").Section;
+const hunk = @import("diff/hunk.zig");
 
 pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
 pub const Layout = struct { changes: Rect, diff: Rect, commit: Rect, status: Rect };
@@ -187,16 +188,32 @@ pub fn clampScroll(scroll: usize, total: usize) usize {
 }
 
 /// Diff ペイン: `model.diff_text` を `model.diff_scroll` を先頭行として描画。`+`/`-` を色分け。
-fn renderDiff(model: *const Model, ctx: *const zz.Context, height: u16) []const u8 {
+/// focus==.diff かつ hunk>0 のとき、選択ハンクの @@ ヘッダ行を反転＋マーカー強調し、
+/// その行が可視範囲に入るよう `model.diff_scroll` を ensure-visible で書き戻す（diff_scroll の唯一 writer）。
+fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     const a = ctx.allocator;
     if (model.diff_text.len == 0) return "(no diff)";
 
     const add_style = zz.Style{ .foreground = zz.Color.green };
     const del_style = zz.Style{ .foreground = zz.Color.red };
+    const sel_style = zz.Style{ .reverse_attr = true, .bold_attr = true };
 
-    // Item 4: diff_scroll は reducer 側で無制限に増えうるため、描画側で総行数にクランプする
-    //（Model.diff_scroll 自体は据え置き、表示オフセットだけ min(scroll, total-1) に丸める）。
-    // 末尾超過で diff が空になる papercut を view 側で解消する。
+    const limit: usize = if (height == 0) 1 else height;
+
+    // ハンク境界を取得（arena）。失敗時は空スライスでハイライト無しの従来描画にフォールバック。
+    const parsed = hunk.parse(a, model.diff_text) catch hunk.ParsedDiff{ .file_header = "", .hunks = &[_]hunk.Hunk{} };
+    const hunks = parsed.hunks;
+
+    // 選択ハンクが可視になるよう diff_scroll を ensure-visible（focus==.diff かつ hunk>0 のときのみ）。
+    var sel_header_line: ?usize = null;
+    if (model.focus == .diff and hunks.len > 0) {
+        const sel = @min(model.selected_hunk, hunks.len - 1);
+        sel_header_line = hunks[sel].start_line;
+        model.diff_scroll = ensureVisible(model.diff_scroll, hunks[sel].start_line, limit);
+    }
+
+    // 総行数で clamp（末尾超過の空表示を防ぐ）。`diff_scroll` の writer は上の ensureVisible、
+    // 表示オフセットはこの clampScroll の二段（spec §11 の seam: Ctrl+d/u はハンク外で引き戻される）。
     var total_lines: usize = 0;
     {
         var cit = std.mem.splitScalar(u8, model.diff_text, '\n');
@@ -207,10 +224,15 @@ fn renderDiff(model: *const Model, ctx: *const zz.Context, height: u16) []const 
     var lines: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, model.diff_text, '\n');
     var idx: usize = 0;
-    const limit: usize = if (height == 0) 1 else height;
     while (it.next()) |line| : (idx += 1) {
         if (idx < scroll_off) continue;
         if (lines.items.len >= limit) break;
+        // 選択ハンクの @@ ヘッダ行は反転＋左マーカーで強調する。
+        if (sel_header_line != null and idx == sel_header_line.?) {
+            const marked = std.fmt.allocPrint(a, "\u{258C}{s}", .{line}) catch line;
+            lines.append(a, sel_style.render(a, marked) catch marked) catch break;
+            continue;
+        }
         const styled: []const u8 = if (line.len > 0 and line[0] == '+')
             (add_style.render(a, line) catch line)
         else if (line.len > 0 and line[0] == '-')
