@@ -203,8 +203,10 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     // focus==.diff のときだけハンク境界を解析（changes/commit フォーカス中は parse を走らせない）。
     // 選択ハンクが画面に全く掛かっていなければ先頭をトップに合わせる（j/k で遠いハンクへ移動した時）。
     // 一部でも見えている間は diff_scroll を据え置き、Ctrl+d/u で大きいハンクの末尾まで読める。
-    // diff_scroll はこのブロックが唯一の writer で、常にハンク範囲内＝diff 行数内に収まるため、
+    // focus==.diff のフレームでは diff_scroll はこのブロックが唯一の writer でハンク範囲内に収まり、
     // 表示先頭行 == diff_scroll となりマウス当たり判定（diff_scroll + ペイン相対行）と一致する。
+    // （focus!=.diff で Ctrl+d/u を多用すると diff_scroll が行数超になり得るが、その時クリックは
+    //  範囲外＝hunkIndexForLine が null で no-op になる。phase 1 は許容の既知 seam。）
     var sel_header_line: ?usize = null;
     if (model.focus == .diff) {
         const parsed = hunk.parse(a, model.diff_text) catch hunk.ParsedDiff{ .file_header = "", .hunks = &[_]hunk.Hunk{} };

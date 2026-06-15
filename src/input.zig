@@ -232,9 +232,9 @@ pub fn fromZigzagMouse(
         null;
 
     // diff ペイン内クリックなら、ペイン相対行に diff_scroll を足した絶対 diff 行を作る。
-    // focus==.diff のフレームでは renderDiff が選択ハンクを画面内に保つよう diff_scroll を調整し
-    // （ハンクが全く見えない時だけ先頭へスナップ、見えている間は据え置き）、diff_scroll は常に
-    // diff 行数内に収まる。よって表示先頭行 == diff_scroll となりクリックが描画と一致する。
+    // focus==.diff のフレームでは renderDiff が選択ハンクを画面内に保つよう diff_scroll を調整する
+    // ため diff_scroll はハンク範囲内に収まり、表示先頭行 == diff_scroll でクリックが描画と一致する。
+    // focus!=.diff での Ctrl+d/u 多用で行数超になった場合のクリックは範囲外 no-op（phase 1 許容の既知 seam）。
     const diff_line: ?usize = if (on_diff)
         model.diff_scroll + @as(usize, ev.y - layout.diff.y)
     else
