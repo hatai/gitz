@@ -274,7 +274,10 @@ fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
     const branch = if (model.branch.len == 0) "(detached)" else model.branch;
     const spin = if (model.busy) " [busy]" else "";
-    const hint = "  j/k move  space stage  c commit  r refresh  q quit";
+    const hint = if (model.focus == .diff)
+        "  j/k hunk  s stage/unstage  tab pane  r refresh  q quit"
+    else
+        "  j/k move  space stage  c commit  r refresh  q quit";
     const base = std.fmt.allocPrint(a, " {s}{s}", .{ branch, spin }) catch " ?";
     if (model.error_text.len > 0) {
         const err_style = zz.Style{ .foreground = zz.Color.red, .bold_attr = true };
