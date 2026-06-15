@@ -70,6 +70,8 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
             // 直列化されるため固定名で衝突しない。
             const rel = ".git/git-tui-stage.patch";
             try base.writeFile(io, .{ .sub_path = rel, .data = ap.patch });
+            // 後続の applyPatchArgv/process.run がエラー return しても temp を残さない。
+            errdefer base.deleteFile(io, rel) catch {};
             const argv = try cmds.applyPatchArgv(a, ap.reverse, rel);
             defer a.free(argv);
             var res = try process.run(a, io, argv, cwd);
