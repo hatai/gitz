@@ -470,7 +470,7 @@ test "fromZigzagMouse: release/drag on diff pane is ignored (no hunk select)" {
     var scratch: [16]view.ChangesRow = undefined;
     var cs = ClickState{};
     m.diff_scroll = 3;
-    // diff ペイン座標 (x=50, y=2)。release と drag はどちらも ignore（select_hunk_at_line を出さない）。
+    // diff ペイン座標 (x=50, y=2)。release と drag はどちらも ignore（select_line_at を出さない）。
     const rel = zz.MouseEvent{ .x = 50, .y = 2, .button = .left, .event_type = .release };
     const me_rel = fromZigzagMouse(rel, &m, mouse_test_layout, &cs, 1000, &scratch);
     try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me_rel.kind);

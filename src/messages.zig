@@ -15,10 +15,6 @@ pub const Msg = union(enum) {
     request_commit, // Ctrl+S
     scroll_diff_down, // Ctrl+d / ホイール下（diff ペイン）
     scroll_diff_up, // Ctrl+u / ホイール上（diff ペイン）
-    hunk_next, // diff フォーカス時 j / ↓（ハンクカーソルを次へ）
-    hunk_prev, // diff フォーカス時 k / ↑（ハンクカーソルを前へ）
-    stage_hunk, // diff フォーカス時 s / space / Enter（section で stage/unstage 決定）
-    select_hunk_at_line: usize, // diff ペインクリックの絶対 diff 行（reducer がハンクに解決）
     diff_cursor_down, // diff フォーカス時 j / ↓（行カーソルを次の本文行へ）
     diff_cursor_up, // diff フォーカス時 k / ↑（行カーソルを前の本文行へ）
     diff_hunk_next, // diff フォーカス時 ]（次ハンク本文先頭へ）
@@ -62,10 +58,6 @@ pub const Msg = union(enum) {
             .request_commit,
             .scroll_diff_down,
             .scroll_diff_up,
-            .hunk_next,
-            .hunk_prev,
-            .stage_hunk,
-            .select_hunk_at_line,
             .diff_cursor_down,
             .diff_cursor_up,
             .diff_hunk_next,
