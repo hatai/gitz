@@ -50,17 +50,20 @@ pub fn keyToMsg(focus: Focus, key: Key) ?Msg {
     if (focus == .diff) {
         return switch (key) {
             .char => |c| switch (c) {
-                'j' => .hunk_next,
-                'k' => .hunk_prev,
-                's', ' ' => .stage_hunk,
+                'j' => .diff_cursor_down,
+                'k' => .diff_cursor_up,
+                'v' => .toggle_line_selection,
+                ']' => .diff_hunk_next,
+                '[' => .diff_hunk_prev,
+                's', ' ' => .stage_lines,
                 'c' => .focus_commit,
                 'r' => .request_refresh,
                 'q' => .quit,
                 else => null,
             },
-            .down => .hunk_next,
-            .up => .hunk_prev,
-            .enter => .stage_hunk,
+            .down => .diff_cursor_down,
+            .up => .diff_cursor_up,
+            .enter => .stage_lines,
             .tab => .focus_next,
             .ctrl_d => .scroll_diff_down,
             .ctrl_u => .scroll_diff_up,
@@ -110,7 +113,7 @@ pub fn mouseToMsg(ev: MouseEvent) ?Msg {
         .left_click => if (ev.file_row) |r|
             .{ .select_index = r }
         else if (ev.diff_line) |dl|
-            .{ .select_hunk_at_line = dl }
+            .{ .select_line_at = dl }
         else if (ev.pane) |p|
             .{ .set_focus = p }
         else
@@ -293,20 +296,17 @@ test "changes focus: unmapped char returns null" {
     try std.testing.expect(keyToMsg(.changes, .{ .char = 'z' }) == null);
 }
 
-test "diff focus: hunk navigation and stage keys map" {
-    try std.testing.expect(keyToMsg(.diff, .{ .char = 'j' }).? == .hunk_next);
-    try std.testing.expect(keyToMsg(.diff, .{ .char = 'k' }).? == .hunk_prev);
-    try std.testing.expect(keyToMsg(.diff, .down).? == .hunk_next);
-    try std.testing.expect(keyToMsg(.diff, .up).? == .hunk_prev);
-    try std.testing.expect(keyToMsg(.diff, .{ .char = 's' }).? == .stage_hunk);
-    try std.testing.expect(keyToMsg(.diff, .{ .char = ' ' }).? == .stage_hunk);
-    try std.testing.expect(keyToMsg(.diff, .enter).? == .stage_hunk);
-    try std.testing.expect(keyToMsg(.diff, .ctrl_d).? == .scroll_diff_down);
-    try std.testing.expect(keyToMsg(.diff, .ctrl_u).? == .scroll_diff_up);
-    try std.testing.expect(keyToMsg(.diff, .{ .char = 'c' }).? == .focus_commit);
-    try std.testing.expect(keyToMsg(.diff, .{ .char = 'r' }).? == .request_refresh);
-    try std.testing.expect(keyToMsg(.diff, .{ .char = 'q' }).? == .quit);
-    try std.testing.expect(keyToMsg(.diff, .tab).? == .focus_next);
+test "diff focus: line cursor / selection / hunk-jump / stage keys map" {
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 'j' }).? == .diff_cursor_down);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 'k' }).? == .diff_cursor_up);
+    try std.testing.expect(keyToMsg(.diff, .down).? == .diff_cursor_down);
+    try std.testing.expect(keyToMsg(.diff, .up).? == .diff_cursor_up);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 'v' }).? == .toggle_line_selection);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = ']' }).? == .diff_hunk_next);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = '[' }).? == .diff_hunk_prev);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = 's' }).? == .stage_lines);
+    try std.testing.expect(keyToMsg(.diff, .{ .char = ' ' }).? == .stage_lines);
+    try std.testing.expect(keyToMsg(.diff, .enter).? == .stage_lines);
 }
 
 test "changes focus mapping is unchanged (regression)" {
@@ -450,7 +450,7 @@ test "fromZigzagMouse: left press on file row B yields left_click -> select_inde
     try std.testing.expectEqual(@as(usize, 1), msg.?.select_index);
 }
 
-test "fromZigzagMouse: click on diff pane yields select_hunk_at_line with scroll offset" {
+test "fromZigzagMouse: click on diff pane yields select_line_at with scroll offset" {
     var m = try buildMouseTestModel(std.testing.allocator);
     defer m.deinit();
     var scratch: [16]view.ChangesRow = undefined;
@@ -460,8 +460,8 @@ test "fromZigzagMouse: click on diff pane yields select_hunk_at_line with scroll
     const ev = zz.MouseEvent{ .x = 50, .y = 2, .button = .left, .event_type = .press };
     const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
     const msg = mouseToMsg(me);
-    try std.testing.expect(msg.? == .select_hunk_at_line);
-    try std.testing.expectEqual(@as(usize, 5), msg.?.select_hunk_at_line);
+    try std.testing.expect(msg.? == .select_line_at);
+    try std.testing.expectEqual(@as(usize, 5), msg.?.select_line_at);
 }
 
 test "fromZigzagMouse: release/drag on diff pane is ignored (no hunk select)" {
