@@ -125,6 +125,15 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             const patch = try hunk.buildPatch(model.allocator, parsed, idx);
             return .{ .apply_patch = .{ .patch = patch, .reverse = (f.section == .staged) } };
         },
+        // Task 5 で本実装に差し替える暫定 no-op（網羅 switch を満たすため）。
+        .diff_cursor_down,
+        .diff_cursor_up,
+        .diff_hunk_next,
+        .diff_hunk_prev,
+        .toggle_line_selection,
+        .stage_lines,
+        .select_line_at,
+        => return .none,
         .quit => return .quit,
         // 解釈器からの結果
         .status_loaded => |entries| {

@@ -19,6 +19,13 @@ pub const Msg = union(enum) {
     hunk_prev, // diff フォーカス時 k / ↑（ハンクカーソルを前へ）
     stage_hunk, // diff フォーカス時 s / space / Enter（section で stage/unstage 決定）
     select_hunk_at_line: usize, // diff ペインクリックの絶対 diff 行（reducer がハンクに解決）
+    diff_cursor_down, // diff フォーカス時 j / ↓（行カーソルを次の本文行へ）
+    diff_cursor_up, // diff フォーカス時 k / ↑（行カーソルを前の本文行へ）
+    diff_hunk_next, // diff フォーカス時 ]（次ハンク本文先頭へ）
+    diff_hunk_prev, // diff フォーカス時 [（前ハンク本文先頭へ）
+    toggle_line_selection, // diff フォーカス時 v（anchor のトグル）
+    stage_lines, // diff フォーカス時 s / space / Enter（選択レンジを stage/unstage）
+    select_line_at: usize, // diff クリックの絶対行（カーソルへ解決・anchor クリア）
     quit,
     select_index: usize, // マウスでファイル行クリック
     set_focus: Focus, // ペインクリックでフォーカス変更
@@ -59,6 +66,13 @@ pub const Msg = union(enum) {
             .hunk_prev,
             .stage_hunk,
             .select_hunk_at_line,
+            .diff_cursor_down,
+            .diff_cursor_up,
+            .diff_hunk_next,
+            .diff_hunk_prev,
+            .toggle_line_selection,
+            .stage_lines,
+            .select_line_at,
             .quit,
             .select_index,
             .set_focus,
