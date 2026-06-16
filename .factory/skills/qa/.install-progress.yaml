@@ -1,0 +1,22 @@
+project: git-tui
+phase: 4-complete
+questionnaire:
+  qa_scope: tui-only
+  test_repo: temp-scratch-repo
+  github_action: required-blocks-merge
+  failure_learning: suggest_in-report
+codebase_facts:
+  language: zig-0.16
+  framework: zigzag-0.1.5
+  app_type: tui
+  build_cmd: "zig build -Doptimize=ReleaseFast"
+  test_cmd: "zig build test --summary all"
+  binary: "zig-out/bin/git-tui"
+  has_github_dir: false
+  imagemagick: true
+generated_files:
+  - .factory/skills/qa/config.yaml
+  - .factory/skills/qa/SKILL.md
+  - .factory/skills/qa/REPORT-TEMPLATE.md
+  - .factory/skills/qa-tui/SKILL.md
+  - .github/workflows/qa.yml

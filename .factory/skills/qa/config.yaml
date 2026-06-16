@@ -1,0 +1,46 @@
+project: git-tui
+imagemagick: true
+
+# git-tui is a local terminal UI that shells out to the local `git` binary.
+# There are no remote environments, auth, feature flags, or SaaS integrations.
+environments:
+  local:
+    url: local-terminal
+    restrictions:
+      # QA only ever mutates the temp scratch repo created at run start.
+      # NEVER launch git-tui against the user's real working repos during QA.
+      - "Only run against the per-run temp scratch repo (see qa-tui setup). Never target real working repos."
+
+default_target: local
+
+auth:
+  method: none
+  provider: none
+
+# No user personas for a single-user local TUI. All tests run as the invoking user.
+personas: []
+
+apps:
+  tui:
+    path_patterns:
+      - "src/**/*.zig"
+      - "build.zig"
+      - "build.zig.zon"
+    skill: qa-tui
+    test_tool: tuistory
+    build_command: "zig build -Doptimize=ReleaseFast"
+
+feature_flags:
+  provider: none
+
+integrations: {}
+
+cleanup:
+  auto_cleanup: true
+  strategy: delete-temp-repo
+  instructions: >
+    Each run creates a temp directory via mktemp -d and initializes a throwaway
+    git repo there. On completion (success or failure), rm -rf that directory.
+    No test users, databases, or remote state to clean up.
+
+failure_learning: suggest_in_report

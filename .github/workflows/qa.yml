@@ -1,0 +1,117 @@
+name: QA
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: qa-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout (full history for diff analysis)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: '0.16.0'
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install tuistory
+        run: npm install -g tuistory
+
+      - name: Install ImageMagick
+        run: sudo apt-get install -y -qq imagemagick
+
+      - name: Install Droid CLI
+        run: curl -fsSL https://app.factory.ai/cli | sh
+
+      - name: Build git-tui (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run QA
+        id: qa
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          CI: 'true'
+        run: |
+          mkdir -p qa-results
+          # Non-interactive CI mode: no human available, no AskUser, no pauses.
+          droid exec --auto high --output qa-output.txt "You are running in a non-interactive CI environment. There is NO human available. Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input. Run the qa skill. Write the final report to qa-results/report.md" || echo "qa exited non-zero (captured)"
+
+      - name: Assemble report
+        if: always()
+        run: |
+          if [ -f qa-results/report.md ]; then
+            cp qa-results/report.md qa-results/final-report.md
+          else
+            {
+              echo "## QA Report"
+              echo ""
+              echo "Report file was not generated. Raw QA output below."
+              echo ""
+              echo "<details><summary>Raw output</summary>"
+              echo ""
+              echo '```'
+              cat qa-output.txt 2>/dev/null || echo "(no output captured)"
+              echo '```'
+              echo ""
+              echo "</details>"
+            } > qa-results/final-report.md
+          fi
+          # Ensure the report starts with the QA Report heading
+          head -1 qa-results/final-report.md | grep -q "^## QA Report" || \
+            sed -i '1i## QA Report\n' qa-results/final-report.md
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-results
+          path: qa-results/
+          retention-days: 14
+
+      - name: Post QA report as PR comment
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f qa-results/final-report.md ]; then
+            echo "No report to post"; exit 0
+          fi
+          BODY=$(cat qa-results/final-report.md)
+          # Footer with artifact + run links
+          FOOTER=$(printf '\n\n---\n📊 [Download artifacts](../runs/%s/artifacts) | [Workflow run](../actions/runs/%s)\n' "${{ github.run_id }}" "${{ github.run_id }}")
+          COMMENT_BODY="<!-- qa-report -->${BODY}${FOOTER}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          # Search for an existing QA comment to update (avoid comment flood)
+          EXISTING_ID=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | startswith(\"<!-- qa-report -->\")) | .id" | head -n1)
+          if [ -n "$EXISTING_ID" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${EXISTING_ID}" \
+              -f body="$COMMENT_BODY" > /dev/null
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+              -f body="$COMMENT_BODY" > /dev/null
+          fi
+
+      - name: Fail job if QA failed
+        if: steps.qa.outcome == 'failure'
+        run: |
+          echo "QA step reported failure; failing the job so the required check blocks merge."
+          exit 1
