@@ -90,9 +90,10 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             var parsed = try hunk.parse(model.allocator, model.diff_text);
             defer parsed.deinit(model.allocator);
             if (parsed.hunks.len == 0) return .none;
-            // 本文行は最終ハンクの排他的上端より手前にしか無い → そこを走査上限に（全行カウント不要）。
-            const last = parsed.hunks[parsed.hunks.len - 1];
-            const limit = last.start_line + last.line_count;
+            // 選択中（anchor あり）はカーソルを anchor のハンク内に留める（spec: 選択は単一ハンク。
+            // view のハイライト [lo,hi] と stage 対象が跨らないことを保証）。anchor 無しは
+            // 最終ハンク末尾まで自由移動（本文行はそこより手前にしか無い＝走査上限）。
+            const limit = navHunkEnd(parsed, model.diff_anchor);
             var n = model.diff_cursor + 1;
             while (n < limit) : (n += 1) {
                 if (isBodyLine(parsed, n)) {
@@ -105,8 +106,14 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         .diff_cursor_up => {
             var parsed = try hunk.parse(model.allocator, model.diff_text);
             defer parsed.deinit(model.allocator);
+            if (parsed.hunks.len == 0) return .none;
+            // 選択中は anchor のハンク本文先頭より上へ出ない。anchor 無しは 0 まで。
+            const floor = if (model.diff_anchor) |anc|
+                hunkBodyTop(parsed.hunks[hunk.hunkIndexForLine(parsed, anc) orelse 0])
+            else
+                0;
             var n = model.diff_cursor;
-            while (n > 0) {
+            while (n > floor) {
                 n -= 1;
                 if (isBodyLine(parsed, n)) {
                     model.diff_cursor = n;
@@ -167,7 +174,8 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             if (maybe) |patch| {
                 return .{ .apply_patch = .{ .patch = patch, .reverse = (f.section == .staged) } };
             }
-            try model.setStr(&model.error_text, "選択範囲に stage できる変更行がありません");
+            // null は 2 因: 変更行ゼロ（文脈のみ選択）/ 末尾改行境界の矛盾。両方を正確に包む文言。
+            try model.setStr(&model.error_text, "選択範囲を stage できません（変更行なし、または末尾改行境界）");
             return .none;
         },
         .quit => return .quit,
@@ -224,8 +232,22 @@ fn isBodyLine(parsed: hunk.ParsedDiff, abs: usize) bool {
 
 /// ハンク `h` の本文先頭行（@@ の次の行）。本文が無い（line_count==1）なら @@ 行自身。
 /// カーソル配置の唯一の基準（diff_hunk_next/prev・clampCursor が共有）。
+/// 注: 実 git diff はヘッダのみのハンク（line_count==1）を出さない（本文 >=1 行）ため、
+/// 通常この else 枝には入らない。退化入力でも下流は kept_changes==0 で安全 no-op。
 fn hunkBodyTop(h: hunk.Hunk) usize {
     return if (h.line_count > 1) h.start_line + 1 else h.start_line;
+}
+
+/// 下方向カーソル移動の排他的上限（絶対行）。選択中（anchor あり）は anchor のハンク末尾、
+/// 非選択時は最終ハンク末尾。これによりカーソルは選択中に anchor のハンクを越えない。
+/// 呼び出し側で parsed.hunks.len > 0 を保証すること。
+fn navHunkEnd(parsed: hunk.ParsedDiff, anchor: ?usize) usize {
+    if (anchor) |anc| {
+        const h = parsed.hunks[hunk.hunkIndexForLine(parsed, anc) orelse 0];
+        return h.start_line + h.line_count;
+    }
+    const last = parsed.hunks[parsed.hunks.len - 1];
+    return last.start_line + last.line_count;
 }
 
 /// 現在選択中のファイルの diff を読み込む AppCmd を返す。
@@ -378,6 +400,33 @@ test "diff_cursor_down/up skip @@ headers and clamp to body lines" {
     var c3 = try update(&m, .diff_cursor_up);
     c3.deinit(a);
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // 戻りも @@h1 を飛ばす
+}
+
+test "cursor stays within anchor's hunk while selecting (no cross-hunk selection)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m); // h0 本文 4-6, h1 本文 8-10
+    // 選択中（anchor=h0 内）はカーソルが h1 へ越えない。
+    m.diff_cursor = 6; // h0 末尾本文 '+B'
+    m.diff_anchor = 5; // h0 内
+    var c1 = try update(&m, .diff_cursor_down);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // h1(8) へ移らず据え置き
+    // anchor を外すと次ハンクへ自由移動。
+    m.diff_anchor = null;
+    var c2 = try update(&m, .diff_cursor_down);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // h1 本文先頭
+    // 上方向も anchor のハンク本文先頭で止まり h0 へ越えない。
+    m.diff_cursor = 9; // h1 '+Y'
+    m.diff_anchor = 9; // h1
+    var c3 = try update(&m, .diff_cursor_up);
+    c3.deinit(a);
+    try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // h1 本文先頭 ' x'
+    var c4 = try update(&m, .diff_cursor_up); // これ以上 h0 へ越えない
+    c4.deinit(a);
+    try std.testing.expectEqual(@as(usize, 8), m.diff_cursor);
 }
 
 test "diff_hunk_next/prev jump to hunk body tops and clear anchor" {
