@@ -66,6 +66,14 @@ pub const Model = struct {
     /// 既存の Model 状態は壊さない（中途半端な破壊を避ける）。
     pub fn replaceFiles(self: *Model, entries: []const status.StatusEntry) !void {
         const a = self.allocator;
+        // 置換前の選択ファイル識別子（section + path）を控える。path は旧 files を指す借用 slice。
+        // next 構築〜照合は旧 files 解放より前に行うので安全（解放後に prev は使わない）。
+        const prev: ?struct { section: status.Section, path: []const u8 } =
+            if (self.selected < self.files.items.len)
+                .{ .section = self.files.items[self.selected].section, .path = self.files.items[self.selected].path }
+            else
+                null;
+
         var next: std.ArrayList(FileItem) = .empty;
         errdefer {
             for (next.items) |*f| {
@@ -85,14 +93,26 @@ pub const Model = struct {
         // **格納順 == 表示順** にする。これにより j/k（model.selected を格納順で線形移動）の
         // ハイライトが画面上を連続的に動く（view.changesRowLayout の表示順と一致する）。
         std.mem.sort(FileItem, next.items, {}, lessThanForDisplay);
-        // ここまで来れば成功。旧 files を解放して入れ替える。
+
+        // 選択を (section, path) で復元（旧 files 解放前に照合）。見つからなければ index クランプにフォールバック。
+        var new_selected: usize = self.selected;
+        if (prev) |p| {
+            for (next.items, 0..) |f, i| {
+                if (f.section == p.section and std.mem.eql(u8, f.path, p.path)) {
+                    new_selected = i;
+                    break;
+                }
+            }
+        }
+
+        // ここまで来れば成功。旧 files を解放して入れ替える（以降 prev.path は使わない）。
         for (self.files.items) |*f| {
             a.free(f.path);
             if (f.orig_path) |p| a.free(p);
         }
         self.files.deinit(a);
         self.files = next;
-        if (self.selected >= self.files.items.len) self.selected = if (self.files.items.len == 0) 0 else self.files.items.len - 1;
+        self.selected = if (self.files.items.len == 0) 0 else @min(new_selected, self.files.items.len - 1);
     }
 
     /// 文字列フィールドを置換するヘルパ（旧を free して dup）。
@@ -179,4 +199,52 @@ test "replaceFiles sorts by section (staged<unstaged<untracked) then path" {
     try std.testing.expectEqual(status.Section.unstaged, m.files.items[2].section);
     try std.testing.expectEqualStrings("a.txt", m.files.items[3].path);
     try std.testing.expectEqual(status.Section.untracked, m.files.items[3].section);
+}
+
+test "replaceFiles preserves selection by (section, path) across refresh" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 初回: 3 ファイル（unstaged a, b, c）。選択を b（index 1）にする。
+    const e1 = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "a.txt"), .orig_path = null, .section = .unstaged },
+        .{ .path = try a.dupe(u8, "b.txt"), .orig_path = null, .section = .unstaged },
+        .{ .path = try a.dupe(u8, "c.txt"), .orig_path = null, .section = .unstaged },
+    };
+    defer for (e1) |e| a.free(e.path);
+    try m.replaceFiles(&e1);
+    m.selected = 1; // b.txt
+    // リフレッシュ: 先頭に新ファイル z(staged) が増え、表示順が変わる。b.txt は unstaged のまま。
+    const e2 = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "z.txt"), .orig_path = null, .section = .staged },
+        .{ .path = try a.dupe(u8, "a.txt"), .orig_path = null, .section = .unstaged },
+        .{ .path = try a.dupe(u8, "b.txt"), .orig_path = null, .section = .unstaged },
+        .{ .path = try a.dupe(u8, "c.txt"), .orig_path = null, .section = .unstaged },
+    };
+    defer for (e2) |e| a.free(e.path);
+    try m.replaceFiles(&e2);
+    // 選択は b.txt を追従しているべき（index ではなく path で維持）。
+    try std.testing.expectEqualStrings("b.txt", m.files.items[m.selected].path);
+    try std.testing.expectEqual(status.Section.unstaged, m.files.items[m.selected].section);
+}
+
+test "replaceFiles falls back to index clamp when selected file is gone" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const e1 = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "a.txt"), .orig_path = null, .section = .unstaged },
+        .{ .path = try a.dupe(u8, "b.txt"), .orig_path = null, .section = .unstaged },
+    };
+    defer for (e1) |e| a.free(e.path);
+    try m.replaceFiles(&e1);
+    m.selected = 1; // b.txt
+    // b.txt が消えて a.txt だけ → b は見つからず、selected は新 len にクランプ（0）。
+    const e2 = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "a.txt"), .orig_path = null, .section = .unstaged },
+    };
+    defer for (e2) |e| a.free(e.path);
+    try m.replaceFiles(&e2);
+    try std.testing.expectEqual(@as(usize, 0), m.selected);
+    try std.testing.expectEqualStrings("a.txt", m.files.items[m.selected].path);
 }
