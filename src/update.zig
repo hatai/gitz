@@ -166,8 +166,8 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             const lo = @min(model.diff_cursor, anchor);
             const hi = @max(model.diff_cursor, anchor);
             const maybe = try hunk.buildLinePatch(model.allocator, parsed, idx, lo, hi, f.section == .staged);
+            model.diff_anchor = null; // 成否に関わらず選択は消費（null パスでもハイライトを残さない）
             if (maybe) |patch| {
-                model.diff_anchor = null; // 選択消費
                 return .{ .apply_patch = .{ .patch = patch, .reverse = (f.section == .staged) } };
             }
             try model.setStr(&model.error_text, "選択範囲に stage できる変更行がありません");
@@ -444,10 +444,12 @@ test "stage_lines on context-only selection is no-op (null patch)" {
     try addFile(&m, "f.txt", .unstaged);
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 4; // ' a' 文脈行のみ
-    m.diff_anchor = null;
+    m.diff_anchor = 4; // 選択あり → null パスでも消費されること
     var cmd = try update(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor); // 選択ハイライトを残さない
+    try std.testing.expect(m.error_text.len > 0);
 }
 
 test "stage_lines guards: untracked / busy" {

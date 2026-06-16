@@ -17,7 +17,6 @@ const zz = @import("zigzag");
 const Model = @import("model.zig").Model;
 const Focus = @import("model.zig").Focus;
 const Section = @import("git/status.zig").Section;
-const hunk = @import("diff/hunk.zig");
 
 pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
 pub const Layout = struct { changes: Rect, diff: Rect, commit: Rect, status: Rect };
