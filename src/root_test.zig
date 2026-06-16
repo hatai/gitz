@@ -16,4 +16,5 @@ test {
     _ = @import("input.zig"); // Task 9
     _ = @import("view.zig"); // Task 10
     _ = @import("diff/hunk.zig"); // 部分ステージング
+    _ = @import("autorefresh.zig"); // 自動リフレッシュ
 }
