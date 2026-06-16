@@ -19,7 +19,8 @@ pub const Model = struct {
     changes_scroll: usize, // Changes ペインの先頭表示**行**（見出し含む visual row オフセット）
     diff_text: []u8, // 選択ファイルの diff（空可）
     diff_scroll: usize, // diff ペインの先頭表示行（スクロールオフセット）
-    selected_hunk: usize, // diff ペインの現在ハンク（0始まり）。ファイル切替で 0、diff 再読込で clamp。
+    diff_cursor: usize, // diff ペインのカーソル（絶対 diff 行 index）。行単位選択の基準。
+    diff_anchor: ?usize, // ビジュアル選択の anchor（絶対 diff 行）。null=範囲未選択。
     commit_message: []u8, // TextArea の内容（空可）
     focus: Focus,
     busy: bool, // reducer の二重実行ゲート（全 in-flight 副作用で true）。表示はしない。
@@ -38,7 +39,8 @@ pub const Model = struct {
             .changes_scroll = 0,
             .diff_text = try a.dupe(u8, ""),
             .diff_scroll = 0,
-            .selected_hunk = 0,
+            .diff_cursor = 0,
+            .diff_anchor = null,
             .commit_message = try a.dupe(u8, ""),
             .focus = .changes,
             .busy = false,
@@ -142,6 +144,13 @@ pub const Model = struct {
         return std.mem.lessThan(u8, a.path, b.path);
     }
 };
+
+/// ビジュアル選択レンジ [lo, hi]（閉区間・絶対 diff 行 index）。anchor==null は単一カーソル行。
+/// reducer（stage 対象）と view（ハイライト）が同一式から導き「見える選択 == stage 対象」を保つ。
+pub fn selectionRange(cursor: usize, anchor: ?usize) struct { lo: usize, hi: usize } {
+    const a = anchor orelse cursor;
+    return .{ .lo = @min(cursor, a), .hi = @max(cursor, a) };
+}
 
 test "init/deinit leaves no leaks" {
     const a = std.testing.allocator;

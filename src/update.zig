@@ -17,20 +17,23 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         .key_down => {
             if (model.selected + 1 < model.files.items.len) model.selected += 1;
             model.diff_scroll = 0;
-            model.selected_hunk = 0;
+            model.diff_cursor = 0;
+            model.diff_anchor = null;
             return loadDiffCmd(model);
         },
         .key_up => {
             if (model.selected > 0) model.selected -= 1;
             model.diff_scroll = 0;
-            model.selected_hunk = 0;
+            model.diff_cursor = 0;
+            model.diff_anchor = null;
             return loadDiffCmd(model);
         },
         .select_index => |i| {
             if (i < model.files.items.len) model.selected = i;
             model.focus = .changes;
             model.diff_scroll = 0;
-            model.selected_hunk = 0;
+            model.diff_cursor = 0;
+            model.diff_anchor = null;
             return loadDiffCmd(model);
         },
         .scroll_diff_down => {
@@ -83,30 +86,73 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             try model.setStr(&model.commit_message, text);
             return .none;
         },
-        .hunk_next => {
+        .diff_cursor_down => {
             var parsed = try hunk.parse(model.allocator, model.diff_text);
             defer parsed.deinit(model.allocator);
-            if (model.selected_hunk + 1 < parsed.hunks.len) model.selected_hunk += 1;
-            return .none;
-        },
-        .hunk_prev => {
-            if (model.selected_hunk > 0) model.selected_hunk -= 1;
-            return .none;
-        },
-        .select_hunk_at_line => |line| {
-            model.focus = .diff; // diff ペインクリックはフォーカスも移す
-            var parsed = try hunk.parse(model.allocator, model.diff_text);
-            defer parsed.deinit(model.allocator);
-            // 空 diff（0 ハンク）は selected_hunk を 0 に正規化（diff_loaded と同じ不変条件）。
-            // 非空でクリックがどのハンクにも当たらない（file_header 等）場合は現状維持。
-            if (parsed.hunks.len == 0) {
-                model.selected_hunk = 0;
-            } else if (hunk.hunkIndexForLine(parsed, line)) |i| {
-                model.selected_hunk = i;
+            if (parsed.hunks.len == 0) return .none;
+            // 選択中（anchor あり）はカーソルを anchor のハンク内に留める（spec: 選択は単一ハンク。
+            // view のハイライト [lo,hi] と stage 対象が跨らないことを保証）。anchor 無しは
+            // 最終ハンク末尾まで自由移動（本文行はそこより手前にしか無い＝走査上限）。
+            const limit = navHunkEnd(parsed, model.diff_anchor);
+            var n = model.diff_cursor + 1;
+            while (n < limit) : (n += 1) {
+                if (isBodyLine(parsed, n)) {
+                    model.diff_cursor = n;
+                    break;
+                }
             }
             return .none;
         },
-        .stage_hunk => {
+        .diff_cursor_up => {
+            var parsed = try hunk.parse(model.allocator, model.diff_text);
+            defer parsed.deinit(model.allocator);
+            if (parsed.hunks.len == 0) return .none;
+            // 選択中は anchor のハンク本文先頭より上へ出ない。anchor 無しは 0 まで。
+            const floor = if (model.diff_anchor) |anc|
+                hunkBodyTop(parsed.hunks[hunk.hunkIndexForLine(parsed, anc) orelse 0])
+            else
+                0;
+            var n = model.diff_cursor;
+            while (n > floor) {
+                n -= 1;
+                if (isBodyLine(parsed, n)) {
+                    model.diff_cursor = n;
+                    break;
+                }
+            }
+            return .none;
+        },
+        .diff_hunk_next => {
+            var parsed = try hunk.parse(model.allocator, model.diff_text);
+            defer parsed.deinit(model.allocator);
+            if (parsed.hunks.len == 0) return .none;
+            const cur = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse 0;
+            const next = @min(cur + 1, parsed.hunks.len - 1);
+            model.diff_cursor = hunkBodyTop(parsed.hunks[next]);
+            model.diff_anchor = null;
+            return .none;
+        },
+        .diff_hunk_prev => {
+            var parsed = try hunk.parse(model.allocator, model.diff_text);
+            defer parsed.deinit(model.allocator);
+            if (parsed.hunks.len == 0) return .none;
+            const cur = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse 0;
+            const prev = if (cur == 0) 0 else cur - 1;
+            model.diff_cursor = hunkBodyTop(parsed.hunks[prev]);
+            model.diff_anchor = null;
+            return .none;
+        },
+        .toggle_line_selection => {
+            model.diff_anchor = if (model.diff_anchor == null) model.diff_cursor else null;
+            return .none;
+        },
+        .select_line_at => |line| {
+            model.focus = .diff;
+            model.diff_cursor = line;
+            try clampCursor(model); // 本文外クリックはハンク本文へクランプ・anchor リセット
+            return .none;
+        },
+        .stage_lines => {
             if (model.busy) return .none;
             if (model.files.items.len == 0) return .none;
             const f = model.files.items[model.selected];
@@ -121,9 +167,16 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             var parsed = try hunk.parse(model.allocator, model.diff_text);
             defer parsed.deinit(model.allocator);
             if (parsed.hunks.len == 0) return .none;
-            const idx = @min(model.selected_hunk, parsed.hunks.len - 1);
-            const patch = try hunk.buildPatch(model.allocator, parsed, idx);
-            return .{ .apply_patch = .{ .patch = patch, .reverse = (f.section == .staged) } };
+            const idx = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse return .none;
+            const sel = @import("model.zig").selectionRange(model.diff_cursor, model.diff_anchor);
+            const maybe = try hunk.buildLinePatch(model.allocator, parsed, idx, sel.lo, sel.hi, f.section == .staged);
+            model.diff_anchor = null; // 成否に関わらず選択は消費（null パスでもハイライトを残さない）
+            if (maybe) |patch| {
+                return .{ .apply_patch = .{ .patch = patch, .reverse = (f.section == .staged) } };
+            }
+            // null は 2 因: 変更行ゼロ（文脈のみ選択）/ 末尾改行境界の矛盾。両方を正確に包む文言。
+            try model.setStr(&model.error_text, "選択範囲を stage できません（変更行なし、または末尾改行境界）");
+            return .none;
         },
         .quit => return .quit,
         // 解釈器からの結果
@@ -135,9 +188,7 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         .diff_loaded => |text| {
             model.busy = false;
             try model.setStr(&model.diff_text, text);
-            var parsed = try hunk.parse(model.allocator, model.diff_text);
-            defer parsed.deinit(model.allocator);
-            model.selected_hunk = if (parsed.hunks.len == 0) 0 else @min(model.selected_hunk, parsed.hunks.len - 1);
+            try clampCursor(model);
             return .none;
         },
         .git_error => |text| {
@@ -151,6 +202,52 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             return .refresh_status;
         },
     }
+}
+
+/// diff 再読込/カーソル移動後にカーソルを本文行へ正規化し anchor をリセットする（純粋）。
+/// - ハンク 0 個: cursor=0。
+/// - カーソルが本文行でない（file_header / @@ ヘッダ行 / 範囲外）: 先頭ハンク本文先頭へ。
+/// - 既にいずれかのハンク本文内: そのまま維持（リフレッシュ時のジャンプ防止）。
+/// anchor は常に null へ（再読込/ファイル切替で選択は無効）。
+fn clampCursor(model: *Model) !void {
+    var parsed = try hunk.parse(model.allocator, model.diff_text);
+    defer parsed.deinit(model.allocator);
+    model.diff_anchor = null;
+    if (parsed.hunks.len == 0) {
+        model.diff_cursor = 0;
+        return;
+    }
+    // 本文行でない（@@ ヘッダ/file_header/範囲外）なら先頭ハンク本文先頭へ再配置
+    // （spec: ヘッダクリックも本文へクランプ）。本文内ならジャンプ防止で維持。
+    if (!isBodyLine(parsed, model.diff_cursor)) {
+        model.diff_cursor = hunkBodyTop(parsed.hunks[0]);
+    }
+}
+
+/// 絶対行 `abs` が「本文行」（いずれかのハンク内 かつ @@ ヘッダ行でない）かを返す。
+fn isBodyLine(parsed: hunk.ParsedDiff, abs: usize) bool {
+    if (hunk.hunkIndexForLine(parsed, abs)) |i| return abs != parsed.hunks[i].start_line;
+    return false;
+}
+
+/// ハンク `h` の本文先頭行（@@ の次の行）。本文が無い（line_count==1）なら @@ 行自身。
+/// カーソル配置の唯一の基準（diff_hunk_next/prev・clampCursor が共有）。
+/// 注: 実 git diff はヘッダのみのハンク（line_count==1）を出さない（本文 >=1 行）ため、
+/// 通常この else 枝には入らない。退化入力でも下流は kept_changes==0 で安全 no-op。
+fn hunkBodyTop(h: hunk.Hunk) usize {
+    return if (h.line_count > 1) h.start_line + 1 else h.start_line;
+}
+
+/// 下方向カーソル移動の排他的上限（絶対行）。選択中（anchor あり）は anchor のハンク末尾、
+/// 非選択時は最終ハンク末尾。これによりカーソルは選択中に anchor のハンクを越えない。
+/// 呼び出し側で parsed.hunks.len > 0 を保証すること。
+fn navHunkEnd(parsed: hunk.ParsedDiff, anchor: ?usize) usize {
+    if (anchor) |anc| {
+        const h = parsed.hunks[hunk.hunkIndexForLine(parsed, anc) orelse 0];
+        return h.start_line + h.line_count;
+    }
+    const last = parsed.hunks[parsed.hunks.len - 1];
+    return last.start_line + last.line_count;
 }
 
 /// 現在選択中のファイルの diff を読み込む AppCmd を返す。
@@ -285,125 +382,176 @@ fn seedTwoHunkDiff(m: *Model) !void {
     try m.setStr(&m.diff_text, diff);
 }
 
-test "hunk_next/hunk_prev move within hunk count and clamp" {
+// seedTwoHunkDiff の絶対行: file_header 0..2 / @@h0=3 ' a'4 '-b'5 '+B'6 / @@h1=7 ' x'8 '+Y'9 ' z'10
+test "diff_cursor_down/up skip @@ headers and clamp to body lines" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
     try seedTwoHunkDiff(&m);
-    try std.testing.expectEqual(@as(usize, 0), m.selected_hunk);
-    var c1 = try update(&m, .hunk_next);
+    m.diff_cursor = 4; // h0 本文先頭 ' a'
+    var c1 = try update(&m, .diff_cursor_down);
     c1.deinit(a);
-    try std.testing.expectEqual(@as(usize, 1), m.selected_hunk);
-    var c2 = try update(&m, .hunk_next); // 末尾で止まる（2 ハンク）
+    try std.testing.expectEqual(@as(usize, 5), m.diff_cursor); // '-b'
+    m.diff_cursor = 6; // h0 末尾本文 '+B'
+    var c2 = try update(&m, .diff_cursor_down);
     c2.deinit(a);
-    try std.testing.expectEqual(@as(usize, 1), m.selected_hunk);
-    var c3 = try update(&m, .hunk_prev);
+    try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // @@h1(7) を飛ばして ' x'(8)
+    m.diff_cursor = 8;
+    var c3 = try update(&m, .diff_cursor_up);
     c3.deinit(a);
-    var c4 = try update(&m, .hunk_prev); // 0 で止まる
-    c4.deinit(a);
-    try std.testing.expectEqual(@as(usize, 0), m.selected_hunk);
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // 戻りも @@h1 を飛ばす
 }
 
-test "stage_hunk on unstaged returns apply_patch with reverse=false and selected hunk" {
+test "cursor stays within anchor's hunk while selecting (no cross-hunk selection)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m); // h0 本文 4-6, h1 本文 8-10
+    // 選択中（anchor=h0 内）はカーソルが h1 へ越えない。
+    m.diff_cursor = 6; // h0 末尾本文 '+B'
+    m.diff_anchor = 5; // h0 内
+    var c1 = try update(&m, .diff_cursor_down);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // h1(8) へ移らず据え置き
+    // anchor を外すと次ハンクへ自由移動。
+    m.diff_anchor = null;
+    var c2 = try update(&m, .diff_cursor_down);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // h1 本文先頭
+    // 上方向も anchor のハンク本文先頭で止まり h0 へ越えない。
+    m.diff_cursor = 9; // h1 '+Y'
+    m.diff_anchor = 9; // h1
+    var c3 = try update(&m, .diff_cursor_up);
+    c3.deinit(a);
+    try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // h1 本文先頭 ' x'
+    var c4 = try update(&m, .diff_cursor_up); // これ以上 h0 へ越えない
+    c4.deinit(a);
+    try std.testing.expectEqual(@as(usize, 8), m.diff_cursor);
+}
+
+test "diff_hunk_next/prev jump to hunk body tops and clear anchor" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m);
+    m.diff_cursor = 4; // h0
+    m.diff_anchor = 4;
+    var c1 = try update(&m, .diff_hunk_next);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // h1 本文先頭
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
+    var c2 = try update(&m, .diff_hunk_prev);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), m.diff_cursor); // h0 本文先頭
+}
+
+test "toggle_line_selection sets then clears anchor" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m);
+    m.diff_cursor = 5;
+    var c1 = try update(&m, .toggle_line_selection);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 5), m.diff_anchor);
+    var c2 = try update(&m, .toggle_line_selection);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
+}
+
+test "stage_lines on unstaged builds apply_patch for the cursor line and clears anchor" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
     try addFile(&m, "f.txt", .unstaged);
     try seedTwoHunkDiff(&m);
-    m.selected_hunk = 1;
-    var cmd = try update(&m, .stage_hunk);
+    m.diff_cursor = 6; // '+B'（h0 の変更行）
+    m.diff_anchor = 6;
+    var cmd = try update(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .apply_patch);
     try std.testing.expect(!cmd.apply_patch.reverse);
-    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "@@ -10,2 +10,3 @@") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "@@ -1,2 +1,2 @@") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "+B\n") != null);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor); // 選択消費
 }
 
-test "stage_hunk on staged sets reverse=true" {
+test "stage_lines on staged sets reverse=true" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
     try addFile(&m, "f.txt", .staged);
     try seedTwoHunkDiff(&m);
-    var cmd = try update(&m, .stage_hunk);
+    m.diff_cursor = 6;
+    var cmd = try update(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .apply_patch);
     try std.testing.expect(cmd.apply_patch.reverse);
 }
 
-test "stage_hunk on untracked is no-op with guidance message" {
+test "stage_lines on context-only selection is no-op (null patch)" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
-    try addFile(&m, "new.txt", .untracked);
+    try addFile(&m, "f.txt", .unstaged);
     try seedTwoHunkDiff(&m);
-    var cmd = try update(&m, .stage_hunk);
+    m.diff_cursor = 4; // ' a' 文脈行のみ
+    m.diff_anchor = 4; // 選択あり → null パスでも消費されること
+    var cmd = try update(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor); // 選択ハイライトを残さない
     try std.testing.expect(m.error_text.len > 0);
 }
 
-test "stage_hunk on rename (orig_path != null) is no-op with guidance message" {
+test "stage_lines guards: untracked / busy" {
     const a = std.testing.allocator;
-    var m = try Model.init(a, "/r");
-    defer m.deinit();
-    try m.files.append(a, .{ .path = try a.dupe(u8, "new.txt"), .orig_path = try a.dupe(u8, "old.txt"), .section = .staged });
-    try seedTwoHunkDiff(&m);
-    var cmd = try update(&m, .stage_hunk);
-    defer cmd.deinit(a);
-    try std.testing.expect(cmd == .none);
-    try std.testing.expect(m.error_text.len > 0);
+    {
+        var m = try Model.init(a, "/r");
+        defer m.deinit();
+        try addFile(&m, "u.txt", .untracked);
+        try seedTwoHunkDiff(&m);
+        m.diff_cursor = 6;
+        var c1 = try update(&m, .stage_lines);
+        c1.deinit(a);
+        try std.testing.expect(c1 == .none);
+        try std.testing.expect(m.error_text.len > 0);
+    }
+    {
+        var m = try Model.init(a, "/r");
+        defer m.deinit();
+        try addFile(&m, "f.txt", .unstaged);
+        try seedTwoHunkDiff(&m);
+        m.busy = true;
+        var c2 = try update(&m, .stage_lines);
+        c2.deinit(a);
+        try std.testing.expect(c2 == .none);
+    }
 }
 
-test "stage_hunk while busy or with zero hunks returns none" {
+test "diff_loaded clamps cursor into a hunk body and resets anchor" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
-    try addFile(&m, "f.txt", .unstaged);
-    try seedTwoHunkDiff(&m);
-    m.busy = true;
-    var c1 = try update(&m, .stage_hunk);
-    c1.deinit(a);
-    try std.testing.expect(c1 == .none);
-    m.busy = false;
-    try m.setStr(&m.diff_text, ""); // 0 ハンク
-    var c2 = try update(&m, .stage_hunk);
-    c2.deinit(a);
-    try std.testing.expect(c2 == .none);
+    m.diff_cursor = 999;
+    m.diff_anchor = 3;
+    const diff = try a.dupe(u8, "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,1 +1,2 @@\n a\n+B\n");
+    defer a.free(diff); // diff_loaded は setStr で複製するため呼び出し側が原本を解放（所有権規約）
+    var cmd = try update(&m, .{ .diff_loaded = diff });
+    cmd.deinit(a);
+    // ヘッダ3行(0..2) / @@=3 / ' a'=4 / '+B'=5 → 範囲外 999 は先頭ハンク本文先頭(start_line+1=4) へ。
+    try std.testing.expectEqual(@as(usize, 4), m.diff_cursor);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
 }
 
-test "select_hunk_at_line resolves line to hunk; count==0 stays 0 (no underflow)" {
+test "select_line_at moves cursor, sets diff focus, clears anchor" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
-    try addFile(&m, "f.txt", .unstaged);
     try seedTwoHunkDiff(&m);
-    // hunk1 の @@ 行は絶対行 7（header3 + hunk0[@@,a,-b,+B]=行3..6 → hunk1 @@ は行7）。
-    var c1 = try update(&m, .{ .select_hunk_at_line = 7 });
-    c1.deinit(a);
-    try std.testing.expectEqual(@as(usize, 1), m.selected_hunk);
-    try std.testing.expectEqual(Focus.diff, m.focus);
-    try m.setStr(&m.diff_text, ""); // 0 ハンクでも underflow しない
-    var c2 = try update(&m, .{ .select_hunk_at_line = 5 });
-    c2.deinit(a);
-    try std.testing.expectEqual(@as(usize, 0), m.selected_hunk);
-}
-
-test "file navigation resets selected_hunk; diff_loaded clamps it" {
-    const a = std.testing.allocator;
-    var m = try Model.init(a, "/r");
-    defer m.deinit();
-    try addFile(&m, "f.txt", .unstaged);
-    try addFile(&m, "g.txt", .unstaged);
-    try seedTwoHunkDiff(&m);
-    m.selected_hunk = 1;
-    var c1 = try update(&m, .key_down); // 別ファイルへ → 0 リセット
-    c1.deinit(a);
-    try std.testing.expectEqual(@as(usize, 0), m.selected_hunk);
-    m.selected_hunk = 5;
-    var msg = Msg{ .diff_loaded = try a.dupe(u8, "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n") };
-    defer msg.deinit(a); // diff_loaded は setStr で複製するため呼び出し側が原本を解放（所有権規約）
-    var c2 = try update(&m, msg);
-    c2.deinit(a);
-    try std.testing.expectEqual(@as(usize, 0), m.selected_hunk);
+    m.diff_anchor = 4;
+    var cmd = try update(&m, .{ .select_line_at = 9 }); // h1 '+Y'
+    cmd.deinit(a);
+    try std.testing.expectEqual(@as(usize, 9), m.diff_cursor);
+    try std.testing.expect(m.focus == .diff);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
 }
