@@ -163,34 +163,24 @@ pub fn buildLinePatch(
                 new_count += 1;
                 prev = .kept;
             },
-            '+' => {
+            '+', '-' => {
+                const is_add = line[0] == '+';
                 if (selected) {
+                    // 選択された変更行は方向に依らずそのまま保持。
                     try body.appendSlice(a, line);
                     try body.append(a, '\n');
-                    new_count += 1;
+                    if (is_add) {
+                        new_count += 1;
+                    } else {
+                        old_count += 1;
+                    }
                     kept_changes += 1;
                     prev = .kept;
-                } else if (reverse) { // unstage: index に存在 → 文脈化
-                    try body.append(a, ' ');
-                    try body.appendSlice(a, line[1..]);
-                    try body.append(a, '\n');
-                    old_count += 1;
-                    new_count += 1;
-                    prev = .contextified;
-                } else { // stage: 削除
+                } else if (is_add != reverse) {
+                    // 削除: (+ かつ stage) または (- かつ unstage)。行ごと落とす。
                     prev = .dropped;
-                }
-            },
-            '-' => {
-                if (selected) {
-                    try body.appendSlice(a, line);
-                    try body.append(a, '\n');
-                    old_count += 1;
-                    kept_changes += 1;
-                    prev = .kept;
-                } else if (reverse) { // unstage: index に不在 → 削除
-                    prev = .dropped;
-                } else { // stage: 文脈化
+                } else {
+                    // 文脈化: (+ かつ unstage) または (- かつ stage)。' ' 前置で両側に残す。
                     try body.append(a, ' ');
                     try body.appendSlice(a, line[1..]);
                     try body.append(a, '\n');

@@ -213,9 +213,9 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     }
     const scroll_off = clampScroll(model.diff_scroll, total_lines);
 
-    // 選択レンジ [lo, hi]（anchor 非 null 時のみ）。
-    const sel_lo: ?usize = if (model.diff_anchor) |anc| @min(model.diff_cursor, anc) else null;
-    const sel_hi: usize = if (model.diff_anchor) |anc| @max(model.diff_cursor, anc) else model.diff_cursor;
+    // 選択レンジ（reducer の stage 対象と同一式 → 見えている選択 == stage 対象）。
+    // ハイライトは anchor 非 null のときだけ（anchor==null は単一行 = カーソルマーカーのみ）。
+    const sel = @import("model.zig").selectionRange(model.diff_cursor, model.diff_anchor);
 
     var lines: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, model.diff_text, '\n');
@@ -224,7 +224,7 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
         if (idx < scroll_off) continue;
         if (lines.items.len >= limit) break;
         const is_cursor = (model.focus == .diff and idx == model.diff_cursor);
-        const in_sel = (model.focus == .diff and sel_lo != null and idx >= sel_lo.? and idx <= sel_hi);
+        const in_sel = (model.focus == .diff and model.diff_anchor != null and idx >= sel.lo and idx <= sel.hi);
         if (is_cursor) {
             const marked = std.fmt.allocPrint(a, "\u{258C}{s}", .{line}) catch line;
             lines.append(a, sel_style.render(a, marked) catch marked) catch break;

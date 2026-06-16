@@ -145,6 +145,13 @@ pub const Model = struct {
     }
 };
 
+/// ビジュアル選択レンジ [lo, hi]（閉区間・絶対 diff 行 index）。anchor==null は単一カーソル行。
+/// reducer（stage 対象）と view（ハイライト）が同一式から導き「見える選択 == stage 対象」を保つ。
+pub fn selectionRange(cursor: usize, anchor: ?usize) struct { lo: usize, hi: usize } {
+    const a = anchor orelse cursor;
+    return .{ .lo = @min(cursor, a), .hi = @max(cursor, a) };
+}
+
 test "init/deinit leaves no leaks" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/tmp/repo");

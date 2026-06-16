@@ -89,11 +89,12 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         .diff_cursor_down => {
             var parsed = try hunk.parse(model.allocator, model.diff_text);
             defer parsed.deinit(model.allocator);
-            var total: usize = 0;
-            var cit = std.mem.splitScalar(u8, model.diff_text, '\n');
-            while (cit.next()) |_| total += 1;
+            if (parsed.hunks.len == 0) return .none;
+            // 本文行は最終ハンクの排他的上端より手前にしか無い → そこを走査上限に（全行カウント不要）。
+            const last = parsed.hunks[parsed.hunks.len - 1];
+            const limit = last.start_line + last.line_count;
             var n = model.diff_cursor + 1;
-            while (n < total) : (n += 1) {
+            while (n < limit) : (n += 1) {
                 if (isBodyLine(parsed, n)) {
                     model.diff_cursor = n;
                     break;
@@ -120,8 +121,7 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             if (parsed.hunks.len == 0) return .none;
             const cur = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse 0;
             const next = @min(cur + 1, parsed.hunks.len - 1);
-            const h = parsed.hunks[next];
-            model.diff_cursor = if (h.line_count > 1) h.start_line + 1 else h.start_line;
+            model.diff_cursor = hunkBodyTop(parsed.hunks[next]);
             model.diff_anchor = null;
             return .none;
         },
@@ -131,8 +131,7 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             if (parsed.hunks.len == 0) return .none;
             const cur = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse 0;
             const prev = if (cur == 0) 0 else cur - 1;
-            const h = parsed.hunks[prev];
-            model.diff_cursor = if (h.line_count > 1) h.start_line + 1 else h.start_line;
+            model.diff_cursor = hunkBodyTop(parsed.hunks[prev]);
             model.diff_anchor = null;
             return .none;
         },
@@ -162,10 +161,8 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             defer parsed.deinit(model.allocator);
             if (parsed.hunks.len == 0) return .none;
             const idx = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse return .none;
-            const anchor = model.diff_anchor orelse model.diff_cursor;
-            const lo = @min(model.diff_cursor, anchor);
-            const hi = @max(model.diff_cursor, anchor);
-            const maybe = try hunk.buildLinePatch(model.allocator, parsed, idx, lo, hi, f.section == .staged);
+            const sel = @import("model.zig").selectionRange(model.diff_cursor, model.diff_anchor);
+            const maybe = try hunk.buildLinePatch(model.allocator, parsed, idx, sel.lo, sel.hi, f.section == .staged);
             model.diff_anchor = null; // 成否に関わらず選択は消費（null パスでもハイライトを残さない）
             if (maybe) |patch| {
                 return .{ .apply_patch = .{ .patch = patch, .reverse = (f.section == .staged) } };
@@ -215,8 +212,7 @@ fn clampCursor(model: *Model) !void {
     // 本文行でない（@@ ヘッダ/file_header/範囲外）なら先頭ハンク本文先頭へ再配置
     // （spec: ヘッダクリックも本文へクランプ）。本文内ならジャンプ防止で維持。
     if (!isBodyLine(parsed, model.diff_cursor)) {
-        const h0 = parsed.hunks[0];
-        model.diff_cursor = if (h0.line_count > 1) h0.start_line + 1 else h0.start_line;
+        model.diff_cursor = hunkBodyTop(parsed.hunks[0]);
     }
 }
 
@@ -224,6 +220,12 @@ fn clampCursor(model: *Model) !void {
 fn isBodyLine(parsed: hunk.ParsedDiff, abs: usize) bool {
     if (hunk.hunkIndexForLine(parsed, abs)) |i| return abs != parsed.hunks[i].start_line;
     return false;
+}
+
+/// ハンク `h` の本文先頭行（@@ の次の行）。本文が無い（line_count==1）なら @@ 行自身。
+/// カーソル配置の唯一の基準（diff_hunk_next/prev・clampCursor が共有）。
+fn hunkBodyTop(h: hunk.Hunk) usize {
+    return if (h.line_count > 1) h.start_line + 1 else h.start_line;
 }
 
 /// 現在選択中のファイルの diff を読み込む AppCmd を返す。
