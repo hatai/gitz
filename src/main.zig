@@ -140,6 +140,16 @@ fn workerRun(app: *App, cmd_in: AppCmd) void {
     app.queue.push(app.io, app.gpa, result);
 }
 
+/// 変更系（mutating）副作用か。スピナ表示（model.working）を出すのはこれらの**ユーザ起動**操作の
+/// 実行中だけにする。読み取り系（refresh_status/load_diff）は出さない＝自動リフレッシュやナビゲーション
+/// でステータスバーが点滅しない。`model.busy`（reducer の二重実行ゲート）は全 in-flight で立てる別物。
+fn isMutating(cmd: AppCmd) bool {
+    return switch (cmd) {
+        .stage, .unstage, .commit, .apply_patch => true,
+        .none, .quit, .refresh_status, .load_diff => false,
+    };
+}
+
 /// 副作用 AppCmd をワーカーへ委譲する。busy 中なら pending に退避（latest-wins）。
 /// `cmd` の所有権を受け取る（委譲できなければここで deinit する）。
 fn dispatchSideEffect(app: *App, cmd: AppCmd) void {
@@ -149,7 +159,8 @@ fn dispatchSideEffect(app: *App, cmd: AppCmd) void {
         app.pending = cmd;
         return;
     }
-    app.model.busy = true; // reducer は busy を立てない（結果で false にするのみ）。ここで立てる。
+    app.model.busy = true; // reducer の二重実行ゲート。全 in-flight で立てる（表示はしない）。
+    app.model.working = isMutating(cmd); // スピナ表示用。変更系のときだけ true（読み取りでは点滅させない）。
     app.worker = std.Thread.spawn(.{}, workerThread, .{ app, cmd }) catch {
         // spawn 失敗時はメインスレッドで同期実行（degraded だがクラッシュしない）。
         // worker は null のままなので reapWorker は join せず、worker_done も触らない（＝
@@ -157,6 +168,7 @@ fn dispatchSideEffect(app: *App, cmd: AppCmd) void {
         // reducer が処理する際に下りる（status_loaded/diff_loaded/committed/git_error 全てが
         // busy=false にする）ので、ここでは触らない。
         app.worker = null;
+        app.model.working = false; // 同期実行に落ちたのでスピナは即解除（busy は reducer 結果で下りる）。
         workerRun(app, cmd);
         return;
     };
@@ -213,6 +225,7 @@ fn reapWorker(app: *App) void {
             w.join();
             app.worker = null;
             app.model.busy = false;
+            app.model.working = false; // スピナ解除（pending があれば下の dispatch が再設定する）。
             if (app.pending) |next| {
                 app.pending = null;
                 dispatchSideEffect(app, next);

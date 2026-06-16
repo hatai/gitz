@@ -270,10 +270,12 @@ fn renderCommit(model: *const Model, ctx: *const zz.Context) []const u8 {
 }
 
 /// Status バー: branch / busy スピナ / error_text / キーヒント。
+/// スピナは `model.working`（変更系操作の実行中のみ）で出す。`model.busy`（全 in-flight ゲート）では
+/// 出さない＝自動リフレッシュ/ナビゲーションの読み取りでステータスバーが点滅しない。
 fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
     const branch = if (model.branch.len == 0) "(detached)" else model.branch;
-    const spin = if (model.busy) " [busy]" else "";
+    const spin = if (model.working) " [busy]" else "";
     const hint = if (model.focus == .diff)
         "  j/k hunk  s stage/unstage  tab pane  r refresh  q quit"
     else

@@ -22,7 +22,8 @@ pub const Model = struct {
     selected_hunk: usize, // diff ペインの現在ハンク（0始まり）。ファイル切替で 0、diff 再読込で clamp。
     commit_message: []u8, // TextArea の内容（空可）
     focus: Focus,
-    busy: bool,
+    busy: bool, // reducer の二重実行ゲート（全 in-flight 副作用で true）。表示はしない。
+    working: bool, // スピナ表示用（変更系=stage/unstage/commit/apply_patch の実行中のみ true）。runtime が管理。
     error_text: []u8, // 直近エラー（空可）
     mouse_enabled: bool,
 
@@ -41,6 +42,7 @@ pub const Model = struct {
             .commit_message = try a.dupe(u8, ""),
             .focus = .changes,
             .busy = false,
+            .working = false,
             .error_text = try a.dupe(u8, ""),
             .mouse_enabled = true,
         };
