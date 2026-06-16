@@ -200,36 +200,23 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
 
     const limit: usize = if (height == 0) 1 else height;
 
-    // focus==.diff のときだけハンク境界を解析（changes/commit フォーカス中は parse を走らせない）。
-    // 選択ハンクが画面に全く掛かっていなければ先頭をトップに合わせる（j/k で遠いハンクへ移動した時）。
-    // 一部でも見えている間は diff_scroll を据え置き、Ctrl+d/u で大きいハンクの末尾まで読める。
-    // focus==.diff のフレームでは diff_scroll はこのブロックが唯一の writer でハンク範囲内に収まり、
-    // 表示先頭行 == diff_scroll となりマウス当たり判定（diff_scroll + ペイン相対行）と一致する。
-    // （focus!=.diff で Ctrl+d/u を多用すると diff_scroll が行数超になり得るが、その時クリックは
-    //  範囲外＝hunkIndexForLine が null で no-op になる。phase 1 は許容の既知 seam。）
-    var sel_header_line: ?usize = null;
-    if (model.focus == .diff) {
-        const parsed = hunk.parse(a, model.diff_text) catch hunk.ParsedDiff{ .file_header = "", .hunks = &[_]hunk.Hunk{} };
-        if (parsed.hunks.len > 0) {
-            const sel = @min(model.selected_hunk, parsed.hunks.len - 1);
-            const h = parsed.hunks[sel];
-            sel_header_line = h.start_line;
-            const hunk_top = h.start_line;
-            const hunk_bot = h.start_line + h.line_count; // exclusive
-            const view_top = model.diff_scroll;
-            const view_bot = model.diff_scroll + limit; // exclusive
-            const overlaps = hunk_top < view_bot and hunk_bot > view_top;
-            if (!overlaps) model.diff_scroll = hunk_top;
-        }
-    }
-
-    // 総行数で clamp（末尾超過の空表示を防ぐ）。
+    // 総行数。
     var total_lines: usize = 0;
     {
         var cit = std.mem.splitScalar(u8, model.diff_text, '\n');
         while (cit.next()) |_| total_lines += 1;
     }
+
+    // focus==.diff のときカーソル行を可視範囲に収める（diff_scroll の唯一 writer）。
+    // ensureVisible はカーソルが窓の外なら scroll を最小限ずらす（マウス当たり判定と一致）。
+    if (model.focus == .diff) {
+        model.diff_scroll = ensureVisible(model.diff_scroll, model.diff_cursor, limit);
+    }
     const scroll_off = clampScroll(model.diff_scroll, total_lines);
+
+    // 選択レンジ [lo, hi]（anchor 非 null 時のみ）。
+    const sel_lo: ?usize = if (model.diff_anchor) |anc| @min(model.diff_cursor, anc) else null;
+    const sel_hi: usize = if (model.diff_anchor) |anc| @max(model.diff_cursor, anc) else model.diff_cursor;
 
     var lines: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, model.diff_text, '\n');
@@ -237,13 +224,16 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     while (it.next()) |line| : (idx += 1) {
         if (idx < scroll_off) continue;
         if (lines.items.len >= limit) break;
-        // 選択ハンクの @@ ヘッダ行は反転＋左マーカーで強調する。
-        if (sel_header_line) |t| {
-            if (idx == t) {
-                const marked = std.fmt.allocPrint(a, "\u{258C}{s}", .{line}) catch line;
-                lines.append(a, sel_style.render(a, marked) catch marked) catch break;
-                continue;
-            }
+        const is_cursor = (model.focus == .diff and idx == model.diff_cursor);
+        const in_sel = (model.focus == .diff and sel_lo != null and idx >= sel_lo.? and idx <= sel_hi);
+        if (is_cursor) {
+            const marked = std.fmt.allocPrint(a, "\u{258C}{s}", .{line}) catch line;
+            lines.append(a, sel_style.render(a, marked) catch marked) catch break;
+            continue;
+        }
+        if (in_sel) {
+            lines.append(a, sel_style.render(a, line) catch line) catch break;
+            continue;
         }
         const styled: []const u8 = if (line.len > 0 and line[0] == '+')
             (add_style.render(a, line) catch line)
@@ -277,7 +267,7 @@ fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
     const branch = if (model.branch.len == 0) "(detached)" else model.branch;
     const spin = if (model.working) " [busy]" else "";
     const hint = if (model.focus == .diff)
-        "  j/k hunk  s stage/unstage  tab pane  r refresh  q quit"
+        "  j/k line  v select  s stage/unstage  ]/[ hunk  tab pane  r refresh  q quit"
     else
         "  j/k move  space stage  c commit  r refresh  q quit";
     const base = std.fmt.allocPrint(a, " {s}{s}", .{ branch, spin }) catch " ?";
