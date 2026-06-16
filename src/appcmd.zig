@@ -361,3 +361,84 @@ test "apply_patch surfaces git_error on a corrupt patch" {
     defer msg.deinit(a);
     try std.testing.expect(msg == .git_error); // 握り潰さない
 }
+
+// 一時 repo で `git diff --cached -- <path>` の出力（index 状態）を複製して返すヘルパ。
+fn stagedDiff(repo: *TmpRepo, a: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    var r = try process.run(a, io, &.{ "git", "diff", "--cached", "--", path }, repo.cwd());
+    defer r.deinit(a);
+    return try a.dupe(u8, r.stdout); // 呼び出し側が free
+}
+
+test "apply_patch (line stage forward): only the selected inserted line enters the index" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "f.txt", "a\nc\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    // a と c の間に B1/B2 を挿入（純粋挿入）。
+    try repo.writeFile(io, "f.txt", "a\nB1\nB2\nc\n");
+    var dmsg = try runOwned(a, io, repo.cwd(), .{ .load_diff = .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .unstaged } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.hunks.len == 1);
+    // '+B1' 行だけ選択して stage。'+B1' の絶対行を探す。
+    var plus_b1: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, dmsg.diff_loaded, '\n');
+        var i: usize = 0;
+        while (it.next()) |ln| : (i += 1) if (std.mem.eql(u8, ln, "+B1")) {
+            plus_b1 = i;
+        };
+    }
+    const maybe = try hunk.buildLinePatch(a, parsed, 0, plus_b1, plus_b1, false);
+    try std.testing.expect(maybe != null);
+    var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{ .patch = maybe.?, .reverse = false } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded); // git_error でないこと
+    // index には B1 のみ入り、B2 はまだ unstaged。
+    const sd = try stagedDiff(&repo, a, io, "f.txt");
+    defer a.free(sd);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+B1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+B2\n") == null);
+}
+
+test "apply_patch (line unstage reverse): only the selected inserted line leaves the index" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "f.txt", "a\nc\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    try repo.writeFile(io, "f.txt", "a\nB1\nB2\nc\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" }); // 全 stage
+    var dmsg = try runOwned(a, io, repo.cwd(), .{ .load_diff = .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .staged } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    var plus_b1: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, dmsg.diff_loaded, '\n');
+        var i: usize = 0;
+        while (it.next()) |ln| : (i += 1) if (std.mem.eql(u8, ln, "+B1")) {
+            plus_b1 = i;
+        };
+    }
+    const maybe = try hunk.buildLinePatch(a, parsed, 0, plus_b1, plus_b1, true);
+    try std.testing.expect(maybe != null);
+    var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{ .patch = maybe.?, .reverse = true } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded);
+    // index からは B1 だけ外れ（staged diff に +B1 が消える）、B2 はまだ staged。
+    const sd = try stagedDiff(&repo, a, io, "f.txt");
+    defer a.free(sd);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+B1\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+B2\n") != null);
+}
