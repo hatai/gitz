@@ -28,8 +28,12 @@ const input = @import("input.zig");
 const viewmod = @import("view.zig");
 const cmds = @import("git/commands.zig");
 const process = @import("git/process.zig");
+const autorefresh = @import("autorefresh.zig");
 
 const Cwd = process.Cwd;
+
+/// 自動 status リフレッシュの最短間隔（ms）。worker 非稼働かつ pending 無しのときのみ発火。
+const auto_refresh_interval_ms: i64 = 1500;
 
 /// ワーカー → メイン の結果キュー（mutex 保護）。ワーカーは push、メインは drain。
 /// Zig 0.16 では同期プリミティブが `std.Io.Mutex` に移り lock/unlock が `io` を要する
@@ -99,6 +103,9 @@ const App = struct {
     // ワーカー直列実行（1 度に 1 コマンド）。busy 中の新規副作用は pending に latest-wins で退避。
     worker: ?std.Thread = null,
     pending: ?AppCmd = null,
+
+    /// 自動リフレッシュの前回 dispatch 時刻（ms）。tick で間引くために使う。
+    last_auto_refresh_ms: i64 = 0,
 };
 
 var g_app: App = undefined;
@@ -135,14 +142,15 @@ fn workerRun(app: *App, cmd_in: AppCmd) void {
 
 /// 副作用 AppCmd をワーカーへ委譲する。busy 中なら pending に退避（latest-wins）。
 /// `cmd` の所有権を受け取る（委譲できなければここで deinit する）。
-fn dispatchSideEffect(app: *App, cmd: AppCmd) void {
+fn dispatchSideEffect(app: *App, cmd: AppCmd, set_busy: bool) void {
     if (app.worker != null) {
         // 既存ワーカー稼働中。前の pending は捨てて最新で上書き（rapid j/k の load_diff を間引く）。
         if (app.pending) |*p| p.deinit(app.gpa);
         app.pending = cmd;
         return;
     }
-    app.model.busy = true; // reducer は busy を立てない（結果で false にするのみ）。ここで立てる。
+    if (set_busy) app.model.busy = true; // 自動リフレッシュ（set_busy=false）はスピナを点滅させない。
+    // reducer は busy を立てない（結果で false にするのみ）。ここで立てる。
     app.worker = std.Thread.spawn(.{}, workerThread, .{ app, cmd }) catch {
         // spawn 失敗時はメインスレッドで同期実行（degraded だがクラッシュしない）。
         // worker は null のままなので reapWorker は join せず、worker_done も触らない（＝
@@ -163,7 +171,7 @@ fn applyAppCmd(app: *App, program: anytype, cmd: AppCmd) void {
     switch (cmd) {
         .none => {},
         .quit => program.quit(),
-        .refresh_status, .stage, .unstage, .load_diff, .commit, .apply_patch => dispatchSideEffect(app, cmd),
+        .refresh_status, .stage, .unstage, .load_diff, .commit, .apply_patch => dispatchSideEffect(app, cmd, true),
     }
 }
 
@@ -208,10 +216,20 @@ fn reapWorker(app: *App) void {
             app.model.busy = false;
             if (app.pending) |next| {
                 app.pending = null;
-                dispatchSideEffect(app, next);
+                dispatchSideEffect(app, next, true);
             }
         }
     }
+}
+
+/// tick ごとに呼ぶ: worker 非稼働かつ pending 無しで前回から間隔経過していれば、
+/// busy を立てずに（スピナを点滅させずに）status を再読込する。外部のファイル変更を
+/// 再起動なしで反映するための定期ポーリング（WSL2 では inotify 不安定のため採用）。
+fn maybeAutoRefresh(app: *App) void {
+    const now = nowMs(app);
+    if (!autorefresh.shouldAutoRefresh(now, app.last_auto_refresh_ms, auto_refresh_interval_ms, app.worker != null, app.pending != null)) return;
+    app.last_auto_refresh_ms = now;
+    dispatchSideEffect(app, .refresh_status, false); // silent（busy を立てない）
 }
 
 pub const RuntimeModel = struct {
@@ -244,6 +262,8 @@ pub const RuntimeModel = struct {
                 // ワーカー完了を回収し、キューを drain して reducer に流す。
                 reapWorker(app);
                 drainQueue(app, program);
+                // 外部のファイル変更を再起動なしで反映する定期ポーリング（間引き済み・busy 非点灯）。
+                maybeAutoRefresh(app);
             },
             .key => |k| handleKey(app, program, k),
             .mouse => |m| handleMouse(app, program, m),
