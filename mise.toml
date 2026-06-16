@@ -1,3 +1,22 @@
+[env]
+_.python.venv = { path = ".venv", create = true }
+
 [tools]
+node = "lts"
+python = "3.13.12"
+"npm:tuistory" = "latest"
+uv = "latest"
 zig = "0.16.0"
 zls = "0.16.0"
+rust = "latest"
+
+[tasks.install]
+alias = "i"
+run = [
+  "sudo -v",
+  "sudo apt update",
+  "sudo apt install -y ffmpeg cage wtype",
+  "uv pip install -r requirements.txt",
+  "cargo install --git https://github.com/asciinema/agg",
+]
+
