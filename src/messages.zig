@@ -89,7 +89,9 @@ pub const AppCmd = union(enum) {
     pub const LoadDiff = struct { path: []u8, orig_path: ?[]u8, section: Section };
     /// 部分ステージング: 単一ハンクのパッチ（所有）と適用方向。
     /// reverse=false: stage（git apply --cached）。reverse=true: unstage（--reverse）。
-    pub const ApplyPatch = struct { patch: []u8, reverse: bool };
+    /// git_dir: 絶対 git-dir（worktree/submodule 対応）。null = フォールバック（cwd 相対 .git/...）。
+    /// デフォルト null 必須: 既存の8箇所の `.{ .patch=..., .reverse=... }` リテラル呼出を壊さないため。
+    pub const ApplyPatch = struct { patch: []u8, reverse: bool, git_dir: ?[]const u8 = null };
 
     pub fn deinit(self: *AppCmd, a: std.mem.Allocator) void {
         // 網羅的 switch: 所有バリアントを追加したら必ずここに解放処理を書く
@@ -105,7 +107,10 @@ pub const AppCmd = union(enum) {
                 if (ld.orig_path) |p| a.free(p);
             },
             .commit => |m| a.free(m),
-            .apply_patch => |ap| a.free(ap.patch),
+            .apply_patch => |ap| {
+                a.free(ap.patch);
+                if (ap.git_dir) |g| a.free(g);
+            },
             // 単純: 解放不要
             .none,
             .refresh_status,
