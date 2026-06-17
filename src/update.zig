@@ -259,6 +259,18 @@ fn navHunkEnd(parsed: hunk.ParsedDiff, anchor: ?usize) usize {
     return last.start_line + last.line_count;
 }
 
+/// diff_text の行数を数える純粋関数。
+/// ★MUST match view.zig renderDiff total_lines counting: 両サイトの同期が崩れると
+///   表示とスクロール上限がズレて制約4と同種のバグが再発する。変更時は両方直すこと。
+/// splitScalar は trailing newline があれば空トークンを1つ追加するため、
+/// 例えば "a\nb\nc\n" は4トークン（"a","b","c",""）を返す。view.zig も同じ計算なので一致する。
+fn diffLineCount(text: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
 /// 現在選択中のファイルの diff を読み込む AppCmd を返す。
 /// ファイルが無ければ diff_text を空にして .none。
 fn loadDiffCmd(model: *Model) !AppCmd {
@@ -389,6 +401,17 @@ fn seedTwoHunkDiff(m: *Model) !void {
         "@@ -1,2 +1,2 @@\n a\n-b\n+B\n" ++ // @@ は行3
         "@@ -10,2 +10,3 @@\n x\n+Y\n z\n"; // @@ は行7
     try m.setStr(&m.diff_text, diff);
+}
+
+test "diffLineCount counts splitScalar tokens (trailing newline yields extra empty)" {
+    // 空文字列: splitScalar は空トークン1つを返す。Task10 の no-op テストが依存する挙動。
+    try std.testing.expectEqual(@as(usize, 1), diffLineCount(""));
+    // "a\nb\nc\n": splitScalar は a, b, c, "" の4トークン。
+    try std.testing.expectEqual(@as(usize, 4), diffLineCount("a\nb\nc\n"));
+    // "a\nb\nc": 末尾改行無し → 3 トークン。
+    try std.testing.expectEqual(@as(usize, 3), diffLineCount("a\nb\nc"));
+    // 単一行: 1 トークン。
+    try std.testing.expectEqual(@as(usize, 1), diffLineCount("(no diff)"));
 }
 
 // seedTwoHunkDiff の絶対行: file_header 0..2 / @@h0=3 ' a'4 '-b'5 '+B'6 / @@h1=7 ' x'8 '+Y'9 ' z'10
