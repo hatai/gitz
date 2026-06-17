@@ -67,7 +67,7 @@ pub fn gitDir(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !?[]u8
 
 - `gitDir` は `repoRoot`（`commands.zig` 既存）と同じ構造: `process.run` → exit_code 判定 →
   stdout の dup（trailing whitespace は `std.mem.trim` で除去）。
-- `--absolute-git-dir` は末尾スラッチ無しを保証するため、argv のパス結合は呼出側で `/` を明示挿入（後述）。
+- `--absolute-git-dir` は末尾スラッシュ無しを保証するため、argv のパス結合は呼出側で `/` を明示挿入（後述）。
 
 #### 2.2 `src/model.zig`（フィールド追加）
 
@@ -118,16 +118,25 @@ pub const ApplyPatch = struct {
 
 ```zig
 if (maybe) |patch| {
+    // ★レビュー指摘 B2: buildLinePatch が所有する patch を、git_dir dupe の OOM で漏らさないよう
+    //   errdefer で保護する（dupe 成功後に所有権を AppCmd へ移譲）。
+    errdefer model.allocator.free(patch);
+    const gd: ?[]u8 = if (model.git_dir) |g| try model.allocator.dupe(u8, g) else null;
+    errdefer if (gd) |x| model.allocator.free(x);
     return .{ .apply_patch = .{
         .patch = patch,
         .reverse = (f.section == .staged),
-        .git_dir = if (model.git_dir) |g| try model.allocator.dupe(u8, g) else null,
+        .git_dir = gd,
     } };
 }
 ```
 
 - `null` も許容（フォールバック経路）。dupe しないと worker スレッドが解放時に model の文字列を指す
   stale エイリアスになる（所有権規約）。
+- **errdefer 二重ガード必須**（レビュー B2）: `patch` は `buildLinePatch` から所有権移譲済みの `[]u8`。
+  従来コードは `patch` 生成後に fallible な処理が無かったが、`git_dir` の dupe は OOM を投げ得るため、
+  `errdefer model.allocator.free(patch)` と `errdefer if (gd) |x| ...` の 2 段で保護しないと
+  `patch`（と dupe 済みの `gd`）がリークする。両 dupe が成功した時点で AppCmd リテラルへ所有権移譲。
 
 #### 2.5 `src/appcmd.zig`（apply_patch 解釈）
 
@@ -195,8 +204,12 @@ if (maybe) |patch| {
 // 起動時 1 回のみ。失敗（非リポジトリ・spawn エラー）は null へ退化し、
 // appcmd のフォールバック経路（cwd 相対 .git/...）へ。起動クラッシュしない。
 // setStr は *[]u8 専用で ?[]u8 には使えないため直接 dupe（起動時 1 回だけなのでヘルパ化不要）。
+// ★レビュー指摘 B1: cmds.gitDir は repoRoot/branchName と同型=caller owned の []u8 を返す。
+//   branchName の既存パターン（main.zig:428 `defer gpa.free(bn)`）どおり、dupe 後に g を free すること。
+//   これを忘れると成功時毎回リークし std.testing.allocator が検出する。
 if (cmds.gitDir(gpa, io, cwd)) |maybe_gd| {
     if (maybe_gd) |g| {
+        defer gpa.free(g); // ★ gitDir 戻り値は caller owned（branchName と同型）
         g_app.model.git_dir = try g_app.model.allocator.dupe(u8, g);
     }
     // maybe_gd == null（非リポジトリ等）は何もしない（git_dir は null のまま）
@@ -204,8 +217,14 @@ if (cmds.gitDir(gpa, io, cwd)) |maybe_gd| {
 ```
 
 - `try` ではなく `if ... else |_| {}` で `RunError` を握りつぶす。
+- **`defer gpa.free(g)` 必須**（レビュー B1）: `gitDir` は `repoRoot`/`branchName` と同じく
+  caller owned の `[]u8` を返す（`try a.dupe(u8, trimmed)`）。`g_app.model.allocator.dupe(u8, g)` で
+  Model 側へ複製した後、`g` 自体は解放しないとリーク。`main.zig:428` の `branchName` ハンドリング
+  （`defer gpa.free(bn)`）と同じ形。
 - `repoRoot` が null のとき（非リポジトリ）は早期 `std.process.exit(1)` しているため、
   `gitDir` の呼出は「確認済みリポジトリ内」でのみ走る（レビュー確認事項）。
+- **配置位置**（レビュー N1）: `g_app` 初期化後かつ `g_app.model.deinit()` の errdefer インストール後に
+  配置（main.zig の `Model.init` → `g_app` ハンドオフ間の no-`try` 不変条件を守る）。
 - `seedInitialStatus` の網羅 switch（`.none, .quit, .apply_patch => {}`）は**変更不要**（apply_patch arm は既存）。
 
 ### テスト
@@ -216,12 +235,16 @@ if (cmds.gitDir(gpa, io, cwd)) |maybe_gd| {
 
 #### 結合（appcmd.zig 内、`TmpRepo` パターン拡張）
 
-- **linked worktree**（レビュー N4 推奨）: `git worktree add <tmp2>` で副 worktree を作り、そこから
-  `apply_patch` を `git_dir != null` で実行 → 成功して index に入ることを `git diff --cached` で assert。
-- **submodule**（レビュー N4 推奨）: `git submodule add` または `git init` + superproject 登録で
-  submodule を作り、submodule 内で `apply_patch` を `git_dir != null` で実行 → 成功を assert。
-  submodule の `.git` ファイルは `gitdir: ../.git/modules/<name>` の**相対**形式（worktree とは別経路）
-  であり、`--absolute-git-dir` が実ディレクトリへ解決することを検証。
+- **linked worktree**（レビュー N4 推奨）: **初回 commit 済みの** TmpRepo から
+  `git worktree add <tmp2> <branch>` で副 worktree を作り（worktree add は HEAD を要求するため
+  TmpRepo.init 直後に空 commit を1つ入れる）、そこから `apply_patch` を `git_dir != null` で実行 →
+  成功して index に入ることを `git diff --cached` で assert。
+- **submodule**（レビュー N4 推奨）: submodule を作り、submodule 内で `apply_patch` を `git_dir != null` 
+  で実行 → 成功を assert。**`git submodule add` はローカルパスだと `protocol.file.allow` 制限に掛かるため**
+  （git 2.38+ の既定）、`git -c protocol.file.allow=always submodule add <path> <name>` で渡すか、
+  `git init` + `.gitmodules` 手動登録で構築（レビュー N1/N3）。submodule の `.git` ファイルは
+  `gitdir: ../.git/modules/<name>` の**相対**形式（worktree とは別経路）であり、`--absolute-git-dir` 
+  が実ディレクトリへ解決することを検証。
 - **フォールバック回帰**: `git_dir = null` で既存 6 件の統合テスト（`TmpRepo` + `runOwned`）が
   **一切変更なしで green** であることを確認（`ApplyPatch.git_dir` のデフォルト `= null` で成立）。
 
@@ -479,8 +502,19 @@ test "fromZigzagMouse: base fields propagate to all branches (factoring invarian
 - ~~`input.fromZigzagMouse` の戻り値 MouseEvent リテラルが分岐ごとに重複。~~
   → 解消: `base` 構築の factoring（`kind` にデフォルト追加）。
 
-「行単位 stage の phase 2 で未対応」セクション（飛び飛ぎ選択・ドラッグ範囲拡張・No-newline 境界）
+「行単位 stage の phase 2 で未対応」セクション（飛び飛び選択・ドラッグ範囲拡張・No-newline 境界）
 は本 spec の対象外のため**変更しない**。
+
+## 6.1 既存コメントの更新（レビュー N4）
+
+制約 4 の実装時に、関連する既存コードのコメントが stale になるため併せて更新する:
+
+- `src/input.zig` の `fromZigzagMouse` 内 `diff_line` 計算コメント（現状: 「phase 1 許容の既知 seam」と
+  範囲外クリックを許容する旨）→ 制約 4 根治後は「reducer 側で diff_scroll を行数クランプするため
+  範囲外にならない」へ書き換え。
+- `src/view.zig` の `renderDiff` コメント（現状: 「diff_scroll の唯一 writer」と `ensureVisible` を指す）→
+  update.zig の `scroll_diff_down` も writer になったため、「writer は update（クランプ）と renderDiff
+  （focus==.diff 時の ensureVisible）の 2 箇所」と訂正。
 
 ## 7. レビュー経緯（設計の妥当性裏付け）
 
@@ -494,6 +528,22 @@ test "fromZigzagMouse: base fields propagate to all branches (factoring invarian
   N3（`diffLineCount` と `renderDiff` の同期コメント必須）を反映。二重 writer 相互作用・既存テスト更新を確認。
 - **制約 5**: NEEDS-CHANGES → 修正で APPROVE。ブロッカー B1（`MouseEvent.kind` にデフォルト `= .ignore`
   必須）を反映。N4（base 伝播 invariant テスト 1 件追加）・N5（5 構築サイトの正しい数）を反映。
+
+### 第 3 回レビュー（spec 全体: subagent + codex 並行）
+
+spec 全体を subagent と codex CLI で並行レビューし、両者から所有権リーク指摘:
+
+- **B1（両者共通）**: `main.zig` 起動時 `gitDir` snippet が `cmds.gitDir` の戻り値（caller owned の `[]u8`、
+  `repoRoot`/`branchName` と同型）を dupe 後に free していなかった。`main.zig:428` の `branchName` 
+  パターン（`defer gpa.free(bn)`）どおり `defer gpa.free(g)` を追加して反映。
+- **B2（codex のみ）**: `update.zig` `stage_lines` で `buildLinePatch` 所有の `patch` を `git_dir` dupe の
+  OOM で漏らす経路があった。`errdefer model.allocator.free(patch)` と `errdefer if (gd) |x| ...` の
+  二重ガードを追加して反映。
+- **N1（codex）**: 起動時 `gitDir` 呼出の配置位置（`g_app` 初期化後・`errdefer` インストール後）を明記。
+- **N2（codex）**: linked worktree テストは初回 commit 済み前提（`worktree add` が HEAD を要求）を明記。
+- **N3（両者共通）**: submodule テストは `git -c protocol.file.allow=always submodule add` を使う旨を明記。
+- **N4（codex）**: 制約 4 実装時に `input.zig` と `view.zig` の stale コメントを併せて更新する§6.1 を追加。
+- **N5（codex）**: typo 修正（`末尾スラッチ` → `末尾スラッシュ`）。
 
 ## 8. テスト規約（既存に従う）
 
