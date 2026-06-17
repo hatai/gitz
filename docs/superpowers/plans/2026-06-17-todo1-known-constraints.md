@@ -315,29 +315,39 @@ Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.g
 ### Task 7: main.zig 起動時の gitDir 呼出（main.zig）
 
 **Files:**
-- Modify: `src/main.zig`（`main()` の `branchName` 解決の直後、`g_app` ハンドオフ前）
+- Modify: `src/main.zig`（`main()` の `errdefer if (!handed_off) g_app.model.deinit();` の直後、`seedInitialStatus(&g_app)` の前）
 
-- [ ] **Step 1: branchName 解決の直後に gitDir 解決を追加**
+- [ ] **Step 1: errdefer インストール直後に gitDir 解決を追加**
 
-`src/main.zig` の `main()` 内で、`if (cmds.branchName(gpa, io, cwd_root)) |bn| { ... } else |_| {}` 
-ブロックの直後（`g_app = .{ ... }` の前）に追加。レビュー B1 対策: `defer gpa.free(g)` 必須（gitDir は caller owned）:
+`src/main.zig` の `main()` 内で、`var handed_off = false;` と `errdefer if (!handed_off) g_app.model.deinit();`
+の**直後**（`seedInitialStatus(&g_app);` の前）に追加。
+
+**★重要（レビュー B1）**: `m.git_dir` ではなく **`g_app.model.git_dir`** を設定すること。
+`main.zig:419-423` の不変条件「`Model.init` 成功から `g_app` ハンドオフの間に `try` を挟まない」
+を守るため、`errdefer` インストール後のこの位置で `g_app.model.git_dir` に対して dupe する。
+OOM 時は errdefer が `g_app.model.deinit()` を発動し、`g_app.model.repo_root` 等も含めて
+正しく解放される（`m` を触らない＝stale エイリアス問題を回避）。
 
 ```zig
-    // git-dir（worktree/submodule の .git ファイルも解決）。失敗は null へ退化し appcmd の
+    // git-dir 解決（worktree/submodule の .git ファイルも解決）。失敗は null へ退化し appcmd の
     // フォールバック経路（cwd 相対 .git/...）へ。起動クラッシュしない（branchName と同型）。
     // ★レビュー B1: cmds.gitDir は repoRoot/branchName と同型=caller owned の []u8 を返す。
-    //   dupe 後に必ず free すること（main.zig:428 の branchName パターンどおり）。
+    //   dupe 後に必ず free すること（main.zig の branchName パターンどおり）。
+    //   ★配置位置（レビュー B1）: `g_app` ハンドオフ後かつ上記 errdefer インストール後。
+    //   これより前（m に対する try）は main.zig:419-423 の no-try 不変条件に違反し OOM で m がリークする。
     if (cmds.gitDir(gpa, io, cwd_root)) |maybe_gd| {
         if (maybe_gd) |g| {
             defer gpa.free(g); // ★ gitDir 戻り値は caller owned
-            m.git_dir = try gpa.dupe(u8, g);
+            g_app.model.git_dir = try g_app.model.allocator.dupe(u8, g);
         }
         // maybe_gd == null（非リポジトリ等）は何もしない（git_dir は null のまま）
     } else |_| {} // RunError（spawn 失敗等）も握りつぶす
 ```
 
-注意: `m` はこの時点で `var m = try Model.init(gpa, root);` で生成済み・`g_app` への浅いコピー前。
-`m.git_dir = ...` で直接設定し、後続の `g_app = .{ .model = m, ... }` でモデルごとコピーされる。
+注意: `g_app.model.git_dir = try ...` の OOM は上の `errdefer if (!handed_off) g_app.model.deinit();` 
+で捕捉される（`g_app.model` の全フィールドが解放される）。`cwd_root` は `g_app` ハンドオフの前の
+`const cwd_root: Cwd = .{ .path = m.repo_root };` で定義済みで、ハンドオフ後も `m.repo_root` と
+`g_app.model.repo_root` は同一ヒープを指すため、`cwd_root` をそのまま使える。
 
 - [ ] **Step 2: コンパイル＆既存テストが通ることを確認**
 
@@ -367,7 +377,9 @@ Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.g
 - [ ] **Step 1: linked worktree 結合テストを書く**
 
 `src/appcmd.zig` の末尾の既存 apply_patch テスト群の直後に追加。`git worktree add` は HEAD を要求するため
-初回 commit を入れる。`worktree.tmp` ディレクトリを `createDirPath` で作ってから `worktree add` する:
+初回 commit を入れる。**オプション順序に注意（レビュー B3）**: `git worktree add -q -b <branch> <path>` 
+（`-b` をパスの前に置く。`-q <path> -b <branch>` だと git が `-b` を path 引数の後に来るオプションとして
+誤解析する場合がある）。
 
 ```zig
 test "apply_patch with git_dir works in a linked worktree" {
@@ -382,8 +394,9 @@ test "apply_patch with git_dir works in a linked worktree" {
     try repo.git(a, io, &.{ "git", "add", "f.txt" });
     try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
 
-    // 副ワークツリーを repo 配下の worktree-tmp へ作る（git worktree add は HEAD を要求=済み）。
-    try repo.git(a, io, &.{ "git", "worktree", "add", "-q", "worktree-tmp", "-b", "wt" });
+    // 副ワークツリーを repo 配下の worktree-tmp へ作る。
+    // ★オプション順序（レビュー B3）: -q -b <branch> <path> の順（path の後に -b を置かない）。
+    try repo.git(a, io, &.{ "git", "worktree", "add", "-q", "-b", "wt", "worktree-tmp" });
 
     // 副ワークツリーを開く。.git はファイル（gitdir ポインタ）のはず。
     var wt = try repo.dir.dir.openDir(io, "worktree-tmp", .{});
@@ -425,58 +438,75 @@ test "apply_patch with git_dir works in a linked worktree" {
 Run: `cd /home/hatai/repos/hatai/git-tui && zig build test --summary all 2>&1 | tail -30`
 Expected: PASS（worktree で apply が成功し staged エントリが返る）
 
-- [ ] **Step 3: submodule 結合テストを書く**
+- [ ] **Step 3: 本物の submodule 結合テストを書く**
 
-worktree テストの直後に追加。submodule は `git -c protocol.file.allow=always submodule add` を使う（git 2.38+ 制限）:
+worktree テストの直後に追加。**レビュー B2 対策**: 通常リポジトリではなく**本物の submodule** 
+（`.git` がファイルで `gitdir: ../.git/modules/<name>` を指す）を作る。`git submodule add` は
+ローカルパスだと `protocol.file.allow` 制限（git 2.38+ 既定）に掛かるため `-c protocol.file.allow=always` で回避:
 
 ```zig
-test "apply_patch with git_dir works in a submodule" {
-    // spec §2 結合テスト: submodule で .git が相対 gitdir: でも --absolute-git-dir が実 dir へ解決する。
+test "apply_patch with git_dir works in a real submodule" {
+    // spec §2 結合テスト: 本物の submodule（.git ファイル=相対 gitdir:）で git_dir 経路が動く。
+    // ★レビュー B2: 通常リポジトリではなく実際の submodule を作る。submodule の .git は
+    //   `gitdir: ../.git/modules/<name>` の相対形式（worktree とは別経路）であり、
+    //   --absolute-git-dir がこれを実ディレクトリへ解決することを検証する。
     const a = std.testing.allocator;
     const io = std.testing.io;
     const hunk = @import("diff/hunk.zig");
+
+    // superproject 用 tmp リポジトリ（初回 commit 済み＝submodule add の前提）。
     var super = try TmpRepo.init(a, io);
     defer super.deinit();
-    // superproject は初回 commit 必要（submodule add の前提）。
     try super.writeFile(io, "root.txt", "x\n");
     try super.git(a, io, &.{ "git", "add", "root.txt" });
     try super.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
 
-    // submodule 用の独立 tmp リポジトリを作る。
+    // submodule 用独立 tmp リポジトリ（初回 commit 済み＝add 可能にするため）。
     var sub_repo = try TmpRepo.init(a, io);
     defer sub_repo.deinit();
     try sub_repo.writeFile(io, "sub.txt", "1\n2\n3\n");
     try sub_repo.git(a, io, &.{ "git", "add", "sub.txt" });
     try sub_repo.git(a, io, &.{ "git", "commit", "-q", "-m", "sub init" });
 
-    // submodule を super へ追加。file:// プロトコル制限を -c で回避（git 2.38+ 既定）。
-    // sub_repo の絶対パスは tmpDir の内部パスだが、runAndFree 経由で cwd 相対に解決できないため、
-    // 代わりに super 内で .gitmodules 手動登録 + git submodule absorbing を使う簡易法を採用。
-    // ここでは sub_repo 自体を「submodule 風 .git ファイル環境」として検証する:
-    // sub_repo は通常リポジトリ（.git ディレクトリ）なので、submodule と同じ .git/modules/<name>
-    // 構造を再現するのは困難。よって本テストは .git ファイル環境の代表として linked worktree
-    // テスト（上記）で網羅し、submodule 個別テストは省略する。
-    //
-    // 代わり: sub_repo の通常 .git ディレクトリに対して git_dir 経路が同等に動くことを確認
-    // （通常 .git も --absolute-git-dir で実ディレクトリを返すため、絶対パス経路の基本検証になる）。
-    const maybe_gd = try cmds.gitDir(a, io, sub_repo.cwd());
+    // super へ sub_repo を submodule として追加。
+    // ★protocol.file.allow=always 必須（git 2.38+ は file:// を既定で拒否）。
+    //   sub_repo の絶対パスは tmpDir の内部パスを取る必要があるが、TmpRepo.dir.dir は
+    //   tmpDir の sub_path を隠すため、ここでは super 内の相対パス経由では追加できない。
+    //   代わりに sub_repo の絶対パスを std.Io.Dir.realpath で得て渡す。
+    var sub_abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sub_abs = sub_repo.dir.dir.realpath(io, ".", &sub_abs_buf) catch return;
+    try super.git(a, io, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", sub_abs, "sub" });
+    // submodule 作業ツリー内のファイルを commit して super 側へ反映。
+    try super.git(a, io, &.{ "git", "commit", "-q", "-m", "add sub" });
+
+    // super/sub を開く。.git はファイルのはず（`gitdir: ../.git/modules/sub`）。
+    var sub_wt = try super.dir.dir.openDir(io, "sub", .{});
+    defer sub_wt.close(io);
+    const sub_cwd: Cwd = .{ .dir = sub_wt };
+
+    // --absolute-git-dir で実 git-dir を解決（相対 gitdir: を透過して super/.git/modules/sub へ）。
+    const maybe_gd = try cmds.gitDir(a, io, sub_cwd);
     try std.testing.expect(maybe_gd != null);
     const gd = maybe_gd.?;
     defer a.free(gd);
-    try std.testing.expect(std.mem.endsWith(u8, gd, ".git"));
+    // gd は .git/modules/sub を指す実ディレクトリであること（worktree とは別経路の検証）。
+    try std.testing.expect(std.mem.indexOf(u8, gd, "modules") != null);
 
-    // sub.txt を変更して apply_patch を git_dir 経路で実行。
-    try sub_repo.writeFile(io, "sub.txt", "1x\n2\n3\n");
-    var dmsg = try runOwned(a, io, sub_repo.cwd(), .{ .load_diff = .{ .path = try a.dupe(u8, "sub.txt"), .orig_path = null, .section = .unstaged } });
+    // submodule 内で sub.txt を変更 → unstaged diff を取得。
+    try sub_wt.writeFile(io, .{ .sub_path = "sub.txt", .data = "1x\n2\n3\n" });
+    var dmsg = try runOwned(a, io, sub_cwd, .{ .load_diff = .{ .path = try a.dupe(u8, "sub.txt"), .orig_path = null, .section = .unstaged } });
     defer dmsg.deinit(a);
     try std.testing.expect(dmsg == .diff_loaded);
     var parsed = try hunk.parse(a, dmsg.diff_loaded);
     defer parsed.deinit(a);
     try std.testing.expect(parsed.hunks.len >= 1);
     const patch = try hunk.buildPatch(a, parsed, 0);
-    var msg = try runOwned(a, io, sub_repo.cwd(), .{ .apply_patch = .{ .patch = patch, .reverse = false, .git_dir = try a.dupe(u8, gd) } });
+
+    // git_dir != null で apply_patch を実行（絶対パス経路）。
+    var msg = try runOwned(a, io, sub_cwd, .{ .apply_patch = .{ .patch = patch, .reverse = false, .git_dir = try a.dupe(u8, gd) } });
     defer msg.deinit(a);
     try std.testing.expect(msg == .status_loaded);
+    // index に入ったことを確認。
     var has_staged = false;
     for (msg.status_loaded) |e| {
         if (std.mem.eql(u8, e.path, "sub.txt") and e.section == .staged) has_staged = true;
@@ -484,6 +514,10 @@ test "apply_patch with git_dir works in a submodule" {
     try std.testing.expect(has_staged);
 }
 ```
+
+注意: `sub_repo.dir.dir.realpath(io, ".", &sub_abs_buf)` は `std.Io.Dir` の API（api-notes で確認）。
+`std.fs.max_path_bytes` はパス長上限の定数。実装時に `zig build test` が通ることを確認し、
+`realpath` のシグネチャが異なる場合は api-notes を再確認して調整すること。
 
 - [ ] **Step 4: テストを実行して通過を確認**
 
@@ -493,7 +527,7 @@ Expected: PASS（両テスト green、リーク検出無し）
 - [ ] **Step 5: コミット**
 
 ```bash
-cd /home/hatai/repos/hatai/git-tui && git add src/appcmd.zig && git commit -m "test(appcmd): apply_patch via git_dir in worktree + submodule-like setup
+cd /home/hatai/repos/hatai/git-tui && git add src/appcmd.zig && git commit -m "test(appcmd): apply_patch via git_dir in real worktree + submodule
 
 Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>"
 ```
@@ -513,7 +547,7 @@ Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.g
 
 ```zig
 test "diffLineCount counts splitScalar tokens (trailing newline yields extra empty)" {
-    // 空文字列: splitScalar は空トークン1つを返す。
+    // 空文字列: splitScalar は空トークン1つを返す。Task10 の no-op テストが依存する挙動。
     try std.testing.expectEqual(@as(usize, 1), diffLineCount(""));
     // "a\nb\nc\n": splitScalar は a, b, c, "" の4トークン。
     try std.testing.expectEqual(@as(usize, 4), diffLineCount("a\nb\nc\n"));
@@ -652,7 +686,9 @@ Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.g
 
 ### Task 11: assert テスト追加（update.zig・存在する場合）
 
-この Task は spec N2（任意推奨）の補強。`renderDiff` の `clampScroll` cap と `diffLineCount` の cap が一致することを検証するが、両者は異なるファイルのため直接の等価テストは困難。代わりに、既存の `view.clampScroll` テストと `update.diffLineCount` テストが**同じ入力で同じ cap を返す**ことを確認する。既存 `view.zig` の `clampScroll` テストが既に cap = total-1 を検証済みであり、`diffLineCount` テストも total を検証済み。両者が同一の `splitScalar` 計算を使うことをコメントで担保した（Task 9 Step 3）ため、**この Task は省略可能**。実装時に迷った場合はスキップしてよい。
+この Task は spec N2（任意推奨）の補強。`renderDiff` の `clampScroll` cap と `diffLineCount` の cap が一致することを検証するが、両者は異なるファイルのため直接の等価テストは困難。代わりに、既存の `view.clampScroll` テストと `update.diffLineCount` テストが**同じ入力で同じ cap を返す**ことを確認する。既存 `view.zig` の `clampScroll` テストが既に cap = total-1 を検証済みであり、`diffLineCount` テストも total を検証済み。両者が同一の `splitScalar` 計算を使うことをコメントで担保した（Task 9 Step 3）ため、**この Task は省略可能**。
+
+**省略する理由（レビュー N2）**: `update.zig` から `view.zig` を import して直接の等価アサーションを書くと、Elm 風の純粋層（update）と UI 層（view）のレイヤー分離に違反する（現在 update.zig は view.zig を import していない）。コメントによる同期担保（Task 9 Step 3 の `★MUST match` コメント）で十分と判断。実装時に迷った場合はスキップしてよい。
 
 ---
 
@@ -946,7 +982,7 @@ Expected: 3 以上（制約3-5の3項目が全て「解消」表記）
 
 制約3:
 1. ✓ linked worktree でハンク stage が成功し index に入る（Task 8 の worktree テスト）。
-2. ✓ submodule 相当環境で git_dir 経路が動く（Task 8 の submodule テスト）。
+2. ✓ 本物の submodule（`.git` ファイル=`gitdir: ../.git/modules/<name>` 相対形式）で `git_dir` 経路が動き、`gd` が `.git/modules/<name>` を指す（Task 8 の submodule テスト）。
 3. ✓ 通常リポジトリで既存のハンク stage 挙動が不変（既存6件の統合テストがフォールバック経路で green）。
 4. ✓ `git rev-parse --absolute-git-dir` 失敗時はフォールバックへ退化（`ApplyPatch.git_dir = null` デフォルト）。
 
