@@ -55,6 +55,15 @@ pub fn applyPatchArgv(a: std.mem.Allocator, reverse: bool, file_path: []const u8
     return list.toOwnedSlice(a);
 }
 
+/// `["git", "rev-parse", "--absolute-git-dir"]` を生成（純粋・呼出側 free）。
+/// worktree / submodule でも実 git-dir へ解決するため apply_patch の書込先特定に使う。
+pub fn gitDirArgv(a: std.mem.Allocator) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(a);
+    try list.appendSlice(a, &.{ "git", "rev-parse", "--absolute-git-dir" });
+    return list.toOwnedSlice(a);
+}
+
 // --- 高レベル関数（実行系・Zig 0.16 Io API） ---
 
 /// cwd を起点にリポジトリルートを返す。cwd を明示できるのでサブディレクトリ起動もテスト可能。
@@ -182,6 +191,16 @@ test "applyPatchArgv: reverse inserts --reverse before file_path" {
     try std.testing.expectEqualStrings("--reverse", argv[3]);
     try std.testing.expectEqualStrings(".git/git-tui-stage.patch", argv[4]);
     try std.testing.expectEqual(@as(usize, 5), argv.len);
+}
+
+test "gitDirArgv builds rev-parse --absolute-git-dir" {
+    const a = std.testing.allocator;
+    const argv = try gitDirArgv(a);
+    defer a.free(argv);
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("rev-parse", argv[1]);
+    try std.testing.expectEqualStrings("--absolute-git-dir", argv[2]);
 }
 
 // 高レベル関数（実行系）はテスト未参照だと Zig のレイジー解析でボディが
