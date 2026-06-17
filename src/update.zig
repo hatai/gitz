@@ -172,7 +172,16 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             const maybe = try hunk.buildLinePatch(model.allocator, parsed, idx, sel.lo, sel.hi, f.section == .staged);
             model.diff_anchor = null; // 成否に関わらず選択は消費（null パスでもハイライトを残さない）
             if (maybe) |patch| {
-                return .{ .apply_patch = .{ .patch = patch, .reverse = (f.section == .staged) } };
+                // ★レビュー B2: buildLinePatch 所有の patch を git_dir dupe OOM で漏らさないよう
+                //   errdefer 二重ガード。両 dupe 成功後に AppCmd リテラルへ所有権移譲。
+                errdefer model.allocator.free(patch);
+                const gd: ?[]u8 = if (model.git_dir) |g| try model.allocator.dupe(u8, g) else null;
+                errdefer if (gd) |x| model.allocator.free(x);
+                return .{ .apply_patch = .{
+                    .patch = patch,
+                    .reverse = (f.section == .staged),
+                    .git_dir = gd,
+                } };
             }
             // null は 2 因: 変更行ゼロ（文脈のみ選択）/ 末尾改行境界の矛盾。両方を正確に包む文言。
             try model.setStr(&model.error_text, "選択範囲を stage できません（変更行なし、または末尾改行境界）");
