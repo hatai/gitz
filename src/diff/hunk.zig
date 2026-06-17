@@ -434,6 +434,116 @@ test "buildLinePatch: Japanese body stages selected line only" {
     try std.testing.expect(std.mem.indexOf(u8, patch, "+三行目\n") == null);
 }
 
+test "buildLinePatch on untracked (--no-index form): only selected + lines, @@ -0,0 +1,N @@" {
+    const a = std.testing.allocator;
+    const diff =
+        "diff --git a/new.txt b/new.txt\n" ++
+        "new file mode 100644\n" ++
+        "index 0000000..0123456 100644\n" ++
+        "--- /dev/null\n" ++
+        "+++ b/new.txt\n" ++
+        "@@ -0,0 +1,4 @@\n" ++
+        "+L1\n" ++
+        "+L2\n" ++
+        "+L3\n" ++
+        "+L4\n";
+    var p = try parse(a, diff);
+    defer p.deinit(a);
+    // +L2(行7) と +L3(行8) だけ選択して stage。
+    const maybe = try buildLinePatch(a, p, 0, 7, 8, false);
+    try std.testing.expect(maybe != null);
+    const patch = maybe.?;
+    defer a.free(patch);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "@@ -0,0 +1,2 @@") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+L2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+L3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+L1\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+L4\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "--- /dev/null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+++ b/new.txt") != null);
+    try std.testing.expect(patch[patch.len - 1] == '\n');
+}
+
+test "buildLinePatch on untracked: full-hunk selection equals buildPatch output" {
+    const a = std.testing.allocator;
+    const diff =
+        "diff --git a/new.txt b/new.txt\n" ++
+        "new file mode 100644\n" ++
+        "index 0000000..0123456 100644\n" ++
+        "--- /dev/null\n" ++
+        "+++ b/new.txt\n" ++
+        "@@ -0,0 +1,3 @@\n" ++
+        "+L1\n" ++
+        "+L2\n" ++
+        "+L3\n";
+    var p = try parse(a, diff);
+    defer p.deinit(a);
+    // ハンク本文を丸ごと覆うレンジ（@@ 行〜末尾本文）。
+    const h = p.hunks[0];
+    const maybe = try buildLinePatch(a, p, 0, h.start_line, h.start_line + h.line_count - 1, false);
+    try std.testing.expect(maybe != null);
+    const line_patch = maybe.?;
+    defer a.free(line_patch);
+    const hunk_patch = try buildPatch(a, p, 0);
+    defer a.free(hunk_patch);
+    // 全行選択なら buildPatch と等価（git add 相当の index 状態になることの純粋層での裏付け）。
+    try std.testing.expectEqualStrings(hunk_patch, line_patch);
+}
+
+test "buildLinePatch on untracked: selected final + line keeps No-newline marker (not null)" {
+    const a = std.testing.allocator;
+    // 末尾改行無しの untracked 3 行ファイル。最終行にのみ \ No newline マーカー。
+    const diff =
+        "diff --git a/new.txt b/new.txt\n" ++
+        "new file mode 100644\n" ++
+        "index 0000000..0123456 100644\n" ++
+        "--- /dev/null\n" ++
+        "+++ b/new.txt\n" ++
+        "@@ -0,0 +1,3 @@\n" ++
+        "+L1\n" ++
+        "+L2\n" ++
+        "+L3\n" ++
+        "\\ No newline at end of file\n";
+    var p = try parse(a, diff);
+    defer p.deinit(a);
+    // 最終行 +L3(行8) のみ選択。L1/L2 は未選択→dropped、L3 は選択→kept、マーカーも prev=.kept で保持。
+    // untracked では contextified 状態に到達しないため null-conflict は発火せず、有効パッチが返る。
+    const maybe = try buildLinePatch(a, p, 0, 8, 8, false);
+    try std.testing.expect(maybe != null);
+    const patch = maybe.?;
+    defer a.free(patch);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "@@ -0,0 +1,1 @@") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+L3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "\\ No newline at end of file") != null); // マーカー保持
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+L1\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+L2\n") == null);
+}
+
+test "buildLinePatch on untracked with Japanese body: only selected line" {
+    const a = std.testing.allocator;
+    const diff =
+        "diff --git a/日本語.txt b/日本語.txt\n" ++
+        "new file mode 100644\n" ++
+        "index 0000000..0123456 100644\n" ++
+        "--- /dev/null\n" ++
+        "+++ b/日本語.txt\n" ++
+        "@@ -0,0 +1,3 @@\n" ++
+        "+一行目\n" ++
+        "+二行目\n" ++
+        "+三行目\n";
+    var p = try parse(a, diff);
+    defer p.deinit(a);
+    // +二行目(行7) だけ選択。
+    const maybe = try buildLinePatch(a, p, 0, 7, 7, false);
+    try std.testing.expect(maybe != null);
+    const patch = maybe.?;
+    defer a.free(patch);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+二行目\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+一行目\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "+三行目\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "@@ -0,0 +1,1 @@") != null);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
