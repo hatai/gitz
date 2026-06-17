@@ -458,3 +458,122 @@ test "apply_patch (line unstage reverse): only the selected inserted line leaves
     try std.testing.expect(std.mem.indexOf(u8, sd, "+B1\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, sd, "+B2\n") != null);
 }
+
+test "apply_patch with git_dir works in a linked worktree" {
+    // spec §2 結合テスト: linked worktree で .git がファイルでも git_dir 経路で apply が成功する。
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // worktree add は HEAD を要求するため初回 commit を入れる。
+    try repo.writeFile(io, "f.txt", "1\n2\n3\n4\n5\n");
+    try repo.git(a, io, &.{ "git", "add", "f.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+
+    // 副ワークツリーを repo 配下の worktree-tmp へ作る。
+    // ★オプション順序（レビュー B3）: -q -b <branch> <path> の順（path の後に -b を置かない）。
+    try repo.git(a, io, &.{ "git", "worktree", "add", "-q", "-b", "wt", "worktree-tmp" });
+
+    // 副ワークツリーを開く。.git はファイル（gitdir ポインタ）のはず。
+    var wt = try repo.dir.dir.openDir(io, "worktree-tmp", .{});
+    defer wt.close(io);
+    const wt_cwd: Cwd = .{ .dir = wt };
+
+    // --absolute-git-dir で実 git-dir を解決（.git ファイルを透過して repo/.git/worktrees/wt へ）。
+    const maybe_gd = try cmds.gitDir(a, io, wt_cwd);
+    try std.testing.expect(maybe_gd != null);
+    const gd = maybe_gd.?;
+    defer a.free(gd);
+    try std.testing.expect(std.mem.indexOf(u8, gd, "worktrees") != null);
+
+    // 副ワークツリーで f.txt を変更 → unstaged diff を取得。
+    try wt.writeFile(io, .{ .sub_path = "f.txt", .data = "1x\n2\n3\n4\n5\n" });
+    var dmsg = try runOwned(a, io, wt_cwd, .{ .load_diff = .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .unstaged } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.hunks.len >= 1);
+    const patch = try hunk.buildPatch(a, parsed, 0);
+
+    // git_dir != null で apply_patch を実行（絶対パス経路）。
+    var msg = try runOwned(a, io, wt_cwd, .{ .apply_patch = .{ .patch = patch, .reverse = false, .git_dir = try a.dupe(u8, gd) } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded);
+    // index に入ったことを確認。
+    var has_staged = false;
+    for (msg.status_loaded) |e| {
+        if (std.mem.eql(u8, e.path, "f.txt") and e.section == .staged) has_staged = true;
+    }
+    try std.testing.expect(has_staged);
+}
+
+test "apply_patch with git_dir works in a real submodule" {
+    // spec §2 結合テスト: 本物の submodule（.git ファイル=相対 gitdir:）で git_dir 経路が動く。
+    // ★レビュー B2: 通常リポジトリではなく実際の submodule を作る。submodule の .git は
+    //   `gitdir: ../.git/modules/<name>` の相対形式（worktree とは別経路）であり、
+    //   --absolute-git-dir がこれを実ディレクトリへ解決することを検証する。
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+
+    // superproject 用 tmp リポジトリ（初回 commit 済み＝submodule add の前提）。
+    var super = try TmpRepo.init(a, io);
+    defer super.deinit();
+    try super.writeFile(io, "root.txt", "x\n");
+    try super.git(a, io, &.{ "git", "add", "root.txt" });
+    try super.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+
+    // submodule 用独立 tmp リポジトリ（初回 commit 済み＝add 可能にするため）。
+    var sub_repo = try TmpRepo.init(a, io);
+    defer sub_repo.deinit();
+    try sub_repo.writeFile(io, "sub.txt", "1\n2\n3\n");
+    try sub_repo.git(a, io, &.{ "git", "add", "sub.txt" });
+    try sub_repo.git(a, io, &.{ "git", "commit", "-q", "-m", "sub init" });
+
+    // super へ sub_repo を submodule として追加。
+    // ★protocol.file.allow=always 必須（git 2.38+ は file:// を既定で拒否）。
+    //   sub_repo の絶対パスを得るため、TmpRepo.dir.dir.realPath(io, buf) を使う
+    //   （Zig 0.16 の std.Io.Dir.realPath は (io, out_buffer) を取り usize を返す）。
+    var sub_abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sub_abs_len = sub_repo.dir.dir.realPath(io, &sub_abs_buf) catch return;
+    const sub_abs = sub_abs_buf[0..sub_abs_len];
+    try super.git(a, io, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", sub_abs, "sub" });
+    // submodule 作業ツリー内のファイルを commit して super 側へ反映。
+    try super.git(a, io, &.{ "git", "commit", "-q", "-m", "add sub" });
+
+    // super/sub を開く。.git はファイルのはず（`gitdir: ../.git/modules/sub`）。
+    var sub_wt = try super.dir.dir.openDir(io, "sub", .{});
+    defer sub_wt.close(io);
+    const sub_cwd: Cwd = .{ .dir = sub_wt };
+
+    // --absolute-git-dir で実 git-dir を解決（相対 gitdir: を透過して super/.git/modules/sub へ）。
+    const maybe_gd = try cmds.gitDir(a, io, sub_cwd);
+    try std.testing.expect(maybe_gd != null);
+    const gd = maybe_gd.?;
+    defer a.free(gd);
+    // gd は .git/modules/sub を指す実ディレクトリであること（worktree とは別経路の検証）。
+    try std.testing.expect(std.mem.indexOf(u8, gd, "modules") != null);
+
+    // submodule 内で sub.txt を変更 → unstaged diff を取得。
+    try sub_wt.writeFile(io, .{ .sub_path = "sub.txt", .data = "1x\n2\n3\n" });
+    var dmsg = try runOwned(a, io, sub_cwd, .{ .load_diff = .{ .path = try a.dupe(u8, "sub.txt"), .orig_path = null, .section = .unstaged } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.hunks.len >= 1);
+    const patch = try hunk.buildPatch(a, parsed, 0);
+
+    // git_dir != null で apply_patch を実行（絶対パス経路）。
+    var msg = try runOwned(a, io, sub_cwd, .{ .apply_patch = .{ .patch = patch, .reverse = false, .git_dir = try a.dupe(u8, gd) } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded);
+    // index に入ったことを確認。
+    var has_staged = false;
+    for (msg.status_loaded) |e| {
+        if (std.mem.eql(u8, e.path, "sub.txt") and e.section == .staged) has_staged = true;
+    }
+    try std.testing.expect(has_staged);
+}
