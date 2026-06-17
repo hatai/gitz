@@ -33,9 +33,12 @@ stage / unstage する。
 - パッチのコンテキスト行・`\ No newline at end of file`・CRLF の扱いに注意。
 - 日本語を含む行でもバイトオフセットではなく行単位でパッチを組む。
 - **phase 1 の既知の制約（phase 2 で対応）**:
-  - 一時パッチを `<repo_root>/.git/` に書くため、linked worktree / submodule（`.git` がファイル）ではハンク stage が失敗する。実 git-dir 解決（`git rev-parse --absolute-git-dir`）またはシステム tmpdir 絶対パス書込で対応予定。
-  - `focus!=.diff`（changes フォーカス）で `Ctrl+d/u` を多用すると `diff_scroll` が diff 行数を超え得る。その状態の diff ペインクリックは範囲外で no-op（誤選択にはならない）。根治は reducer の `scroll_diff_down` で diff 行数クランプ。
-  - `input.fromZigzagMouse` の戻り値 MouseEvent リテラルが分岐ごとに重複しており、フィールド追加時に漏れやすい。ベースを 1 度組んで `.kind` だけ差し替える factoring を検討。
+  - [x] ~~一時パッチを `<repo_root>/.git/` に書くため、linked worktree / submodule ではハンク stage が失敗する。~~
+    **解消**（2026-06-17）: `git rev-parse --absolute-git-dir` で絶対 git-dir を解決し `<git-dir>/git-tui-stage.patch` へ書込（`ApplyPatch.git_dir`・フォールバック付き）。
+  - [x] ~~`focus!=.diff` で `Ctrl+d/u` を多用すると `diff_scroll` が diff 行数を超え得る。~~
+    **解消**（2026-06-17）: `update.scroll_diff_down` で `diffLineCount(text)` 上限クランプ。
+  - [x] ~~`input.fromZigzagMouse` の戻り値 MouseEvent リテラルが分岐ごとに重複。~~
+    **解消**（2026-06-17）: `base` 構築の factoring（`MouseEvent.kind` にデフォルト `.ignore` 追加）。
   - **行単位 stage の phase 2 で未対応（さらに将来）**:
     - 飛び飛び（discontiguous）のマーク集合選択（チェックボックス型）。現状は連続レンジのみ。
     - マウスのドラッグ範囲拡張 / Shift クリック範囲拡張（`MouseEvent` に修飾キーフィールド追加が前提。現状クリックはカーソル移動のみ）。
