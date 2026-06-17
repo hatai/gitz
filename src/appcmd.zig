@@ -577,3 +577,65 @@ test "apply_patch with git_dir works in a real submodule" {
     }
     try std.testing.expect(has_staged);
 }
+
+test "apply_patch stages a partial hunk of an untracked file (new-file create via --cached)" {
+    // spec §4.3 結合テスト: untracked ファイル（index 未登録）の部分行 stage が git apply --cached で通る。
+    // 実証実験 1 で成功した経路そのものを回帰テスト化する。実装は変更しない（テストのみ）。
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // untracked の 10 行ファイルを作る。
+    try repo.writeFile(io, "new.txt", "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\n");
+    // untracked の diff（--no-index）を取得。
+    var dmsg = try runOwned(a, io, repo.cwd(), .{ .load_diff = .{
+        .path = try a.dupe(u8, "new.txt"), .orig_path = null, .section = .untracked,
+    } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.hunks.len >= 1);
+    // L4-L6（3 行）だけ選択して buildLinePatch。+L4 と +L6 の絶対行を splitScalar で探す。
+    var plus_l4: usize = 0;
+    var plus_l6: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, dmsg.diff_loaded, '\n');
+        var i: usize = 0;
+        while (it.next()) |ln| : (i += 1) {
+            if (std.mem.eql(u8, ln, "+L4")) plus_l4 = i;
+            if (std.mem.eql(u8, ln, "+L6")) plus_l6 = i;
+        }
+    }
+    // 行探索が成功したことを事前 assert（未発見だと plus_*==0 のまま間接的失敗になるのを避ける）。
+    try std.testing.expect(plus_l4 != 0);
+    try std.testing.expect(plus_l6 != 0);
+    try std.testing.expect(plus_l4 <= plus_l6);
+    const maybe = try hunk.buildLinePatch(a, parsed, 0, plus_l4, plus_l6, false);
+    try std.testing.expect(maybe != null);
+    // git apply --cached を実行。git_dir は指定しない（既存のフォールバック cwd 相対 .git/ 経路を使う）。
+    var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{
+        .patch = maybe.?, .reverse = false,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded); // git_error でないこと
+    // status が 1 AM（staged + unstaged 混合）になることを確認。
+    var has_staged = false;
+    var has_unstaged = false;
+    for (msg.status_loaded) |e| {
+        if (std.mem.eql(u8, e.path, "new.txt")) {
+            if (e.section == .staged) has_staged = true;
+            if (e.section == .unstaged) has_unstaged = true;
+        }
+    }
+    try std.testing.expect(has_staged and has_unstaged);
+    // index には L4-L6 のみ入ったことを確認。
+    const sd = try stagedDiff(&repo, a, io, "new.txt");
+    defer a.free(sd);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+L4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+L5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+L6\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+L1\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sd, "+L10\n") == null);
+}
