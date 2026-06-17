@@ -161,10 +161,11 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             if (model.busy) return .none;
             if (model.files.items.len == 0) return .none;
             const f = model.files.items[model.selected];
-            if (f.section == .untracked) {
-                try model.setStr(&model.error_text, "untracked はファイル単位で stage してください");
-                return .none;
-            }
+            // untracked ガード削除（2026-06-17）: buildLinePatch(reverse=false) が --no-index diff の
+            //   全行挿入を自然に処理する（未選択 + は削除、選択 + は保持 → @@ -0,0 +1,N @@ の部分挿入パッチ）。
+            //   git apply --cached は index 未登録パスも新規作成として受理する（実証実験で確認）。
+            //   部分 stage 後は status が 1 AM となり replaceFiles が staged+unstaged 2 エントリへ展開する。
+            //   No-newline マーカーは直前の + 行の kept/dropped に追従し、文脈化は発生しないため null にはならない。
             if (f.orig_path != null) {
                 try model.setStr(&model.error_text, "rename はファイル単位で stage してください");
                 return .none;
@@ -565,29 +566,44 @@ test "stage_lines on context-only selection is no-op (null patch)" {
     try std.testing.expect(m.error_text.len > 0);
 }
 
-test "stage_lines guards: untracked / busy" {
+test "stage_lines on untracked builds apply_patch (reverse=false) for partial stage" {
     const a = std.testing.allocator;
-    {
-        var m = try Model.init(a, "/r");
-        defer m.deinit();
-        try addFile(&m, "u.txt", .untracked);
-        try seedTwoHunkDiff(&m);
-        m.diff_cursor = 6;
-        var c1 = try update(&m, .stage_lines);
-        c1.deinit(a);
-        try std.testing.expect(c1 == .none);
-        try std.testing.expect(m.error_text.len > 0);
-    }
-    {
-        var m = try Model.init(a, "/r");
-        defer m.deinit();
-        try addFile(&m, "f.txt", .unstaged);
-        try seedTwoHunkDiff(&m);
-        m.busy = true;
-        var c2 = try update(&m, .stage_lines);
-        c2.deinit(a);
-        try std.testing.expect(c2 == .none);
-    }
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "new.txt", .untracked);
+    // untracked の diff（--no-index 形式・全行挿入）を直接セット。
+    try m.setStr(&m.diff_text,
+        "diff --git a/new.txt b/new.txt\n" ++
+        "new file mode 100644\n" ++
+        "index 0000000..0123456 100644\n" ++
+        "--- /dev/null\n" ++
+        "+++ b/new.txt\n" ++
+        "@@ -0,0 +1,3 @@\n" ++
+        "+L1\n" ++
+        "+L2\n" ++
+        "+L3\n");
+    m.diff_cursor = 7; // +L2 の絶対行（file_header 5 行 + @@ が行5, +L1=6, +L2=7, +L3=8）
+    var cmd = try update(&m, .stage_lines);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .apply_patch);
+    try std.testing.expect(!cmd.apply_patch.reverse); // untracked は reverse=false
+    // 選択行 L2 のみパッチへ含まれ、L1/L3 は含まれない。
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "+L2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "+L1\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "+L3\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "@@ -0,0 +1,1 @@") != null);
+}
+
+test "stage_lines guards: busy" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try seedTwoHunkDiff(&m);
+    m.busy = true;
+    var c = try update(&m, .stage_lines);
+    defer c.deinit(a);
+    try std.testing.expect(c == .none);
 }
 
 test "diff_loaded clamps cursor into a hunk body and resets anchor" {
