@@ -449,6 +449,20 @@ pub fn main(init: std.process.Init) !void {
     var handed_off = false;
     errdefer if (!handed_off) g_app.model.deinit();
 
+    // git-dir 解決（worktree/submodule の .git ファイルも解決）。失敗は null へ退化し appcmd の
+    // フォールバック経路（cwd 相対 .git/...）へ。起動クラッシュしない（branchName と同型）。
+    // ★レビュー B1: cmds.gitDir は repoRoot/branchName と同型=caller owned の []u8 を返す。
+    //   dupe 後に必ず free すること（main.zig の branchName パターンどおり）。
+    //   ★配置位置（レビュー B1）: `g_app` ハンドオフ後かつ上記 errdefer インストール後。
+    //   これより前（m に対する try）は main.zig の no-try 不変条件に違反し OOM で m がリークする。
+    if (cmds.gitDir(gpa, io, cwd_root)) |maybe_gd| {
+        if (maybe_gd) |g| {
+            defer gpa.free(g); // ★ gitDir 戻り値は caller owned
+            g_app.model.git_dir = try g_app.model.allocator.dupe(u8, g);
+        }
+        // maybe_gd == null（非リポジトリ等）は何もしない（git_dir は null のまま）
+    } else |_| {} // RunError（spawn 失敗等）も握りつぶす
+
     // 3. 初回 status を同期ロード（start() 前なので worker も TUI も未起動）。
     seedInitialStatus(&g_app);
 
