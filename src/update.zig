@@ -37,7 +37,12 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             return loadDiffCmd(model);
         },
         .scroll_diff_down => {
-            model.diff_scroll += 1;
+            // ★制約4根治: diff_text 行数でクランプ。splitScalar は空でも1トークンを返すため
+            //   total==0 は到達不能だが、diffLineCount が将来 trailing 空を除外すると total==0 に
+            //   なり得る。前方防御的に残す（到達不能でも total-1 の underflow を防ぐ）。
+            const total = diffLineCount(model.diff_text);
+            if (total == 0) return .none;
+            if (model.diff_scroll < total - 1) model.diff_scroll += 1;
             return .none;
         },
         .scroll_diff_up => {
@@ -368,6 +373,7 @@ test "scroll_diff adjusts offset and clamps at zero" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
+    try m.setStr(&m.diff_text, "a\nb\nc\n"); // 4トークン（trailing 含む）→ cap 3。+=1 が従来どおり起きる。
     var c1 = try update(&m, .scroll_diff_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), m.diff_scroll);
@@ -375,6 +381,30 @@ test "scroll_diff adjusts offset and clamps at zero" {
     c2.deinit(a);
     var c3 = try update(&m, .scroll_diff_up);
     c3.deinit(a); // 0 で止まる
+    try std.testing.expectEqual(@as(usize, 0), m.diff_scroll);
+}
+
+test "scroll_diff_down stops at diffLineCount(text) - 1 (constraint 4 root fix)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 4トークン（a,b,c,""）→ cap 3。5回叩いても 3 で止まる。
+    try m.setStr(&m.diff_text, "a\nb\nc\n");
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var c = try update(&m, .scroll_diff_down);
+        c.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 3), m.diff_scroll);
+}
+
+test "scroll_diff_down on empty diff_text is no-op (no underflow)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // diff_text 未設定（空文字列=1トークン）→ cap 0。+=1 は起きない。
+    var c = try update(&m, .scroll_diff_down);
+    c.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), m.diff_scroll);
 }
 
