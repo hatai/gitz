@@ -35,6 +35,8 @@
 
 `buildLinePatch` が untracked の `--no-index` 形式 diff を処理できることを pin する。実装は変更しない（テストのみ）。これらのテストは「untracked ガード削除が安全であること」の純粋層での根拠となる（受け入れ基準 1/2/8/日本語）。
 
+**fixture に関する注記（レビュー指摘反映）**: 実 git の `git diff --no-index -- /dev/null <path>` は `diff --git a/<path> b/<path>` 形式のヘッダを出す。下記 fixture でもそれに合わせている。`buildLinePatch` は `file_header` を passthrough するため、ヘッダの内容自体は検証対象ではなく、本質は `--- /dev/null` と全行 `+` のハンク構造（`@@ -0,0 +1,N @@`）である。
+
 **Files:**
 - Modify: `src/diff/hunk.zig`（末尾の既存 `test` ブロック手前に新規テストを追加）
 - Test: 同ファイル内 `test {}` ブロック
@@ -399,6 +401,10 @@ test "apply_patch stages a partial hunk of an untracked file (new-file create vi
             if (std.mem.eql(u8, ln, "+L6")) plus_l6 = i;
         }
     }
+    // 行探索が成功したことを事前 assert（未発見だと plus_*==0 のまま間接的失敗になるのを避ける）。
+    try std.testing.expect(plus_l4 != 0);
+    try std.testing.expect(plus_l6 != 0);
+    try std.testing.expect(plus_l4 <= plus_l6);
     const maybe = try hunk.buildLinePatch(a, parsed, 0, plus_l4, plus_l6, false);
     try std.testing.expect(maybe != null);
     // git apply --cached を実行。git_dir は指定しない（既存のフォールバック cwd 相対 .git/ 経路を使う）。
@@ -452,12 +458,14 @@ EOF
 
 ---
 
-## Task 4: `TODO.md` の該当チェックボックス `[x]` 化 + 留意点追記
+## Task 4: `TODO.md` の該当チェックボックス `[x]` 化 + 留意点追記 + 既存 no-newline 記述の訂正
 
 `CLAUDE.md`「将来 TODO」の規約に従い、実装完了後に `TODO.md` を更新する（TODO 項目に影響/完了する変更を入れたら該当チェックボックスや記述を更新すること）。
 
+**重要（レビュー指摘反映）**: TODO.md の「行単位 stage の phase 2 で未対応（さらに将来）」セクションに既存の記述「No-newline 境界に掛かる選択は矛盾パッチ回避のため no-op（ガイダンス表示）」がある。これは tracked diff の文脈化に起因する null を指すが、**untracked の全挿入ハンクでは最終 `+` 行を選択すればマーカー保持の有効パッチが出る**（spec 受け入れ基準 8・実装で対応済み）。両者を区別しないと spec と TODO の不整合が残るため、本タスクでこの記述も訂正する。
+
 **Files:**
-- Modify: `TODO.md`（TODO 1「Sub Tasks」と「留意点」セクション）
+- Modify: `TODO.md`（TODO 1「Sub Tasks」と「留意点」と「行単位 stage の phase 2 で未対応」セクション）
 
 - [ ] **Step 1: TODO 1「Sub Tasks」のチェックボックスを `[x]` 化**
 
@@ -488,12 +496,28 @@ EOF
   `git add -N`（intent-to-add）は不要。`buildLinePatch` の変換ルールが全行挿入 diff でそのまま成立つ。
 ```
 
-- [ ] **Step 3: `zig build test --summary all` で全体 green を最終確認**
+- [ ] **Step 3: 既存の「No-newline 境界」記述を tracked/untracked 区別へ訂正**
+
+`TODO.md` の「行単位 stage の phase 2 で未対応（さらに将来）」セクション内の下記行:
+
+```
+    - No-newline 境界に掛かる選択は矛盾パッチ回避のため no-op（ガイダンス表示）。
+```
+
+これを以下へ置換（tracked/untracked を区別し、untracked は既に対応済みであることを明示）:
+
+```
+    - **tracked diff** で文脈化が必要な No-newline 境界の選択は矛盾パッチ回避のため no-op（ガイダンス表示）。
+      ※untracked の全挿入ハンクでは文脈化が発生しないため、最終 `+` 行を選択すればマーカー保持の
+      有効パッチになる（2026-06-17 対応済み・spec 受け入れ基準 8）。
+```
+
+- [ ] **Step 4: `zig build test --summary all` で全体 green を最終確認**
 
 Run: `zig build test --summary all`
 Expected: PASS（全テスト green・リーク検出クリア）。`TODO.md` 変更自体はテストへ影響しないが、最終確認として全テストを一発回す。
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add TODO.md
@@ -502,7 +526,9 @@ docs(todo): mark untracked hunk stage as resolved
 
 Updates TODO 1: untracked hunk stage is now implemented via git apply --cached
 direct (not git add -N). Notes the --no-index diff prerequisite in the
-caveats section.
+caveats section. Clarifies the existing No-newline caveat: tracked diffs
+still produce no-op on contextify conflicts, but untracked all-insert hunks
+emit a valid patch when the final + line is selected (marker kept).
 
 Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
 EOF
