@@ -55,29 +55,45 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
             return .committed;
         },
         .apply_patch => |ap| {
-            // 書込先 Dir を cwd から解決（.dir=借用 / .path=open / .inherit=process cwd）。
-            var owned_dir = false;
-            var base: std.Io.Dir = switch (cwd) {
-                .dir => |d| d,
-                .path => |p| blk: {
-                    owned_dir = true;
-                    break :blk try std.Io.Dir.openDirAbsolute(io, p, .{});
-                },
-                .inherit => std.Io.Dir.cwd(),
-            };
-            defer if (owned_dir) base.close(io);
-            // .git/ 配下に書く（worktree に出さず status を汚さない）。副作用は worker で
-            // 直列化されるため固定名で衝突しない。
-            const rel = ".git/git-tui-stage.patch";
-            try base.writeFile(io, .{ .sub_path = rel, .data = ap.patch });
-            // 後続の applyPatchArgv/process.run がエラー return しても temp を残さない。
-            errdefer base.deleteFile(io, rel) catch {};
-            const argv = try cmds.applyPatchArgv(a, ap.reverse, rel);
-            defer a.free(argv);
-            var res = try process.run(a, io, argv, cwd);
-            defer res.deinit(a);
-            base.deleteFile(io, rel) catch {}; // status を読む前に消す
-            if (res.exit_code != 0) return .{ .git_error = try a.dupe(u8, res.stderr) };
+            // git_dir 有無で 2 経路。成功/失敗に関わらず temp を削除してから status を読む。
+            // bare repo では apply --cached 自体が意味を持たないが本 TUI 対象外（コメントのみ）。
+            if (ap.git_dir) |git_dir| {
+                // 絶対パス経路: worktree / submodule / 通常の全ケース対応。
+                const tmp_abs = try std.fmt.allocPrint(a, "{s}/git-tui-stage.patch", .{git_dir});
+                defer a.free(tmp_abs);
+                var dir = try std.Io.Dir.openDirAbsolute(io, git_dir, .{});
+                defer dir.close(io);
+                try dir.writeFile(io, .{ .sub_path = "git-tui-stage.patch", .data = ap.patch });
+                errdefer dir.deleteFile(io, "git-tui-stage.patch") catch {};
+                const argv = try cmds.applyPatchArgv(a, ap.reverse, tmp_abs);
+                defer a.free(argv);
+                var res = try process.run(a, io, argv, cwd);
+                defer res.deinit(a);
+                dir.deleteFile(io, "git-tui-stage.patch") catch {};
+                if (res.exit_code != 0) return .{ .git_error = try a.dupe(u8, res.stderr) };
+            } else {
+                // フォールバック: 従来の cwd 相対 .git/git-tui-stage.patch（既存テスト・通常リポジトリ）。
+                var owned_dir = false;
+                var base: std.Io.Dir = switch (cwd) {
+                    .dir => |d| d,
+                    .path => |p| blk: {
+                        owned_dir = true;
+                        break :blk try std.Io.Dir.openDirAbsolute(io, p, .{});
+                    },
+                    .inherit => std.Io.Dir.cwd(),
+                };
+                defer if (owned_dir) base.close(io);
+                const rel = ".git/git-tui-stage.patch";
+                try base.writeFile(io, .{ .sub_path = rel, .data = ap.patch });
+                errdefer base.deleteFile(io, rel) catch {};
+                const argv = try cmds.applyPatchArgv(a, ap.reverse, rel);
+                defer a.free(argv);
+                var res = try process.run(a, io, argv, cwd);
+                defer res.deinit(a);
+                base.deleteFile(io, rel) catch {};
+                if (res.exit_code != 0) return .{ .git_error = try a.dupe(u8, res.stderr) };
+            }
+            // 共通: status 再読込。
             var sres = try cmds.statusRaw(a, io, cwd);
             defer sres.deinit(a);
             if (sres.exit_code != 0) return .{ .git_error = try a.dupe(u8, sres.stderr) };
