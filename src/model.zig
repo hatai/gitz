@@ -26,6 +26,7 @@ pub const Model = struct {
     busy: bool, // reducer の二重実行ゲート（全 in-flight 副作用で true）。表示はしない。
     working: bool, // スピナ表示用（変更系=stage/unstage/commit/apply_patch の実行中のみ true）。runtime が管理。
     error_text: []u8, // 直近エラー（空可）
+    git_dir: ?[]u8, // 絶対 git-dir パス。null = 解決失敗（フォールバック用）。起動時のみ設定。
     mouse_enabled: bool,
 
     pub fn init(a: std.mem.Allocator, repo_root: []const u8) !Model {
@@ -46,6 +47,7 @@ pub const Model = struct {
             .busy = false,
             .working = false,
             .error_text = try a.dupe(u8, ""),
+            .git_dir = null,
             .mouse_enabled = true,
         };
     }
@@ -53,6 +55,7 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         const a = self.allocator;
         a.free(self.repo_root);
+        if (self.git_dir) |g| a.free(g);
         a.free(self.branch);
         for (self.files.items) |*f| {
             a.free(f.path);
