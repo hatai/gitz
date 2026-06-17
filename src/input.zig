@@ -94,7 +94,8 @@ pub const MouseEvent = struct {
     /// press/release/drag/move を全部報告するため（zig-pkg .../terminal.zig:336 が
     /// "\x1b[?1003h\x1b[?1006h" を書く）、左クリックの release や bare motion を
     /// `left_click` に潰すと select_index/set_focus が誤爆する。これらは `ignore` にする。
-    kind: enum { left_click, left_double, wheel_up, wheel_down, ignore },
+    /// デフォルト .ignore 必須（制約5: base リテラルが kind 省略で組めるようにするため）。
+    kind: enum { left_click, left_double, wheel_up, wheel_down, ignore } = .ignore,
     /// クリックされたペイン（フォーカス変更に使う。null=どのペイン外でもない）
     pane: ?Focus = null,
     /// ファイル一覧ペイン内で計算済みの**格納インデックス**（`Model.files.items` の添字）。
@@ -244,22 +245,48 @@ pub fn fromZigzagMouse(
     else
         null;
 
+    // 共通ベースを一度組む。kind は全分岐で上書きされるためデフォルト .ignore は漏れない（制約5）。
+    const base = MouseEvent{
+        .pane = pane,
+        .file_row = file_row,
+        .on_diff = on_diff,
+        .diff_line = diff_line,
+        // .kind は MouseEvent.kind のデフォルト .ignore を使う（各分岐で必ず上書き）
+    };
     return switch (ev.button) {
         // ホイールは event_type に関係なく honor する（SGR では wheel も press 扱いで来る）。
-        .wheel_up => .{ .kind = .wheel_up, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line },
-        .wheel_down => .{ .kind = .wheel_down, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line },
+        .wheel_up => blk: {
+            var m = base;
+            m.kind = .wheel_up;
+            break :blk m;
+        },
+        .wheel_down => blk: {
+            var m = base;
+            m.kind = .wheel_down;
+            break :blk m;
+        },
         .left => blk: {
             // press のみ click/double として扱う。release/drag/move は `ignore`（select_index/set_focus を誤爆させない）。
             // mode 1003 では単一の物理クリックでも press と release が来るため、両方を click にすると 2 回選択される。
-            if (ev.event_type != .press) break :blk .{ .kind = .ignore, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line };
+            if (ev.event_type != .press) {
+                var m = base;
+                m.kind = .ignore;
+                break :blk m;
+            }
             const kind: @FieldType(MouseEvent, "kind") = switch (classifyClick(cs, now_ms, file_row)) {
                 .double => .left_double,
                 .single => .left_click,
             };
-            break :blk .{ .kind = kind, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line };
+            var m = base;
+            m.kind = kind;
+            break :blk m;
         },
         // 中/右/wheel_left/wheel_right/button_8..11/none と bare motion は何もしない。
-        else => .{ .kind = .ignore, .pane = pane, .file_row = file_row, .on_diff = on_diff, .diff_line = diff_line },
+        else => blk: {
+            var m = base;
+            m.kind = .ignore;
+            break :blk m;
+        },
     };
 }
 
@@ -611,6 +638,24 @@ test "fromZigzagMouse: left press on header row focuses changes pane (no select)
     const msg = mouseToMsg(me);
     try std.testing.expect(msg.? == .set_focus);
     try std.testing.expectEqual(Focus.changes, msg.?.set_focus);
+}
+
+test "fromZigzagMouse: base fields propagate to all branches (factoring invariant)" {
+    // 制約5の factoring 不変条件: ignore 系分岐（右クリック等）でも base フィールドが伝播することを検証。
+    // これが壊れると将来のフィールド追加で特定分岐だけ取り残される（本制約の再発）。
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var scratch: [16]view.ChangesRow = undefined;
+    var cs = ClickState{};
+    m.diff_scroll = 2; // diff_line 計算に影響するようオフセットを設定
+    // diff ペイン上で右クリック（else 分岐 = ignore）。kind は ignore だが、
+    // pane/on_diff/diff_line は base から伝播しているはず。
+    const ev = zz.MouseEvent{ .x = 50, .y = 2, .button = .right, .event_type = .press };
+    const me = fromZigzagMouse(ev, &m, mouse_test_layout, &cs, 1000, &scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me.kind);
+    try std.testing.expectEqual(Focus.diff, me.pane.?); // base から伝播
+    try std.testing.expect(me.on_diff); // base から伝播
+    try std.testing.expectEqual(@as(usize, 4), me.diff_line.?); // 2 + 2 = 4（base から伝播）
 }
 
 // zigzag 依存の pub 関数（fromZigzagKey/fromZigzagMouse）も型検査されるよう refAllDecls する。
