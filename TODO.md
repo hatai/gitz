@@ -25,11 +25,19 @@ stage / unstage する。
 - [x] 選択ハンクから `git apply --cached`（or `--cached --reverse`）用のパッチを生成
 - [x] `git apply --cached <tmpfile>` でパッチを適用して stage / unstage（stdin 不可のため一時ファイル方式）
 - [x] 行単位選択（複数行レンジ）→ 部分パッチ生成（phase 2）
-- [ ] untracked ファイルのハンク stage（intent-to-add `git add -N`）（phase 2）
+- [x] untracked ファイルのハンク stage（phase 2）
+  - **方式**: `git add -N`（intent-to-add）ではなく `git apply --cached` 単体で新規作成ハンクを
+    直接 apply する（実証実験で受理を確認）。`buildLinePatch(reverse=false)` が `--no-index`
+    形式の全行挿入 diff を自然に処理するため、`update.stage_lines` の untracked ガードを削除する
+    だけ（`hunk.zig`/`appcmd.zig`/`messages.zig` は一切変更不要）。部分 stage 後は status が `1 AM`
+    となり `replaceFiles` が staged+unstaged 2 エントリへ展開する（既存挙動で吸収）。
 - [x] パッチ生成のユニットテスト（コンテキスト行・改行末尾・日本語を含む差分）
 - [ ] rename ファイルのハンク stage（phase 2: file_header の rename 行を扱う）
 
 ### 留意点
+- **untracked の部分 stage は `--no-index` 形式の diff が前提**。`git apply --cached` は index 未登録
+  パスでも `--- /dev/null` / `+++ b/<file>` 形式の新規作成ハンクを受理する（実証実験 2026-06-17）。
+  `git add -N`（intent-to-add）は不要。`buildLinePatch` の変換ルールが全行挿入 diff でそのまま成立つ。
 - パッチのコンテキスト行・`\ No newline at end of file`・CRLF の扱いに注意。
 - 日本語を含む行でもバイトオフセットではなく行単位でパッチを組む。
 - **phase 1 の既知の制約（phase 2 で対応）**:
@@ -42,7 +50,9 @@ stage / unstage する。
   - **行単位 stage の phase 2 で未対応（さらに将来）**:
     - 飛び飛び（discontiguous）のマーク集合選択（チェックボックス型）。現状は連続レンジのみ。
     - マウスのドラッグ範囲拡張 / Shift クリック範囲拡張（`MouseEvent` に修飾キーフィールド追加が前提。現状クリックはカーソル移動のみ）。
-    - No-newline 境界に掛かる選択は矛盾パッチ回避のため no-op（ガイダンス表示）。
+    - **tracked diff** で文脈化が必要な No-newline 境界の選択は矛盾パッチ回避のため no-op（ガイダンス表示）。
+      ※untracked の全挿入ハンクでは文脈化が発生しないため、最終 `+` 行を選択すればマーカー保持の
+      有効パッチになる（2026-06-17 対応済み・spec 受け入れ基準 8）。
 
 ---
 
