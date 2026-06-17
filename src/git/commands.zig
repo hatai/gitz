@@ -76,6 +76,19 @@ pub fn repoRoot(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !?[]u8 {
     return try a.dupe(u8, trimmed);
 }
 
+/// cwd を起点に絶対 git-dir パスを返す（worktree/submodule の .git ファイルも解決）。
+/// 失敗（非リポジトリ・exit!=0）は null、spawn 失敗は RunError 伝播（repoRoot と同型）。
+/// 呼出側が free（成功時のみ確保）。
+pub fn gitDir(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !?[]u8 {
+    const argv = try gitDirArgv(a);
+    defer a.free(argv);
+    var res = try process.run(a, io, argv, cwd);
+    defer res.deinit(a);
+    if (res.exit_code != 0) return null;
+    const trimmed = std.mem.trimEnd(u8, res.stdout, "\n");
+    return try a.dupe(u8, trimmed);
+}
+
 pub fn hasHead(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !bool {
     var res = try process.run(a, io, &.{ "git", "rev-parse", "--verify", "HEAD" }, cwd);
     defer res.deinit(a);
