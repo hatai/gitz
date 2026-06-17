@@ -187,8 +187,9 @@ pub fn clampScroll(scroll: usize, total: usize) usize {
 }
 
 /// Diff ペイン: `model.diff_text` を `model.diff_scroll` を先頭行として描画。`+`/`-` を色分け。
-/// focus==.diff のとき選択ハンクの @@ ヘッダ行を反転＋マーカー強調し、選択ハンクが画面に
-/// 掛かるよう `model.diff_scroll` を調整する（diff_scroll の唯一 writer）。
+/// focus==.diff のとき選択ハンクの @@ ヘッダ行を反転＋マーカー強調し、選択ハンクが画面
+/// 掛かるよう model.diff_scroll を調整する（diff_scroll の writer は2箇所:
+/// update.scroll_diff_down/up の行数クランプと、focus==.diff 時の renderDiff の ensureVisible）。
 fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     const a = ctx.allocator;
     if (model.diff_text.len == 0) return "(no diff)";
@@ -206,8 +207,9 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
         while (cit.next()) |_| total_lines += 1;
     }
 
-    // focus==.diff のときカーソル行を可視範囲に収める（diff_scroll の唯一 writer）。
-    // ensureVisible はカーソルが窓の外なら scroll を最小限ずらす（マウス当たり判定と一致）。
+    // focus==.diff のときカーソル行を可視範囲に収める（diff_scroll writer のうち renderDiff 側。
+    // もう一方は update.scroll_diff_down/up の行数クランプ。ensureVisible はカーソルが窓の外なら
+    // scroll を最小限ずらす（マウス当たり判定と一致）。
     if (model.focus == .diff) {
         model.diff_scroll = ensureVisible(model.diff_scroll, model.diff_cursor, limit);
     }
