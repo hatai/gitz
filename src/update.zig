@@ -236,24 +236,48 @@ fn isDiffOwnerCurrent(model: *const Model) bool {
     return f.section == owner.section and std.mem.eql(u8, f.path, owner.path);
 }
 
-/// diff 再読込/カーソル移動後にカーソルを本文行へ正規化し anchor をリセットする（純粋）。
-/// - ハンク 0 個: cursor=0。
+/// diff 再読込/カーソル移動後にカーソルを本文行へ正規化し、anchor を**検証**する（純粋）。
+/// - ハンク 0 個: cursor=0, anchor=null。
 /// - カーソルが本文行でない（file_header / @@ ヘッダ行 / 範囲外）: 先頭ハンク本文先頭へ。
 /// - 既にいずれかのハンク本文内: そのまま維持（リフレッシュ時のジャンプ防止）。
-/// anchor は常に null へ（再読込/ファイル切替で選択は無効）。
+/// anchor は「(a) 本文行、(b) cursor と同じハンク」を両方満たすときだけ保持。それ以外は null。
+/// ★層 2（Bug 1 修正）: 無条件 clear すると v → j → s の間に auto-refresh が走っただけで
+///   選択が消える（TODO 1 ブロッカー）。ユーザー能動的なファイル切替（key_down/up/select_index/
+///   diff_hunk_next/prev）は各 arm が明示的に anchor を clear するため、ここでの clear は
+///   それら経路では冗長だった。層 1（isDiffOwnerCurrent）でファイル同一性を確認した上で呼ばれる。
 fn clampCursor(model: *Model) !void {
     var parsed = try hunk.parse(model.allocator, model.diff_text);
     defer parsed.deinit(model.allocator);
-    model.diff_anchor = null;
     if (parsed.hunks.len == 0) {
         model.diff_cursor = 0;
+        model.diff_anchor = null; // ハンク無しでは選択は無意味
         return;
     }
-    // 本文行でない（@@ ヘッダ/file_header/範囲外）なら先頭ハンク本文先頭へ再配置
-    // （spec: ヘッダクリックも本文へクランプ）。本文内ならジャンプ防止で維持。
+    // カーソルが本文行でない（@@ ヘッダ/file_header/範囲外）なら先頭ハンク本文先頭へ再配置。
+    // 本文内ならジャンプ防止で維持。
     if (!isBodyLine(parsed, model.diff_cursor)) {
         model.diff_cursor = hunkBodyTop(parsed.hunks[0]);
     }
+    // 層 2: anchor 検証。cursor 再配置後に検証するので、新しい cursor ハンクと anchor ハンクが
+    // 一致すれば保持（ユーザが v で作った選択を cursor ズレだけで消さない）。
+    model.diff_anchor = validateAnchor(parsed, model.diff_cursor, model.diff_anchor);
+}
+
+/// anchor が「(a) 本文行」「(b) cursor と同じハンク」を両方満たすかを検証し、満たすならそのまま
+/// 返し、満たさない（または anchor==null）なら null を返す。純粋・allocator 不要。層 2。
+///
+/// cond-a の 2 段チェックは非冗長: `isBodyLine` は @@ ヘッダ行（start_line に等しい行）を拒否するが、
+/// `hunkIndexForLine` は @@ ヘッダ行に対して non-null（[start_line, start_line+line_count) に含まれる）
+/// を返す。よって isBodyLine=true を通過した anchor は必ずハンク内本文行であり、後続の
+/// hunkIndexForLine は non-null になることが保証される。2 つめの orelse return null は到達不能だが、
+/// isBodyLine と hunkIndexForLine の契約が独立しているため防御的に残す（subagent N1 訂正）。
+fn validateAnchor(parsed: hunk.ParsedDiff, cursor: usize, anchor: ?usize) ?usize {
+    const a = anchor orelse return null;
+    if (!isBodyLine(parsed, a)) return null; // (a) 本文行でない（@@ ヘッダ/file_header/範囲外）
+    const a_hunk = hunk.hunkIndexForLine(parsed, a) orelse return null; // isBodyLine=true なら必ず non-null（到達不能ガード）
+    const c_hunk = hunk.hunkIndexForLine(parsed, cursor) orelse return null; // cursor が本文でない（clampCursor で本文へ正規化済みだが念のため）
+    if (a_hunk != c_hunk) return null; // (b) 異ハンク
+    return a;
 }
 
 /// 絶対行 `abs` が「本文行」（いずれかのハンク内 かつ @@ ヘッダ行でない）かを返す。
@@ -851,4 +875,58 @@ test "Bug 1 Layer 1: diff_loaded clears anchor when selected file changed (codex
     cmd.deinit(a);
     // ★層 1: owner(f.txt) != selected(g.txt) → anchor clear
     try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
+}
+
+test "validateAnchor: null anchor stays null" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m); // h0 body 4-6, h1 body 8-10
+    var parsed = try hunk.parse(a, m.diff_text);
+    defer parsed.deinit(a);
+    try std.testing.expectEqual(@as(?usize, null), validateAnchor(parsed, 5, null));
+}
+
+test "validateAnchor: anchor on @@ header is cleared (cond-a fail)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m); // @@h0 = 行3
+    var parsed = try hunk.parse(a, m.diff_text);
+    defer parsed.deinit(a);
+    try std.testing.expectEqual(@as(?usize, null), validateAnchor(parsed, 5, 3));
+}
+
+test "validateAnchor: anchor on file_header is cleared (cond-a fail)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m); // file_header = 行0-2
+    var parsed = try hunk.parse(a, m.diff_text);
+    defer parsed.deinit(a);
+    try std.testing.expectEqual(@as(?usize, null), validateAnchor(parsed, 5, 1));
+}
+
+test "validateAnchor: anchor on different hunk from cursor is cleared (cond-b fail)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m); // h0 body 4-6, h1 body 8-10
+    var parsed = try hunk.parse(a, m.diff_text);
+    defer parsed.deinit(a);
+    // cursor=h0(行5), anchor=h1(行9) → 異ハンク → null
+    try std.testing.expectEqual(@as(?usize, null), validateAnchor(parsed, 5, 9));
+}
+
+test "validateAnchor: anchor on body line in same hunk as cursor is kept (both pass)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m); // h0 body 4-6
+    var parsed = try hunk.parse(a, m.diff_text);
+    defer parsed.deinit(a);
+    // cursor=行5, anchor=行6 → 同 h0 本文 → 保持
+    try std.testing.expectEqual(@as(?usize, 6), validateAnchor(parsed, 5, 6));
+    // cursor=行6, anchor=行5 → 同 h0 本文 → 保持
+    try std.testing.expectEqual(@as(?usize, 5), validateAnchor(parsed, 6, 5));
 }
