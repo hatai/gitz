@@ -954,3 +954,50 @@ test "select_line_at still clears anchor after Bug 1 fix (regression)" {
     try std.testing.expect(m.focus == .diff);
     try std.testing.expectEqual(@as(?usize, null), m.diff_anchor); // ★explicit clear が無いと残る
 }
+
+test "Bug 1 e2e: range selection survives diff_loaded (auto-refresh simulation)" {
+    // v → j → (auto-refresh が diff_loaded を発火) → s で範囲 stage されること。
+    // ★層 1（diff_owner 一致）+ 層 2（validateAnchor 通過）の両方を検証。
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try seedTwoHunkDiff(&m); // h0 本文 4-6 (' a'/-b/+B)
+
+    // 層 1 セットアップ: diff_owner を "f.txt"/.unstaged へ設定。
+    // 実機では loadDiffCmd（status_loaded → load_diff）がこれを行う。テストでは直接 setup。
+    try m.setDiffOwner("f.txt", .unstaged);
+
+    // 1) v で選択開始 (cursor=5 → anchor=5)
+    m.diff_cursor = 5;
+    var c1 = try update(&m, .toggle_line_selection);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 5), m.diff_anchor);
+
+    // 2) j で選択拡張 (cursor=5 → 6)
+    var c2 = try update(&m, .diff_cursor_down);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
+    try std.testing.expectEqual(@as(?usize, 5), m.diff_anchor); // 選択維持
+
+    // 3) auto-refresh シミュレーション: 同じ diff_text で diff_loaded を再送
+    //    （main.zig の maybeAutoRefresh → status_loaded → load_diff → diff_loaded と同効果）
+    //    ★層 1: diff_owner("f.txt"/.unstaged) == selected ファイル → 一致 → anchor 保持へ進む
+    //    ★層 2: validateAnchor が anchor=5(h0 本文) と cursor=6(同 h0) を確認 → 保持
+    const same_diff = try a.dupe(u8, m.diff_text);
+    defer a.free(same_diff);
+    var c3 = try update(&m, .{ .diff_loaded = same_diff });
+    c3.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 5), m.diff_anchor); // ★Bug 1 の核心: 保持される
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
+
+    // 4) s で stage → 選択範囲 [5,6] がパッチへ含まれること（単一行ではなく 2 行分）
+    //    ★Bug 1 無修正なら anchor が diff_loaded で null 化し、selectionRange(6,null)={6,6}
+    //      なので '-b' は未選択→文脈化(' b')されてパッチから消え、'+B' のみ残る。
+    //      修正後は anchor=5 保持で selectionRange(6,5)={5,6} となり、'-b' も選択→保持される。
+    var c4 = try update(&m, .stage_lines);
+    defer c4.deinit(a);
+    try std.testing.expect(c4 == .apply_patch);
+    try std.testing.expect(std.mem.indexOf(u8, c4.apply_patch.patch, "+B\n") != null); // 選択された追加行
+    try std.testing.expect(std.mem.indexOf(u8, c4.apply_patch.patch, "-b\n") != null); // 選択された削除行（文脈化されず保持）
+}
