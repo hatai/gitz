@@ -97,6 +97,45 @@ stage / unstage する。
     破綻するため本ツールでもサポートしない（ガードでファイル単位 unstage を案内）。
     ファイル単位 unstage 後に再 stage で回避すること。
 
+### QA 2026-06-18 観察による UX 改善提案（機能ブロッカーではない・任意対応）
+QA（`qa` スキル + `qa-tui` サブスキル + tuistory 実機検証）で TODO 1 全 Sub Tasks が**期待どおり動作**することを確認済み。
+以下は機能ブロッカーではなく、使い勝手・テスト容易性の改善案。優先度は低い。
+
+- [x] **`v` トグル状態の視覚的明示**（低優先・UX）
+  - **観察**: `v` で範囲選択開始 → もう一度 `v` で解除（単一カーソルへ復帰）した際、
+    テキストダンプ snapshot では anchor 有無の区別がほぼ見えない（色違いのみ）。
+    実機の色付き端末では判別可能だが、テスト自動化やスクリーンショット共有で分かりにくい。
+  - **提案**: anchor 設定時に範囲全体を反転/網掛け等、形状レベルで差を出す。
+    またはステータスバーに `SELECT` インジケータを表示。
+  - **対応済み**（2026-06-18）: ステータスバーに `[SELECT]` インジケータ、範囲行頭に `>` prefix を実装。
+    spec: `docs/superpowers/specs/2026-06-18-qa-ux-improvements-design.md` §2。
+- [x] **rename+modify の staged diff 表示の補足**（低優先・UX）
+  - **観察**: `2 RM`（rename staged + content modify unstaged）で部分 stage すると、
+    HEAD に新パスが存在しないため `git diff --cached` が `new file mode` になる。
+    これは git の仕様だが、diff ペインで見たユーザが「ファイル全体が stage された」と誤認しやすい。
+    実際の index 内容は部分 stage 結果（例: `gamma` のまま `epsilon` 追加）で正しい。
+  - **提案**: diff ペイン上部に rename context（`oldname.txt → newname.txt` 等）を表示するか、
+    メタ情報行で「部分 stage 済み・rename 別途 staged」を明示。
+  - **対応済み**（2026-06-18）: `model.isRenamePartialState` 純粋判定 + `view.renderDiff` のメタ行挿入を実装。
+    `2 RM`（rename staged + content modify unstaged）で `git diff --cached` が `new file mode` になる誤認を防止。
+    spec: `docs/superpowers/specs/2026-06-18-qa-ux-improvements-design.md` §3。
+- [x] **commit の `Ctrl+S` キーバインドの代替検証**（低優先・互換性）
+  - **観察**: tuistory 経由で `ctrl+s`（プラス区切り）が受理されず `ctrl s`（スペース区切り）で成功。
+    実端末でも `Ctrl+S` がフロー制御（XOFF）に捕捉される環境があり得る。
+  - **提案**: README のキーマップ表に注意書きを追加するか、代替（`Enter` や `Ctrl+Enter`）の検討。
+    ※現状の `Ctrl+S` は TextArea 標準に合わせたもので妥当。ドキュメント整備で十分。
+  - **対応済み**（2026-06-18）: README のキーマップ表へ `stty -ixon` の注意書きを追記。
+    代替キー（Ctrl+Enter 等）は zigzag の KeyEvent サポート次第で将来検討。
+    spec: `docs/superpowers/specs/2026-06-18-qa-ux-improvements-design.md` §4。
+- [x] **`#` 等でハンク全体を選択するショートカット**（新規・任意）
+  - **観察**: 行レンジ選択は `v` + `j` 繰り返しだが、ハンク全体を一度に stage する操作があると
+    lazygit 等からの移行ユーザに馴染む。
+  - **提案**: `H`（ハンク単位 stage）や `#`（ハンク全体を選択範囲に設定→`s`）等の追加検討。
+    既存の `]`/`[` ジャンプと組み合わせて設計。
+  - **対応済み**（2026-06-18）: `#`（select_hunk・現在ハンク本文全体を選択、`s` で stage）と
+    `H`（stage_hunk・ハンクを即 stage）の両方を実装。共通ヘルパ `buildStagePatchFromSelection` で
+    `stage_lines` と適用ロジックを共有。spec: `docs/superpowers/specs/2026-06-18-qa-ux-improvements-design.md` §5。
+
 ---
 
 ## TODO 2. ログ / コミットグラフ表示
