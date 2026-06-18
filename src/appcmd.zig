@@ -639,3 +639,75 @@ test "apply_patch stages a partial hunk of an untracked file (new-file create vi
     try std.testing.expect(std.mem.indexOf(u8, sd, "+L1\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, sd, "+L10\n") == null);
 }
+
+test "apply_patch stages a partial hunk of a renamed file (git mv + unstaged modify)" {
+    // spec 2026-06-17-rename-hunk-stage-design.md §2 実験2・§3.4 結合テスト。
+    // git mv で rename が staged、内容変更が unstaged な 2 RM 状態で、unstaged 側 diff
+    // （new.txt 単体・rename ヘッダ無し）の部分パッチを forward 適用 → 2 R. へ遷移する。
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const hunk = @import("diff/hunk.zig");
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "old.txt", "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
+    try repo.git(a, io, &.{ "git", "add", "old.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    // rename を staged にし、その後内容を変更（unstaged）→ 2 RM 状態。
+    try repo.git(a, io, &.{ "git", "mv", "old.txt", "new.txt" });
+    try repo.writeFile(io, "new.txt", "a\nX\nc\nd\ne\nf\ng\nh\ni\nj\n");
+    // unstaged 側 diff を取得: orig_path == null で load_diff を呼ぶ（2 RM 展開後の unstaged エントリ相当）。
+    var dmsg = try runOwned(a, io, repo.cwd(), .{ .load_diff = .{
+        .path = try a.dupe(u8, "new.txt"), .orig_path = null, .section = .unstaged,
+    } });
+    defer dmsg.deinit(a);
+    try std.testing.expect(dmsg == .diff_loaded);
+    // diff は rename ヘッダを含まない content-only 形式（spec §2 実験1 の検証）。
+    try std.testing.expect(std.mem.indexOf(u8, dmsg.diff_loaded, "rename from") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dmsg.diff_loaded, "--- a/new.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dmsg.diff_loaded, "+++ b/new.txt") != null);
+    var parsed = try hunk.parse(a, dmsg.diff_loaded);
+    defer parsed.deinit(a);
+    try std.testing.expect(parsed.hunks.len >= 1);
+    // (b->X) 置換を部分 stage する。-b と +X の両方の絶対行を splitScalar で探し、
+    // 両方を覆うレンジ [minus_b, plus_X] を選択する（前方 stage で - と + を対で残す必要がある）。
+    // ★注意: buildLinePatch(reverse=false) で未選択の + は削除・未選択の - は文脈化される。
+    //   よって -b だけを選ぶと「b の削除」だけが stage され +X が落ちる。必ず +X まで含めること。
+    var minus_b: usize = 0;
+    var plus_X: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, dmsg.diff_loaded, '\n');
+        var i: usize = 0;
+        while (it.next()) |ln| : (i += 1) {
+            if (std.mem.eql(u8, ln, "-b")) minus_b = i;
+            if (std.mem.eql(u8, ln, "+X")) plus_X = i;
+        }
+    }
+    try std.testing.expect(minus_b != 0);
+    try std.testing.expect(plus_X != 0);
+    try std.testing.expect(minus_b < plus_X); // -b の直後に +X が来る前提
+    const maybe = try hunk.buildLinePatch(a, parsed, 0, minus_b, plus_X, false);
+    try std.testing.expect(maybe != null);
+    // forward 適用: git apply --cached が index の new.txt へ部分パッチを受理する。
+    var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{
+        .patch = maybe.?, .reverse = false,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .status_loaded); // git_error でないこと
+    // 遷移後: staged rename + staged 内容変更 = 2 R.（staged エントリのみ、unstaged は無し）。
+    var has_staged = false;
+    var has_unstaged = false;
+    for (msg.status_loaded) |e| {
+        if (std.mem.eql(u8, e.path, "new.txt")) {
+            if (e.section == .staged) has_staged = true;
+            if (e.section == .unstaged) has_unstaged = true;
+        }
+    }
+    try std.testing.expect(has_staged); // 2 R. の staged 側
+    try std.testing.expect(!has_unstaged); // 内容変更は全て staged へ吸収された
+    // index に (b->X) が入ったことを確認。rename を含むためパス指定なしで staged 全体を見る
+    // （stagedDiff ヘルパは `-- <path>` 単体指定で、rename 元 old.txt 側がパスフィルタで落ちるため使えない）。
+    var r2 = try process.run(a, io, &.{ "git", "diff", "--cached" }, repo.cwd());
+    defer r2.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "+X\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "-b\n") != null);
+}
