@@ -220,6 +220,16 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     const sel = @import("model.zig").selectionRange(model.diff_cursor, model.diff_anchor);
 
     var lines: std.ArrayList([]const u8) = .empty;
+
+    // タスク B: rename+modify の部分 stage 状態（2 RM）で diff が new file mode になる誤認防止。
+    // model.diff_text に触れず、描画時のみ先頭行へメタ行を差し込む（diffLineCount 不整合回避）。
+    if (@import("model.zig").isRenamePartialState(model)) {
+        const cur = model.files.items[model.selected];
+        const orig = cur.orig_path orelse "";
+        const meta = std.fmt.allocPrint(a, "[rename staged: {s} → {s} · content partial]", .{ orig, cur.path }) catch "[rename staged · content partial]";
+        lines.append(a, meta) catch {};
+    }
+
     var it = std.mem.splitScalar(u8, model.diff_text, '\n');
     var idx: usize = 0;
     while (it.next()) |line| : (idx += 1) {
@@ -233,7 +243,9 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
             continue;
         }
         if (in_sel) {
-            lines.append(a, sel_style.render(a, line) catch line) catch break;
+            // タスク A: anchor 非 null のとき範囲全体に `>` prefix + reverse（テキストダンプでも選択判別可能）。
+            const prefixed = std.fmt.allocPrint(a, ">{s}", .{line}) catch line;
+            lines.append(a, sel_style.render(a, prefixed) catch prefixed) catch break;
             continue;
         }
         const styled: []const u8 = if (line.len > 0 and line[0] == '+')
@@ -263,21 +275,27 @@ fn renderCommit(model: *const Model, ctx: *const zz.Context) []const u8 {
 /// Status バー: branch / busy スピナ / error_text / キーヒント。
 /// スピナは `model.working`（変更系操作の実行中のみ）で出す。`model.busy`（全 in-flight ゲート）では
 /// 出さない＝自動リフレッシュ/ナビゲーションの読み取りでステータスバーが点滅しない。
+/// タスク A: diff フォーカス + anchor 非 null のとき `[SELECT]` を先頭に表示（テキストダンプでも判別）。
 fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
     const branch = if (model.branch.len == 0) "(detached)" else model.branch;
     const spin = if (model.working) " [busy]" else "";
-    const hint = if (model.focus == .diff)
-        "  j/k line  v select  s stage/unstage  ]/[ hunk  tab pane  r refresh  q quit"
+    const select_indicator: []const u8 = if (model.focus == .diff and model.diff_anchor != null)
+        "[SELECT]  "
     else
-        "  j/k move  space stage  c commit  r refresh  q quit";
+        "";
+    const hint_base = if (model.focus == .diff)
+        "j/k line  v select  # hunk  H stage-hunk  s stage/unstage  ]/[ hunk  tab pane  r refresh  q quit"
+    else
+        "j/k move  space stage  c commit  r refresh  q quit";
+    const hint = std.fmt.allocPrint(a, "{s}{s}", .{ select_indicator, hint_base }) catch hint_base;
     const base = std.fmt.allocPrint(a, " {s}{s}", .{ branch, spin }) catch " ?";
     if (model.error_text.len > 0) {
         const err_style = zz.Style{ .foreground = zz.Color.red, .bold_attr = true };
         const err = err_style.render(a, model.error_text) catch model.error_text;
-        return std.fmt.allocPrint(a, "{s}  {s}{s}", .{ base, err, hint }) catch base;
+        return std.fmt.allocPrint(a, "{s}  {s}  {s}", .{ base, err, hint }) catch base;
     }
-    return std.fmt.allocPrint(a, "{s}{s}", .{ base, hint }) catch base;
+    return std.fmt.allocPrint(a, "{s}  {s}", .{ base, hint }) catch base;
 }
 
 /// 各ペインの内容を矩形 `r` のセル数に合わせて整形する。
