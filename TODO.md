@@ -32,7 +32,7 @@ stage / unstage する。
     だけ（`hunk.zig`/`appcmd.zig`/`messages.zig` は一切変更不要）。部分 stage 後は status が `1 AM`
     となり `replaceFiles` が staged+unstaged 2 エントリへ展開する（既存挙動で吸収）。
 - [x] パッチ生成のユニットテスト（コンテキスト行・改行末尾・日本語を含む差分）
-- [ ] rename ファイルのハンク stage（phase 2: file_header の rename 行を扱う）
+- [x] rename ファイルのハンク stage（phase 2: file_header の rename 行を扱う）
 
 ### 留意点
 - **untracked の部分 stage は `--no-index` 形式の diff が前提**。`git apply --cached` は index 未登録
@@ -53,6 +53,19 @@ stage / unstage する。
     - **tracked diff** で文脈化が必要な No-newline 境界の選択は矛盾パッチ回避のため no-op（ガイダンス表示）。
       ※untracked の全挿入ハンクでは文脈化が発生しないため、最終 `+` 行を選択すればマーカー保持の
       有効パッチになる（2026-06-17 対応済み・spec 受け入れ基準 8）。
+- **rename + modify の部分 stage（2026-06-17 完了）**:
+  - **方式**: `2 RM`（rename staged + 内容変更 unstaged）は `git mv` 時点で rename が index 済みのため、
+    unstaged 側 diff は `new.txt` 単体の content-only diff になる。`status.parse` が `2 RM` を展開した
+    unstaged エントリは `Y='M'` なので `orig_path == null` になり、`update.stage_lines` の現行ガード
+    （`f.orig_path != null`）を通過する。既存の `buildLinePatch`/`buildPatch` が tracked と同形で処理する。
+    **コード変更不要**・回帰テスト追加のみで完了（`docs/superpowers/specs/2026-06-17-rename-hunk-stage-design.md`）。
+  - **既知の制約1（`2 .R` / `2 .C` worktree rename の部分 stage）**: porcelain `Y='R'/'C'` に対応する
+    unstaged エントリは `orig_path != null` でガードブロック。diff が rename ヘッダを含むため未検証。
+    将来 spec で実証してから対応。ファイル単位 stage で回避可能。
+  - **既知の制約2（staged rename+modify の部分行 unstage）**: `2 R.`（rename + 内容変更が両方 staged）
+    からの行/ハンク単位 unstage は、git 自体の `apply --cached --reverse` が index の old 側パス解決で
+    破綻するため本ツールでもサポートしない（ガードでファイル単位 unstage を案内）。
+    ファイル単位 unstage 後に再 stage で回避すること。
 
 ---
 
