@@ -333,10 +333,18 @@ fn loadDiffCmd(model: *Model) !AppCmd {
         return .none;
     }
     const f = model.files.items[model.selected];
-    try model.setDiffOwner(f.path, f.section); // ★層 1: 発行時にオーナーを記録
+    // ★codex レビュー B1 対策: payload の dupe を先に行い、errdefer でリークガード。
+    //   path の dupe 成功後に orig_path の dupe が OOM になると path が漏れるため。
+    //   また setDiffOwner（副作用）は payload 構築成功後に呼ぶ（OOM で diff_owner が更新
+    //   されるが load_diff が返らない「意味論不一致」を避けるため）。
+    const path_dup = try model.allocator.dupe(u8, f.path);
+    errdefer model.allocator.free(path_dup);
+    const orig_dup: ?[]u8 = if (f.orig_path) |p| try model.allocator.dupe(u8, p) else null;
+    errdefer if (orig_dup) |o| model.allocator.free(o);
+    try model.setDiffOwner(f.path, f.section); // ★層 1: payload 構築成功後にオーナーを記録
     return .{ .load_diff = .{
-        .path = try model.allocator.dupe(u8, f.path),
-        .orig_path = if (f.orig_path) |p| try model.allocator.dupe(u8, p) else null,
+        .path = path_dup,
+        .orig_path = orig_dup,
         .section = f.section,
     } };
 }
