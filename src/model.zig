@@ -206,6 +206,27 @@ fn selectByPathPriority(items: []const FileItem, path: []const u8) usize {
     return 0;
 }
 
+/// 現在選択中のエントリが「rename の部分 stage 状態」（2 RM 等）かを純粋判定する。
+/// true の条件（全て AND）:
+///   1. files 非空 かつ selected が有効
+///   2. selected エントリの section == .staged
+///   3. selected エントリの orig_path != null（rename/copy 由来）
+///   4. 同 path を持つ .unstaged エントリが files 内に存在（content modify がまだ残っている）
+/// 条件 4 は 2 R.（rename+内容変更が両方 staged・完全 stage）と 2 RM（rename staged + content
+/// modify unstaged）を区別する。view.renderDiff がメタ行表示の判定に使う。純粋・allocator 不要。
+pub fn isRenamePartialState(model: *const Model) bool {
+    if (model.files.items.len == 0) return false;
+    if (model.selected >= model.files.items.len) return false;
+    const cur = model.files.items[model.selected];
+    if (cur.section != .staged) return false;
+    if (cur.orig_path == null) return false;
+    // 同 path の .unstaged エントリが存在するか
+    for (model.files.items) |f| {
+        if (f.section == .unstaged and std.mem.eql(u8, f.path, cur.path)) return true;
+    }
+    return false;
+}
+
 /// ビジュアル選択レンジ [lo, hi]（閉区間・絶対 diff 行 index）。anchor==null は単一カーソル行。
 /// reducer（stage 対象）と view（ハイライト）が同一式から導き「見える選択 == stage 対象」を保つ。
 pub fn selectionRange(cursor: usize, anchor: ?usize) struct { lo: usize, hi: usize } {
@@ -389,6 +410,77 @@ test "selectByPathPriority defensive fallback returns 0 on no match" {
     };
     // "f.txt" は無いが契約違反呼出 → index 0 へ退化（クラッシュしない）
     try std.testing.expectEqual(@as(usize, 0), selectByPathPriority(&items, "f.txt"));
+}
+
+test "isRenamePartialState: 2 RM staged entry with unstaged sibling returns true" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 2 RM 展開後: staged(new.txt, orig=old.txt) + unstaged(new.txt, orig=null)
+    try m.files.append(a, .{
+        .path = try a.dupe(u8, "new.txt"),
+        .orig_path = try a.dupe(u8, "old.txt"),
+        .section = .staged,
+    });
+    try m.files.append(a, .{
+        .path = try a.dupe(u8, "new.txt"),
+        .orig_path = null,
+        .section = .unstaged,
+    });
+    m.selected = 0; // staged 側を選択
+    try std.testing.expect(isRenamePartialState(&m));
+}
+
+test "isRenamePartialState: 2 R. (full stage, no unstaged sibling) returns false" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.files.append(a, .{
+        .path = try a.dupe(u8, "new.txt"),
+        .orig_path = try a.dupe(u8, "old.txt"),
+        .section = .staged,
+    });
+    // unstaged 兄弟無し（完全 stage）→ false
+    m.selected = 0;
+    try std.testing.expect(!isRenamePartialState(&m));
+}
+
+test "isRenamePartialState: 1 AM staged entry (orig_path null) returns false" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.files.append(a, .{
+        .path = try a.dupe(u8, "f.txt"),
+        .orig_path = null,
+        .section = .staged,
+    });
+    try m.files.append(a, .{
+        .path = try a.dupe(u8, "f.txt"),
+        .orig_path = null,
+        .section = .unstaged,
+    });
+    m.selected = 0;
+    try std.testing.expect(!isRenamePartialState(&m)); // orig_path null
+}
+
+test "isRenamePartialState: 2 .R unstaged entry returns false (section mismatch)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.files.append(a, .{
+        .path = try a.dupe(u8, "new.txt"),
+        .orig_path = try a.dupe(u8, "old.txt"),
+        .section = .unstaged,
+    });
+    m.selected = 0;
+    try std.testing.expect(!isRenamePartialState(&m)); // section が unstaged
+}
+
+test "isRenamePartialState: empty files returns false" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try std.testing.expect(!isRenamePartialState(&m));
 }
 
 test "Bug 2: partial stage of untracked follows selection to unstaged entry" {
