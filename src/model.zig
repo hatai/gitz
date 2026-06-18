@@ -1,6 +1,11 @@
 const std = @import("std");
 const status = @import("git/status.zig");
 
+/// 最後に load_diff を発行したファイル識別子（層 1: codex B1 対策）。path のみで追跡すると
+/// partial stage で `? f` → `1 AM` 展開時の section 変化を取り逃がすため、section も持つ。
+/// `orig_path` は含めない（section 変化検出を優先）。
+pub const DiffOwner = struct { path: []u8, section: status.Section };
+
 pub const Focus = enum { changes, diff, commit };
 
 pub const FileItem = struct {
@@ -21,6 +26,7 @@ pub const Model = struct {
     diff_scroll: usize, // diff ペインの先頭表示行（スクロールオフセット）
     diff_cursor: usize, // diff ペインのカーソル（絶対 diff 行 index）。行単位選択の基準。
     diff_anchor: ?usize, // ビジュアル選択の anchor（絶対 diff 行）。null=範囲未選択。
+    diff_owner: ?DiffOwner, // 最後に load_diff を発行したファイル。null = 未発行（初回）。
     commit_message: []u8, // TextArea の内容（空可）
     focus: Focus,
     busy: bool, // reducer の二重実行ゲート（全 in-flight 副作用で true）。表示はしない。
@@ -42,6 +48,7 @@ pub const Model = struct {
             .diff_scroll = 0,
             .diff_cursor = 0,
             .diff_anchor = null,
+            .diff_owner = null,
             .commit_message = try a.dupe(u8, ""),
             .focus = .changes,
             .busy = false,
@@ -63,6 +70,7 @@ pub const Model = struct {
         }
         self.files.deinit(a);
         a.free(self.diff_text);
+        if (self.diff_owner) |o| a.free(o.path);
         a.free(self.commit_message);
         a.free(self.error_text);
     }
@@ -261,4 +269,11 @@ test "replaceFiles falls back to index clamp when selected file is gone" {
     try m.replaceFiles(&e2);
     try std.testing.expectEqual(@as(usize, 0), m.selected);
     try std.testing.expectEqualStrings("a.txt", m.files.items[m.selected].path);
+}
+
+test "Model.diff_owner starts null and survives init/deinit (Layer 1 field)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try std.testing.expectEqual(@as(?DiffOwner, null), m.diff_owner);
 }
