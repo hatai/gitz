@@ -109,15 +109,29 @@ pub const Model = struct {
         // ハイライトが画面上を連続的に動く（view.changesRowLayout の表示順と一致する）。
         std.mem.sort(FileItem, next.items, {}, lessThanForDisplay);
 
-        // 選択を (section, path) で復元（旧 files 解放前に照合）。見つからなければ index クランプにフォールバック。
+        // 選択を復元。2 段階: (1) (section, path) 完全一致、(2) path のみでフォールバック（unstaged>staged>untracked優先）。
+        // 第 2 段階は部分 stage で section が変わったケース（? untracked.txt → 1 AM で
+        // .untracked → .staged+.unstaged）へ選択を追従させる（Bug 2）。unstaged 優先は
+        // 「まだ作業が残っている」側へ誘導し連続 stage を継続しやすくする。
         var new_selected: usize = self.selected;
         if (prev) |p| {
+            var found_exact: ?usize = null;
+            var found_path_only: ?usize = null;
             for (next.items, 0..) |f, i| {
-                if (f.section == p.section and std.mem.eql(u8, f.path, p.path)) {
-                    new_selected = i;
-                    break;
+                if (found_exact == null and f.section == p.section and std.mem.eql(u8, f.path, p.path)) {
+                    found_exact = i;
+                }
+                if (found_path_only == null and std.mem.eql(u8, f.path, p.path)) {
+                    found_path_only = i;
                 }
             }
+            if (found_exact) |i| {
+                new_selected = i;
+            } else if (found_path_only != null) {
+                // 完全一致無し。path のみで一致するエントリから優先順位（unstaged>staged>untracked）で選ぶ。
+                new_selected = selectByPathPriority(next.items, p.path);
+            }
+            // どちらも見つからなければ new_selected は self.selected のまま（下で index クランプ）。
         }
 
         // ここまで来れば成功。旧 files を解放して入れ替える（以降 prev.path は使わない）。
@@ -375,4 +389,55 @@ test "selectByPathPriority defensive fallback returns 0 on no match" {
     };
     // "f.txt" は無いが契約違反呼出 → index 0 へ退化（クラッシュしない）
     try std.testing.expectEqual(@as(usize, 0), selectByPathPriority(&items, "f.txt"));
+}
+
+test "Bug 2: partial stage of untracked follows selection to unstaged entry" {
+    // untracked.txt 選択中 → 部分 stage で ? → 1 AM 展開。.unstaged 側へ追従すること。
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+
+    // 初回: untracked.txt のみ
+    const e1 = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "untracked.txt"), .orig_path = null, .section = .untracked },
+    };
+    defer for (e1) |e| a.free(e.path);
+    try m.replaceFiles(&e1);
+    try std.testing.expectEqualStrings("untracked.txt", m.files.items[m.selected].path);
+    try std.testing.expectEqual(status.Section.untracked, m.files.items[m.selected].section);
+
+    // 部分 stage 後: 1 AM 展開で staged + unstaged の 2 エントリ + 別の untracked が残ったとする
+    const e2 = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "untracked.txt"), .orig_path = null, .section = .staged },
+        .{ .path = try a.dupe(u8, "untracked.txt"), .orig_path = null, .section = .unstaged },
+        .{ .path = try a.dupe(u8, "other.txt"), .orig_path = null, .section = .untracked },
+    };
+    defer for (e2) |e| a.free(e.path);
+    try m.replaceFiles(&e2);
+    // ★Bug 2 の核心: 同 path の .unstaged 側へ追従
+    // 表示順ソート後: staged(untracked.txt) / unstaged(untracked.txt) / untracked(other.txt)
+    //   → staged が先頭。完全一致 (untracked, "untracked.txt") は無し（section 変わった）。
+    //   path-only フォールバック: unstaged 優先 → index 1。
+    try std.testing.expectEqualStrings("untracked.txt", m.files.items[m.selected].path);
+    try std.testing.expectEqual(status.Section.unstaged, m.files.items[m.selected].section);
+}
+
+test "Bug 2: full stage of untracked follows selection to staged entry" {
+    // untracked 完全 stage → unstaged 側は消え staged のみ残る → staged へ追従
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const e1 = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .untracked },
+    };
+    defer for (e1) |e| a.free(e.path);
+    try m.replaceFiles(&e1);
+
+    const e2 = [_]status.StatusEntry{
+        .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .staged },
+    };
+    defer for (e2) |e| a.free(e.path);
+    try m.replaceFiles(&e2);
+    try std.testing.expectEqualStrings("f.txt", m.files.items[m.selected].path);
+    try std.testing.expectEqual(status.Section.staged, m.files.items[m.selected].section);
 }
