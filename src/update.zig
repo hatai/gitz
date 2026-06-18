@@ -665,6 +665,42 @@ test "stage_lines on staged rename entry (orig_path!=null, section=staged) is gu
     try std.testing.expect(std.mem.indexOf(u8, m.error_text, "rename") != null);
 }
 
+test "stage_lines on 2 .R unstaged entry (orig_path!=null, section=unstaged) is guarded" {
+    // spec 2026-06-17-rename-hunk-stage-design.md §3.4・§4 リスクA:
+    // 2 .R（worktree rename・orig_path != null）の部分 stage は diff が rename ヘッダを含み
+    // 部分パッチ生成が未検証のためガード維持。当初案の section==.staged 絞り込みを破棄したことで
+    // このパスが開放されないことを固定化する。
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 2 .R の unstaged エントリ: path=new.txt, orig_path=old.txt, section=.unstaged
+    try m.files.append(m.allocator, .{
+        .path = try m.allocator.dupe(u8, "new.txt"),
+        .orig_path = try m.allocator.dupe(u8, "old.txt"),
+        .section = .unstaged,
+    });
+    try m.setStr(&m.diff_text,
+        "diff --git a/old.txt b/new.txt\n" ++
+        "similarity index 80%\n" ++
+        "rename from old.txt\n" ++
+        "rename to new.txt\n" ++
+        "index 92dfa21..e1da833 100644\n" ++
+        "--- a/old.txt\n" ++
+        "+++ b/new.txt\n" ++
+        "@@ -1,3 +1,3 @@\n" ++
+        " a\n" ++
+        "-b\n" ++
+        "+X\n" ++
+        " c\n");
+    m.diff_cursor = 9;
+    m.diff_anchor = 9;
+    var cmd = try update(&m, .stage_lines);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none); // ガードでブロック
+    try std.testing.expect(m.error_text.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, m.error_text, "rename") != null);
+}
+
 test "stage_lines guards: busy" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
