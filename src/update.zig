@@ -203,7 +203,13 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         .diff_loaded => |text| {
             model.busy = false;
             try model.setStr(&model.diff_text, text);
-            try clampCursor(model);
+            // ★層 1: ファイル同一性ゲート（codex B1）。clampCursor は diff_text しか見えず
+            //   「どのファイルの diff か」を知らないため、ここで selected ファイルが
+            //   load_diff 発行時と同じか検証する。不一致なら stale anchor を消す。
+            if (!isDiffOwnerCurrent(model)) {
+                model.diff_anchor = null;
+            }
+            try clampCursor(model); // 層 2: validateAnchor（Task 5 で実装）
             return .none;
         },
         .git_error => |text| {
@@ -217,6 +223,17 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             return .refresh_status;
         },
     }
+}
+
+/// model.diff_owner（最後に load_diff を発行したファイル）が現在の selected ファイルと一致するか。
+/// 一致しない（ファイル切替・外部プロセスで selected が別へクランプ・初回ロード前）は false。
+/// 純粋・allocator 不要。層 1（codex B1 対策）。
+fn isDiffOwnerCurrent(model: *const Model) bool {
+    const owner = model.diff_owner orelse return false;
+    if (model.files.items.len == 0) return false;
+    if (model.selected >= model.files.items.len) return false;
+    const f = model.files.items[model.selected];
+    return f.section == owner.section and std.mem.eql(u8, f.path, owner.path);
 }
 
 /// diff 再読込/カーソル移動後にカーソルを本文行へ正規化し anchor をリセットする（純粋）。
@@ -773,4 +790,65 @@ test "loadDiffCmd clears diff_owner when files empty (Layer 1)" {
     var cmd = try update(&m, .{ .status_loaded = &.{} });
     cmd.deinit(a); // .none を返す（ファイル無し）
     try std.testing.expect(m.diff_owner == null);
+}
+
+test "isDiffOwnerCurrent: null owner returns false (first load)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    // diff_owner 未設定
+    try std.testing.expect(!isDiffOwnerCurrent(&m));
+}
+
+test "isDiffOwnerCurrent: matching section+path returns true" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try m.setDiffOwner("f.txt", .unstaged);
+    try std.testing.expect(isDiffOwnerCurrent(&m));
+}
+
+test "isDiffOwnerCurrent: section change (partial stage) returns false" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .staged); // 部分 stage 後の staged エントリ
+    try m.setDiffOwner("f.txt", .untracked); // 発行時は untracked だった
+    try std.testing.expect(!isDiffOwnerCurrent(&m));
+}
+
+test "isDiffOwnerCurrent: path change returns false" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "g.txt", .unstaged);
+    try m.setDiffOwner("f.txt", .unstaged); // 別ファイル
+    try std.testing.expect(!isDiffOwnerCurrent(&m));
+}
+
+test "Bug 1 Layer 1: diff_loaded clears anchor when selected file changed (codex B1)" {
+    // f.txt 選択中に anchor=5 → 外部プロセスで f.txt が消え g.txt へ切替 →
+    // owner は f.txt のまま（loadDiffCmd を経由せず直接 selected を変えたレース）。
+    // この状態で diff_loaded が届くと層 1 が anchor を消す。
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try addFile(&m, "g.txt", .unstaged);
+    try seedTwoHunkDiff(&m);
+    m.diff_cursor = 5;
+    m.diff_anchor = 5;
+    // owner を f.txt のまま記録（loadDiffCmd 相当）
+    try m.setDiffOwner("f.txt", .unstaged);
+    // selected を g.txt(1) へ（外部プロセスで f.txt が消えた等）。owner は更新しない。
+    m.selected = 1;
+    // g.txt の diff_loaded が届いたとする（テストでは同じ diff_text を再利用）
+    const diff_copy = try a.dupe(u8, m.diff_text);
+    defer a.free(diff_copy);
+    var cmd = try update(&m, .{ .diff_loaded = diff_copy });
+    cmd.deinit(a);
+    // ★層 1: owner(f.txt) != selected(g.txt) → anchor clear
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
 }
