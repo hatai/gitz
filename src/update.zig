@@ -594,6 +594,42 @@ test "stage_lines on untracked builds apply_patch (reverse=false) for partial st
     try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "@@ -0,0 +1,1 @@") != null);
 }
 
+test "stage_lines on 2 RM unstaged entry (orig_path=null) builds apply_patch (reverse=false)" {
+    // spec 2026-06-17-rename-hunk-stage-design.md §3.4: 2 RM の unstaged 側は
+    // orig_path == null なので現行ガードを通過し、buildLinePatch(reverse=false) へ進む。
+    // これが本タスクの核心「2 RM の部分 stage は現状で動く」の回帰保護。
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 2 RM 展開後の unstaged エントリ: path=new.txt, orig_path=null, section=.unstaged
+    // （addFile ヘルパは orig_path=null 固定なのでそのまま使える）
+    try addFile(&m, "new.txt", .unstaged);
+    // git mv 済み状態の unstaged 側 diff（rename ヘッダ無し・content-only）
+    try m.setStr(&m.diff_text,
+        "diff --git a/new.txt b/new.txt\n" ++
+        "index 9405325..6fe8acc 100644\n" ++
+        "--- a/new.txt\n" ++
+        "+++ b/new.txt\n" ++
+        "@@ -1,5 +1,5 @@\n" ++
+        " a\n" ++
+        "-b\n" ++
+        "+X\n" ++
+        " c\n" ++
+        " d\n" ++
+        " e\n");
+    m.diff_cursor = 7; // +X の絶対行（file_header 4 行 + @@ が行4, ' a'=5, '-b'=6, '+X'=7）
+    m.diff_anchor = 7;
+    var cmd = try update(&m, .stage_lines);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .apply_patch);
+    try std.testing.expect(!cmd.apply_patch.reverse); // unstaged → forward
+    // 選択行 +X のみ保持。未選択 -b は文脈化（' b'）され、元の -b としては残らない。
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "+X\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "-b\n") == null);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor); // 選択消費
+    try std.testing.expect(m.error_text.len == 0); // ガードメッセージ無し
+}
+
 test "stage_lines guards: busy" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
