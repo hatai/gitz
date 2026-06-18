@@ -214,6 +214,30 @@ pub fn hunkIndexForLine(parsed: ParsedDiff, abs_line: usize) ?usize {
     return null;
 }
 
+/// ハンク `h` の本文の**最終本文行**（`@@` ヘッダを除く）の絶対行番号を返す。
+/// 本文行 = 行頭が `' '`/`'+'`/`'-'` のいずれか。`@@` ヘッダ行（`abs == start_line`）や
+/// `\ No newline` マーカー（行頭 `'\'`）は本文行と見なさない。
+/// `line_count <= 1`（本文 0 行の退化ハンク）の場合は `start_line` を返す
+/// （呼び出し側ガードで弾く前提の安全フォールバック）。
+/// `update.zig` の `hunkBodyTop` と対。`update.hunkBodyTop` は `start_line + 1` を返すが、
+/// 本関数は絶対行の最終本文行を返すため hunk 本体を行単位で走査する。
+pub fn hunkBodyBottom(h: Hunk) usize {
+    if (h.line_count <= 1) return h.start_line;
+    // h.text を行に分割し、@@ ヘッダの次から最後の本文行（行頭が ' '/'+'/'-'）を探す。
+    var it = std.mem.splitScalar(u8, h.text, '\n');
+    const header = it.next() orelse return h.start_line; // "@@ ... @@" を読み飛ばす
+    _ = header;
+    var last_body_abs: usize = h.start_line; // 本文が無ければ @@ 行へ退化（安全）
+    var abs: usize = h.start_line + 1;
+    while (it.next()) |line| : (abs += 1) {
+        if (line.len == 0) continue; // 末尾 \n 由来の空要素
+        if (line[0] == ' ' or line[0] == '+' or line[0] == '-') {
+            last_body_abs = abs;
+        }
+    }
+    return last_body_abs;
+}
+
 test "buildPatch emits only the selected hunk plus file_header, newline-terminated" {
     const a = std.testing.allocator;
     const diff =
@@ -250,6 +274,38 @@ test "hunkIndexForLine maps absolute diff line to hunk (header rows -> null outs
     try std.testing.expectEqual(@as(?usize, 1), hunkIndexForLine(p, 5)); // hunk1 ヘッダ
     try std.testing.expectEqual(@as(?usize, 1), hunkIndexForLine(p, 7)); // hunk1 本文
     try std.testing.expectEqual(@as(?usize, null), hunkIndexForLine(p, 99)); // 範囲外
+}
+
+test "hunkBodyBottom returns last body line for multi-line hunk" {
+    const a = std.testing.allocator;
+    const diff =
+        "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n" ++
+        "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+    var p = try parse(a, diff);
+    defer p.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), p.hunks.len);
+    // @@ は行3、本文 ' a'=4, '-b'=5, '+B'=6, ' c'=7 → 最終本文行は 7
+    try std.testing.expectEqual(@as(usize, 7), hunkBodyBottom(p.hunks[0]));
+}
+
+test "hunkBodyBottom on degenerate hunk (line_count==1) returns start_line" {
+    // 本文 0 行の退化ハンク（@@ のみ・line_count==1）は実 git diff では出ないが、
+    // パーサが寛容に受理する可能性を考慮し start_line へ退化して安全に扱う。
+    const h: Hunk = .{ .text = "@@ -1,1 +1,1 @@\n", .start_line = 3, .line_count = 1 };
+    try std.testing.expectEqual(@as(usize, 3), hunkBodyBottom(h));
+}
+
+test "hunkBodyBottom on hunk with trailing no-newline marker returns the body line" {
+    const a = std.testing.allocator;
+    const diff =
+        "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n" ++
+        "@@ -1,1 +1,2 @@\n a\n+B\n\\ No newline at end of file\n";
+    var p = try parse(a, diff);
+    defer p.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), p.hunks.len);
+    // @@ は行3、本文 ' a'=4, '+B'=5, '\'=6 → 最終本文行は 5（'\' は本文判定では行頭が '\\' だが
+    // hunkBodyBottom は本文行を ' '/'+'/'-' のみと見なすため '\' を本文と見なさず '+B'=5 を返す）
+    try std.testing.expectEqual(@as(usize, 5), hunkBodyBottom(p.hunks[0]));
 }
 
 test "parse splits two hunks and captures file_header" {
