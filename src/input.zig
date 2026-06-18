@@ -53,6 +53,8 @@ pub fn keyToMsg(focus: Focus, key: Key) ?Msg {
                 'j' => .diff_cursor_down,
                 'k' => .diff_cursor_up,
                 'v' => .toggle_line_selection,
+                '#' => .select_hunk,
+                'H' => .stage_hunk,
                 ']' => .diff_hunk_next,
                 '[' => .diff_hunk_prev,
                 's', ' ' => .stage_lines,
@@ -335,6 +337,19 @@ test "diff focus: line cursor / selection / hunk-jump / stage keys map" {
     try std.testing.expect(keyToMsg(.diff, .{ .char = 's' }).? == .stage_lines);
     try std.testing.expect(keyToMsg(.diff, .{ .char = ' ' }).? == .stage_lines);
     try std.testing.expect(keyToMsg(.diff, .enter).? == .stage_lines);
+}
+
+test "keyToMsg diff focus: '#' maps to select_hunk" {
+    try std.testing.expectEqual(@as(?Msg, .select_hunk), keyToMsg(.diff, .{ .char = '#' }));
+}
+
+test "keyToMsg diff focus: 'H' maps to stage_hunk" {
+    try std.testing.expectEqual(@as(?Msg, .stage_hunk), keyToMsg(.diff, .{ .char = 'H' }));
+}
+
+test "keyToMsg diff focus: lowercase 'h' is unmapped (stays null)" {
+    // 大文字 H のみ。小文字 h は未割当（将来 vim 系 left 等と衝突回避）。
+    try std.testing.expectEqual(@as(?Msg, null), keyToMsg(.diff, .{ .char = 'h' }));
 }
 
 test "changes focus mapping is unchanged (regression)" {
