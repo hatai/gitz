@@ -630,6 +630,41 @@ test "stage_lines on 2 RM unstaged entry (orig_path=null) builds apply_patch (re
     try std.testing.expect(m.error_text.len == 0); // ガードメッセージ無し
 }
 
+test "stage_lines on staged rename entry (orig_path!=null, section=staged) is guarded" {
+    // spec 2026-06-17-rename-hunk-stage-design.md §3.4: staged rename 側はガード維持。
+    // 2 R.（rename+内容変更が両方 staged）からの部分 unstage は git の apply --cached --reverse が
+    // index を破綻させるため（spec §2 実験3）、ファイル単位 unstage を案内するガードを残す。
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // staged rename エントリ: path=new.txt, orig_path=old.txt, section=.staged
+    try m.files.append(m.allocator, .{
+        .path = try m.allocator.dupe(u8, "new.txt"),
+        .orig_path = try m.allocator.dupe(u8, "old.txt"),
+        .section = .staged,
+    });
+    try m.setStr(&m.diff_text,
+        "diff --git a/old.txt b/new.txt\n" ++
+        "similarity index 80%\n" ++
+        "rename from old.txt\n" ++
+        "rename to new.txt\n" ++
+        "index 92dfa21..e1da833 100644\n" ++
+        "--- a/old.txt\n" ++
+        "+++ b/new.txt\n" ++
+        "@@ -1,3 +1,3 @@\n" ++
+        " a\n" ++
+        "-b\n" ++
+        "+X\n" ++
+        " c\n");
+    m.diff_cursor = 9; // -b の絶対行（file_header 7 行 + @@ 行7, ' a'=8, '-b'=9）
+    m.diff_anchor = 9;
+    var cmd = try update(&m, .stage_lines);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none); // ガードでブロック
+    try std.testing.expect(m.error_text.len > 0); // ガイドメッセージ
+    try std.testing.expect(std.mem.indexOf(u8, m.error_text, "rename") != null);
+}
+
 test "stage_lines guards: busy" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
