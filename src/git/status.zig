@@ -202,3 +202,27 @@ test "unstaged-side rename (XY=.R) puts orig_path on the unstaged entry" {
     try std.testing.expectEqual(Section.unstaged, entries[0].section);
     try std.testing.expectEqualStrings("old.txt", entries[0].orig_path.?);
 }
+
+test "rename+modify (XY=RM): staged keeps orig_path, unstaged has null orig_path" {
+    // spec 2026-06-17-rename-hunk-stage-design.md §2 実験1 の核心不変条件。
+    // X='R'(rename) は staged 側へ orig_path を付き、Y='M'(modify) は is_y_rename=false
+    // なので unstaged 側へは orig_path が付かない（null）。この不一致により、
+    // update.stage_lines の現行ガード (f.orig_path != null) は unstaged 側を通過させる。
+    const a = std.testing.allocator;
+    const raw = "2 RM N... 100644 100644 100644 9405325 9405325 R100 new.txt\x00old.txt\x00";
+    const entries = try parse(a, raw);
+    defer {
+        for (entries) |*e| e.deinit(a);
+        a.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    // staged 側: path=new.txt, orig_path=old.txt
+    try std.testing.expectEqual(Section.staged, entries[0].section);
+    try std.testing.expectEqualStrings("new.txt", entries[0].path);
+    try std.testing.expect(entries[0].orig_path != null);
+    try std.testing.expectEqualStrings("old.txt", entries[0].orig_path.?);
+    // unstaged 側: path=new.txt, orig_path=null（Y='M' は rename ではない）
+    try std.testing.expectEqual(Section.unstaged, entries[1].section);
+    try std.testing.expectEqualStrings("new.txt", entries[1].path);
+    try std.testing.expect(entries[1].orig_path == null);
+}
