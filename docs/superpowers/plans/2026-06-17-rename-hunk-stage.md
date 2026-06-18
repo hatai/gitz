@@ -341,17 +341,24 @@ test "apply_patch stages a partial hunk of a renamed file (git mv + unstaged mod
     var parsed = try hunk.parse(a, dmsg.diff_loaded);
     defer parsed.deinit(a);
     try std.testing.expect(parsed.hunks.len >= 1);
-    // (b->X) 変更行のみを選択して部分パッチを組む。-b の絶対行を splitScalar で探す。
+    // (b->X) 置換を部分 stage する。-b と +X の両方の絶対行を splitScalar で探し、
+    // 両方を覆うレンジ [minus_b, plus_X] を選択する（前方 stage で - と + を対で残す必要がある）。
+    // ★注意: buildLinePatch(reverse=false) で未選択の + は削除・未選択の - は文脈化される。
+    //   よって -b だけを選ぶと「b の削除」だけが stage され +X が落ちる。必ず +X まで含めること。
     var minus_b: usize = 0;
+    var plus_X: usize = 0;
     {
         var it = std.mem.splitScalar(u8, dmsg.diff_loaded, '\n');
         var i: usize = 0;
         while (it.next()) |ln| : (i += 1) {
             if (std.mem.eql(u8, ln, "-b")) minus_b = i;
+            if (std.mem.eql(u8, ln, "+X")) plus_X = i;
         }
     }
     try std.testing.expect(minus_b != 0);
-    const maybe = try hunk.buildLinePatch(a, parsed, 0, minus_b, minus_b, false);
+    try std.testing.expect(plus_X != 0);
+    try std.testing.expect(minus_b < plus_X); // -b の直後に +X が来る前提
+    const maybe = try hunk.buildLinePatch(a, parsed, 0, minus_b, plus_X, false);
     try std.testing.expect(maybe != null);
     // forward 適用: git apply --cached が index の new.txt へ部分パッチを受理する。
     var msg = try runOwned(a, io, repo.cwd(), .{ .apply_patch = .{
