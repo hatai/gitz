@@ -33,6 +33,32 @@ stage / unstage する。
     となり `replaceFiles` が staged+unstaged 2 エントリへ展開する（既存挙動で吸収）。
 - [x] パッチ生成のユニットテスト（コンテキスト行・改行末尾・日本語を含む差分）
 - [x] rename ファイルのハンク stage（phase 2: file_header の rename 行を扱う）
+- [x] **★範囲 stage が auto-refresh で破壊されるバグの修正（2026-06-18 QA で発見・ブロッカー・同日解消）**
+  - **症状**: `v` で選択開始 → `j` で選択拡張 → `s` で stage の標準フローで、選択範囲ではなく
+    最終カーソル位置の**単一行**しか stage されない。これにより TODO 1 の目玉「複数行レンジの部分 stage」
+    が実環境で実質使用不能。単一行 stage（`v` 押さずに `s`）は正常に動作する。
+  - **根拠**: `update.zig` の `clampCursor` が `diff_loaded`/`status_loaded` 経由で無条件に
+    `model.diff_anchor = null` を実行する。`main.zig` の auto-refresh（1500ms ポーリング）や
+    ファイル切替時の `loadDiffCmd` がこのパスを起動するため、`v` 押下から `s` 押下までの間に
+    高確率で anchor が null 化される（stderr デバッグで実証）。
+  - **解消**（2026-06-18）: 2 層構成。(1) **層 1（ファイル同一性ゲート）**: `model.diff_owner` フィールド +
+    `isDiffOwnerCurrent` ヘルパを新設し、`diff_loaded` arm の先頭で `load_diff` 発行時の selected と
+    現在の selected が同じ `(section, path)` か検証（不一致なら stale anchor を clear）。外部プロセスで
+    selected が別ファイルへ切り替わった後の回帰を防止（codex レビュー B1）。(2) **層 2（validateAnchor）**:
+    `clampCursor` の無条件 anchor clear を `validateAnchor`（anchor が (a) 本文行、(b) cursor と同ハンク、
+    の AND を満たすなら保持）へ置換。`select_line_at` arm に明示的 clear を追加しマウスクリック＝選択解除
+    セマンティクスを回復。spec: `docs/superpowers/specs/2026-06-18-range-stage-autorefresh-fix-design.md`。
+- [x] **★部分 stage 後の選択ファイル追従バグの修正（2026-06-18 QA で発見・UX ノイズ・同日解消）**
+  - **症状**: `untracked.txt` を部分 stage すると porcelain が `? untracked.txt` → `1 AM untracked.txt` へ
+    変わり、`replaceFiles` が staged と untracked の 2 エントリへ展開する。`replaceFiles` の選択復元は
+    `(section, path)` 一致で行うため、section が `.untracked` → `.staged`（または `.untracked` 残存側）へ
+    変わると追従できず、diff ペインが別ファイル（先頭マッチ or index クランプ）へ切り替わることがある。
+  - **影響**: 機能破壊ではない（stage 自体は成功）が、連続して部分 stage を繰り返す際の UX ノイズ。
+  - **解消**（2026-06-18）: `replaceFiles` の選択復元を 2 段階へ拡張。(1) `(section, path)` 完全一致
+    （従来どおり）。(2) 見つからなければ `selectByPathPriority`（優先順位 unstaged > staged > untracked）
+    で path のみ一致するエントリへフォールバック。unstaged 優先は「まだ作業が残っている」側へ誘導し
+    連続 stage を継続しやすくする。完全 stage 時は unstaged 側が消え staged のみ残るため staged へ追従。
+    spec: `docs/superpowers/specs/2026-06-18-range-stage-autorefresh-fix-design.md` §3。
 
 ### 留意点
 - **untracked の部分 stage は `--no-index` 形式の diff が前提**。`git apply --cached` は index 未登録
@@ -53,6 +79,10 @@ stage / unstage する。
     - **tracked diff** で文脈化が必要な No-newline 境界の選択は矛盾パッチ回避のため no-op（ガイダンス表示）。
       ※untracked の全挿入ハンクでは文脈化が発生しないため、最終 `+` 行を選択すればマーカー保持の
       有効パッチになる（2026-06-17 対応済み・spec 受け入れ基準 8）。
+- **★解消済みバグ（2026-06-18 QA で発見・同日解消）**: Sub Tasks の「範囲 stage が auto-refresh で破壊されるバグの修正」
+  および「部分 stage 後の選択ファイル追従バグの修正」を参照。両者とも 2 層構成（層 1: ファイル同一性ゲート `isDiffOwnerCurrent` +
+  `model.diff_owner`、層 2: `validateAnchor`）+ path-only フォールバック（`selectByPathPriority`）で解消。
+  spec: `docs/superpowers/specs/2026-06-18-range-stage-autorefresh-fix-design.md`。
 - **rename + modify の部分 stage（2026-06-17 完了）**:
   - **方式**: `2 RM`（rename staged + 内容変更 unstaged）は `git mv` 時点で rename が index 済みのため、
     unstaged 側 diff は `new.txt` 単体の content-only diff になる。`status.parse` が `2 RM` を展開した
