@@ -171,6 +171,27 @@ pub const Model = struct {
     }
 };
 
+/// path のみが一致するエントリのうち、優先順位（unstaged > staged > untracked）で最も高いものの
+/// index を返す。純粋・allocator 不要。Bug 2（部分 stage 後の選択追従）で replaceFiles が呼ぶ。
+///
+/// 呼び出し側は `found_path_only != null`（path に一致するエントリが少なくとも1つ存在）を保証して
+/// 呼ぶため、本関数は常にヒットする。末尾の `return 0` は防御的フォールバックで、契約違反の呼出し
+/// （path 一致エントリが無いのに呼んだ）時に index 0 へ退化して安全性を保つ。`unreachable` には
+/// しない（一部のエッジで契約が崩れたときの安全側 / codex N3）。
+///
+/// 優先順位は sectionRank（staged=0 < unstaged=1 < untracked=2）とは**逆**（unstaged が先頭）。
+/// sectionRank は表示順（staged が先頭）用で、選択追従の優先順位とは別物。混同しないよう個別定義。
+fn selectByPathPriority(items: []const FileItem, path: []const u8) usize {
+    const priorities = [_]status.Section{ .unstaged, .staged, .untracked };
+    for (priorities) |sec| {
+        for (items, 0..) |f, i| {
+            if (f.section == sec and std.mem.eql(u8, f.path, path)) return i;
+        }
+    }
+    // 防御的フォールバック（契約違反時）: index 0 へ退化。
+    return 0;
+}
+
 /// ビジュアル選択レンジ [lo, hi]（閉区間・絶対 diff 行 index）。anchor==null は単一カーソル行。
 /// reducer（stage 対象）と view（ハイライト）が同一式から導き「見える選択 == stage 対象」を保つ。
 pub fn selectionRange(cursor: usize, anchor: ?usize) struct { lo: usize, hi: usize } {
@@ -307,4 +328,51 @@ test "setDiffOwner replaces and clearDiffOwner frees (Layer 1)" {
     // クリア
     m.clearDiffOwner();
     try std.testing.expectEqual(@as(?DiffOwner, null), m.diff_owner);
+}
+
+test "selectByPathPriority prefers unstaged over staged and untracked" {
+    const a = std.testing.allocator;
+    const path_f = try a.dupe(u8, "f.txt");
+    defer a.free(path_f);
+    const items = [_]FileItem{
+        .{ .path = path_f, .orig_path = null, .section = .staged },
+        .{ .path = path_f, .orig_path = null, .section = .unstaged },
+        .{ .path = path_f, .orig_path = null, .section = .untracked },
+    };
+    try std.testing.expectEqual(@as(usize, 1), selectByPathPriority(&items, "f.txt"));
+}
+
+test "selectByPathPriority falls back to staged when no unstaged match" {
+    const a = std.testing.allocator;
+    const path_f = try a.dupe(u8, "f.txt");
+    defer a.free(path_f);
+    const path_g = try a.dupe(u8, "g.txt");
+    defer a.free(path_g);
+    const items = [_]FileItem{
+        .{ .path = path_g, .orig_path = null, .section = .unstaged },
+        .{ .path = path_f, .orig_path = null, .section = .staged },
+        .{ .path = path_f, .orig_path = null, .section = .untracked },
+    };
+    try std.testing.expectEqual(@as(usize, 1), selectByPathPriority(&items, "f.txt")); // staged 優先
+}
+
+test "selectByPathPriority falls back to untracked when only untracked matches" {
+    const a = std.testing.allocator;
+    const path_f = try a.dupe(u8, "f.txt");
+    defer a.free(path_f);
+    const items = [_]FileItem{
+        .{ .path = path_f, .orig_path = null, .section = .untracked },
+    };
+    try std.testing.expectEqual(@as(usize, 0), selectByPathPriority(&items, "f.txt"));
+}
+
+test "selectByPathPriority defensive fallback returns 0 on no match" {
+    const a = std.testing.allocator;
+    const path_g = try a.dupe(u8, "g.txt");
+    defer a.free(path_g);
+    const items = [_]FileItem{
+        .{ .path = path_g, .orig_path = null, .section = .unstaged },
+    };
+    // "f.txt" は無いが契約違反呼出 → index 0 へ退化（クラッシュしない）
+    try std.testing.expectEqual(@as(usize, 0), selectByPathPriority(&items, "f.txt"));
 }
