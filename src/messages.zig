@@ -21,6 +21,8 @@ pub const Msg = union(enum) {
     diff_hunk_prev, // diff フォーカス時 [（前ハンク本文先頭へ）
     toggle_line_selection, // diff フォーカス時 v（anchor のトグル）
     stage_lines, // diff フォーカス時 s / space / Enter（選択レンジを stage/unstage）
+    select_hunk, // diff フォーカス時 # （現在ハンク本文全体を選択範囲へ）
+    stage_hunk, // diff フォーカス時 H （現在ハンクを即 stage/unstage）
     select_line_at: usize, // diff クリックの絶対行（カーソルへ解決・anchor クリア）
     quit,
     select_index: usize, // マウスでファイル行クリック
@@ -64,6 +66,8 @@ pub const Msg = union(enum) {
             .diff_hunk_prev,
             .toggle_line_selection,
             .stage_lines,
+            .select_hunk,
+            .stage_hunk,
             .select_line_at,
             .quit,
             .select_index,

@@ -199,6 +199,8 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             try model.setStr(&model.error_text, "選択範囲を stage できません（変更行なし、または末尾改行境界）");
             return .none;
         },
+        .select_hunk => return .none, // stub: Task 3 replaces with real impl
+        .stage_hunk => return .none, // stub: Task 3 replaces with real impl
         .quit => return .quit,
         // 解釈器からの結果
         .status_loaded => |entries| {
