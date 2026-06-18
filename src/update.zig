@@ -181,26 +181,48 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             if (parsed.hunks.len == 0) return .none;
             const idx = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse return .none;
             const sel = @import("model.zig").selectionRange(model.diff_cursor, model.diff_anchor);
-            const maybe = try hunk.buildLinePatch(model.allocator, parsed, idx, sel.lo, sel.hi, f.section == .staged);
+            const cmd = try buildStagePatchFromSelection(model, parsed, idx, sel.lo, sel.hi);
             model.diff_anchor = null; // 成否に関わらず選択は消費（null パスでもハイライトを残さない）
-            if (maybe) |patch| {
-                // ★レビュー B2: buildLinePatch 所有の patch を git_dir dupe OOM で漏らさないよう
-                //   errdefer 二重ガード。両 dupe 成功後に AppCmd リテラルへ所有権移譲。
-                errdefer model.allocator.free(patch);
-                const gd: ?[]u8 = if (model.git_dir) |g| try model.allocator.dupe(u8, g) else null;
-                errdefer if (gd) |x| model.allocator.free(x);
-                return .{ .apply_patch = .{
-                    .patch = patch,
-                    .reverse = (f.section == .staged),
-                    .git_dir = gd,
-                } };
-            }
-            // null は 2 因: 変更行ゼロ（文脈のみ選択）/ 末尾改行境界の矛盾。両方を正確に包む文言。
-            try model.setStr(&model.error_text, "選択範囲を stage できません（変更行なし、または末尾改行境界）");
+            return cmd;
+        },
+        .select_hunk => {
+            // 現在ハンクの本文全体を選択範囲へ。anchor=本文先頭, cursor=本文末尾。
+            // 空 diff / ハンク無しは no-op（panic 回避）。
+            var parsed = try hunk.parse(model.allocator, model.diff_text);
+            defer parsed.deinit(model.allocator);
+            if (parsed.hunks.len == 0) return .none;
+            const idx = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse 0;
+            const top = hunkBodyTop(parsed.hunks[idx]);
+            const bot = hunk.hunkBodyBottom(parsed.hunks[idx]);
+            model.focus = .diff;
+            model.diff_anchor = top;
+            model.diff_cursor = bot;
             return .none;
         },
-        .select_hunk => return .none, // stub: Task 3 replaces with real impl
-        .stage_hunk => return .none, // stub: Task 3 replaces with real impl
+        .stage_hunk => {
+            // 現在ハンクの本文全体を即 stage（select_hunk + stage_lines と等価）。
+            // 空 diff / busy / rename ガード付き。
+            if (model.busy) return .none;
+            if (model.files.items.len == 0) return .none;
+            const f = model.files.items[model.selected];
+            if (f.orig_path != null) {
+                try model.setStr(&model.error_text, "rename はファイル単位で stage してください");
+                return .none;
+            }
+            var parsed = try hunk.parse(model.allocator, model.diff_text);
+            defer parsed.deinit(model.allocator);
+            if (parsed.hunks.len == 0) return .none;
+            const idx = hunk.hunkIndexForLine(parsed, model.diff_cursor) orelse 0;
+            const top = hunkBodyTop(parsed.hunks[idx]);
+            const bot = hunk.hunkBodyBottom(parsed.hunks[idx]);
+            model.focus = .diff;
+            model.diff_cursor = bot; // 視覚化: cursor は本文末尾（▌ マーカー）
+            model.diff_anchor = top;
+            const sel = @import("model.zig").selectionRange(bot, top); // [top, bot]
+            const cmd = try buildStagePatchFromSelection(model, parsed, idx, sel.lo, sel.hi);
+            model.diff_anchor = null; // 選択消費
+            return cmd;
+        },
         .quit => return .quit,
         // 解釈器からの結果
         .status_loaded => |entries| {
@@ -242,6 +264,36 @@ fn isDiffOwnerCurrent(model: *const Model) bool {
     if (model.selected >= model.files.items.len) return false;
     const f = model.files.items[model.selected];
     return f.section == owner.section and std.mem.eql(u8, f.path, owner.path);
+}
+
+/// 選択レンジから apply_patch AppCmd を構築する共通ヘルパ（stage_lines / stage_hunk 共用）。
+/// 純粋（Model を read-only で参照・error_text のみ setStr で変更）。
+/// - rename ガードは呼び出し側で済ませること（本関数は f.orig_path を見ない）。
+/// - 戻り値: `.apply_patch`（成功）または `.none`（null パッチ時は error_text をセット）。
+/// ★本関数は model.diff_anchor を clear しない。呼び出し側が消費後に clear する（責務分離）。
+/// 注: sel 引数に匿名 struct を使うと model.selectionRange の戻り値型と型不一致になるため、
+///   lo/hi を個別パラメータで受ける（Zig の構造体同一性は宣言位置依存）。
+fn buildStagePatchFromSelection(
+    model: *Model,
+    parsed: hunk.ParsedDiff,
+    idx: usize,
+    lo: usize,
+    hi: usize,
+) !AppCmd {
+    const f = model.files.items[model.selected];
+    const maybe = try hunk.buildLinePatch(model.allocator, parsed, idx, lo, hi, f.section == .staged);
+    if (maybe) |patch| {
+        errdefer model.allocator.free(patch);
+        const gd: ?[]u8 = if (model.git_dir) |g| try model.allocator.dupe(u8, g) else null;
+        errdefer if (gd) |x| model.allocator.free(x);
+        return .{ .apply_patch = .{
+            .patch = patch,
+            .reverse = (f.section == .staged),
+            .git_dir = gd,
+        } };
+    }
+    try model.setStr(&model.error_text, "選択範囲を stage できません（変更行なし、または末尾改行境界）");
+    return .none;
 }
 
 /// diff 再読込/カーソル移動後にカーソルを本文行へ正規化し、anchor を**検証**する（純粋）。
@@ -1010,4 +1062,129 @@ test "Bug 1 e2e: range selection survives diff_loaded (auto-refresh simulation)"
     try std.testing.expect(c4 == .apply_patch);
     try std.testing.expect(std.mem.indexOf(u8, c4.apply_patch.patch, "+B\n") != null); // 選択された追加行
     try std.testing.expect(std.mem.indexOf(u8, c4.apply_patch.patch, "-b\n") != null); // 選択された削除行（文脈化されず保持）
+}
+
+test "select_hunk sets anchor=body top, cursor=body bottom, focus=diff" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try seedTwoHunkDiff(&m); // h0 本文 4-6, h1 本文 8-10
+    m.diff_cursor = 5; // h0 本文
+    m.focus = .changes; // diff フォーカスで無い状態から
+    var cmd = try update(&m, .select_hunk);
+    defer cmd.deinit(a);
+    try std.testing.expect(m.focus == .diff);
+    try std.testing.expectEqual(@as(usize, 4), m.diff_anchor.?); // h0 本文先頭
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // h0 本文末尾
+}
+
+test "select_hunk on empty diff (no hunks) is no-op" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try m.setStr(&m.diff_text, ""); // ハンク無し
+    m.diff_cursor = 0;
+    var cmd = try update(&m, .select_hunk);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
+}
+
+test "select_hunk picks the hunk containing cursor even on @@ header" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try seedTwoHunkDiff(&m); // @@h0 = 行3
+    m.diff_cursor = 3; // @@h0 ヘッダ行
+    var cmd = try update(&m, .select_hunk);
+    defer cmd.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), m.diff_anchor.?); // h0 本文先頭
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // h0 本文末尾
+}
+
+test "stage_hunk builds apply_patch for whole hunk body" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try seedTwoHunkDiff(&m); // h0 本文 4-6: ' a', '-b', '+B'
+    m.diff_cursor = 5;
+    m.focus = .diff;
+    var cmd = try update(&m, .stage_hunk);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .apply_patch);
+    try std.testing.expect(!cmd.apply_patch.reverse); // unstaged → forward
+    // h0 全体がパッチへ含まれる: -b と +B 両方
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "-b\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmd.apply_patch.patch, "+B\n") != null);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor); // 選択消費
+}
+
+test "stage_hunk on empty diff is no-op" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try m.setStr(&m.diff_text, "");
+    var cmd = try update(&m, .stage_hunk);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "stage_hunk respects busy guard" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try seedTwoHunkDiff(&m);
+    m.diff_cursor = 5;
+    m.busy = true;
+    var cmd = try update(&m, .stage_hunk);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "stage_hunk respects rename guard (orig_path != null)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 2 .R の unstaged エントリ（orig_path != null）
+    try m.files.append(m.allocator, .{
+        .path = try m.allocator.dupe(u8, "new.txt"),
+        .orig_path = try m.allocator.dupe(u8, "old.txt"),
+        .section = .unstaged,
+    });
+    try seedTwoHunkDiff(&m);
+    m.diff_cursor = 5;
+    var cmd = try update(&m, .stage_hunk);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expect(m.error_text.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, m.error_text, "rename") != null);
+}
+
+test "select_hunk followed by auto-refresh preserves anchor (Bug 1 e2e analog)" {
+    // select_hunk 後に diff_loaded が来ても validateAnchor が保持する。
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    try seedTwoHunkDiff(&m); // h0 本文 4-6
+    try m.setDiffOwner("f.txt", .unstaged); // 層 1 セットアップ
+    m.diff_cursor = 5;
+    var c1 = try update(&m, .select_hunk);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 4), m.diff_anchor);
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
+    // auto-refresh シミュレーション: 同じ diff で diff_loaded 再送
+    const same = try a.dupe(u8, m.diff_text);
+    defer a.free(same);
+    var c2 = try update(&m, .{ .diff_loaded = same });
+    c2.deinit(a);
+    // 層 1（owner 一致）+ 層 2（anchor=h0本文, cursor=同h0）で保持
+    try std.testing.expectEqual(@as(?usize, 4), m.diff_anchor);
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
 }
