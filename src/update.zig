@@ -154,7 +154,13 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         .select_line_at => |line| {
             model.focus = .diff;
             model.diff_cursor = line;
-            try clampCursor(model); // 本文外クリックはハンク本文へクランプ・anchor リセット
+            // ★マウスクリックは「明示的な選択解除」のセマンティクス。clampCursor が anchor を
+            //   保持するようになった（Bug 1 層 2 修正）ため、ここで明示的に clear しないと
+            //   クリックで選択が残る。ユーザー能動操作経路はここだけ clampCursor 経由で anchor を
+            //   clear する必要がある（key_down/up/select_index/diff_hunk_next/prev は arm 内で
+            //   直接 clear するため非依存）。
+            model.diff_anchor = null;
+            try clampCursor(model); // 本文外クリックはハンク本文へクランプ
             return .none;
         },
         .stage_lines => {
@@ -756,12 +762,12 @@ test "stage_lines guards: busy" {
     try std.testing.expect(c == .none);
 }
 
-test "diff_loaded clamps cursor into a hunk body and resets anchor" {
+test "diff_loaded clamps cursor into a hunk body and validates anchor" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
     m.diff_cursor = 999;
-    m.diff_anchor = 3;
+    m.diff_anchor = 3; // @@ ヘッダ行 (start_line==3) → isBodyLine=false → cond-a fail → null 化
     const diff = try a.dupe(u8, "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,1 +1,2 @@\n a\n+B\n");
     defer a.free(diff); // diff_loaded は setStr で複製するため呼び出し側が原本を解放（所有権規約）
     var cmd = try update(&m, .{ .diff_loaded = diff });
@@ -929,4 +935,22 @@ test "validateAnchor: anchor on body line in same hunk as cursor is kept (both p
     try std.testing.expectEqual(@as(?usize, 6), validateAnchor(parsed, 5, 6));
     // cursor=行6, anchor=行5 → 同 h0 本文 → 保持
     try std.testing.expectEqual(@as(?usize, 5), validateAnchor(parsed, 6, 5));
+}
+
+test "select_line_at still clears anchor after Bug 1 fix (regression)" {
+    // マウスクリックは明示的選択解除。clampCursor が anchor を保持するようになっても
+    // select_line_at 単独で anchor を clear する。同じハンク内へクリックしたケースで検証
+    // （異ハンクなら cond-b が消すため、同一ハンクのときだけ explicit clear が必須）。
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try seedTwoHunkDiff(&m); // h0 body 4,5,6
+    m.diff_cursor = 4;
+    m.diff_anchor = 5; // 選択あり（h0 内）
+    // 同じ h0 内の行6 へクリック（cond-b は pass してしまう → explicit clear が必須）
+    var cmd = try update(&m, .{ .select_line_at = 6 });
+    cmd.deinit(a);
+    try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
+    try std.testing.expect(m.focus == .diff);
+    try std.testing.expectEqual(@as(?usize, null), m.diff_anchor); // ★explicit clear が無いと残る
 }
