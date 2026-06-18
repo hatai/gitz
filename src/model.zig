@@ -138,6 +138,21 @@ pub const Model = struct {
         field.* = dup;
     }
 
+    /// diff_owner を置換する（旧を free して dup）。loadDiffCmd が呼ぶ（層 1）。
+    pub fn setDiffOwner(self: *Model, path: []const u8, section: status.Section) !void {
+        const a = self.allocator;
+        const new_path = try a.dupe(u8, path);
+        if (self.diff_owner) |old| a.free(old.path);
+        self.diff_owner = .{ .path = new_path, .section = section };
+    }
+
+    /// diff_owner をクリアする（ファイル一覧が空になった等）。純粋。
+    pub fn clearDiffOwner(self: *Model) void {
+        const a = self.allocator;
+        if (self.diff_owner) |old| a.free(old.path);
+        self.diff_owner = null;
+    }
+
     /// 表示順の section ランク（staged が先頭、untracked が末尾）。
     fn sectionRank(s: status.Section) u8 {
         return switch (s) {
@@ -275,5 +290,21 @@ test "Model.diff_owner starts null and survives init/deinit (Layer 1 field)" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
+    try std.testing.expectEqual(@as(?DiffOwner, null), m.diff_owner);
+}
+
+test "setDiffOwner replaces and clearDiffOwner frees (Layer 1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.setDiffOwner("f.txt", .unstaged);
+    try std.testing.expectEqualStrings("f.txt", m.diff_owner.?.path);
+    try std.testing.expectEqual(status.Section.unstaged, m.diff_owner.?.section);
+    // 上書き（旧を free して新へ）
+    try m.setDiffOwner("g.txt", .staged);
+    try std.testing.expectEqualStrings("g.txt", m.diff_owner.?.path);
+    try std.testing.expectEqual(status.Section.staged, m.diff_owner.?.section);
+    // クリア
+    m.clearDiffOwner();
     try std.testing.expectEqual(@as(?DiffOwner, null), m.diff_owner);
 }
