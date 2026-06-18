@@ -282,9 +282,11 @@ fn diffLineCount(text: []const u8) usize {
 fn loadDiffCmd(model: *Model) !AppCmd {
     if (model.files.items.len == 0) {
         try model.setStr(&model.diff_text, "");
+        model.clearDiffOwner(); // ファイル無し → diff_owner も無し（層 1）
         return .none;
     }
     const f = model.files.items[model.selected];
+    try model.setDiffOwner(f.path, f.section); // ★層 1: 発行時にオーナーを記録
     return .{ .load_diff = .{
         .path = try model.allocator.dupe(u8, f.path),
         .orig_path = if (f.orig_path) |p| try model.allocator.dupe(u8, p) else null,
@@ -739,4 +741,36 @@ test "select_line_at moves cursor, sets diff focus, clears anchor" {
     try std.testing.expectEqual(@as(usize, 9), m.diff_cursor);
     try std.testing.expect(m.focus == .diff);
     try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
+}
+
+test "loadDiffCmd records diff_owner for selected file (Layer 1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try addFile(&m, "f.txt", .unstaged);
+    // toggle_stage ではなく直接 status_loaded 経由で loadDiffCmd を起動する。
+    // 1件のファイル → selected=0 → loadDiffCmd が diff_owner を selected ファイルへ記録する。
+    // Msg.status_loaded は []StatusEntry（所有・mutable）なので var 配列から coerse する。
+    var e = [_]@import("git/status.zig").StatusEntry{
+        .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .unstaged },
+    };
+    defer for (e) |entry| a.free(entry.path);
+    var cmd = try update(&m, .{ .status_loaded = &e });
+    defer cmd.deinit(a); // load_diff を返す
+    // status_loaded → replaceFiles → loadDiffCmd で diff_owner が selected ファイルへ記録される
+    try std.testing.expect(m.diff_owner != null);
+    try std.testing.expectEqualStrings("f.txt", m.diff_owner.?.path);
+    try std.testing.expectEqual(@import("git/status.zig").Section.unstaged, m.diff_owner.?.section);
+}
+
+test "loadDiffCmd clears diff_owner when files empty (Layer 1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 手動で diff_owner を設定（ファイル無しの状態）
+    try m.setDiffOwner("stale.txt", .unstaged);
+    // status_loaded で空エントリ → replaceFiles で files 空 → loadDiffCmd で diff_owner クリア
+    var cmd = try update(&m, .{ .status_loaded = &.{} });
+    cmd.deinit(a); // .none を返す（ファイル無し）
+    try std.testing.expect(m.diff_owner == null);
 }
