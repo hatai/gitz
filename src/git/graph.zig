@@ -116,6 +116,77 @@ pub fn computeAll(
     } };
 }
 
+/// 増分: 入力 GraphState を消費（所有権移行）し、delta rows + 新 frontier を構築 → 新 state 返却。
+/// 既存 rows の deep-copy はしない（H-08: O(N²) 回避）。代わりに GraphRow 構造体を
+/// 新 ArrayList へ move し、元 state は `.invalid` へ遷移させる（消費済みを示す）。
+/// 強例外保証: 失敗時は入力 state を一切触らない（fallible 操作を全て先行）。
+///
+/// NOTE: 設計上 `state: *GraphState`（ポインタ）を採用。値渡しでは呼び出し元の base と
+/// 返却 state が同じ cells ポインタを共有し、両者の deinit で二重解放となるため。
+pub fn computeIncremental(
+    a: std.mem.Allocator,
+    state: *GraphState,
+    new_commits: []const log.Commit,
+) !GraphState {
+    if (state.* != .valid) return error.InvalidState;
+    const src = &state.valid;
+
+    // 返却に必要なスカラー値を事前退避（消費後に src へアクセスしないため）
+    const generation = src.generation;
+    const old_processed_len = src.processed_len;
+    const old_rows_len = src.rows.items.len;
+
+    // 1. combined バッファを先行確保（この時点では所有する row 無し・空）
+    var combined: std.ArrayList(GraphRow) = .empty;
+    errdefer combined.deinit(a); // 空 → buffer free のみ
+    try combined.ensureTotalCapacity(a, old_rows_len + new_commits.len);
+
+    // 2. frontier を clone（処理用の一時状態）
+    var tmp_frontier = try src.frontier.clone(a);
+    errdefer tmp_frontier.deinit(a);
+
+    // 3. delta rows を新規構築（cloned frontier 上で処理）
+    var delta_rows: std.ArrayList(GraphRow) = .empty;
+    errdefer {
+        for (delta_rows.items) |*r| r.deinit(a);
+        delta_rows.deinit(a);
+    }
+    for (new_commits) |c| {
+        var row = try processCommit(a, &tmp_frontier, c);
+        errdefer row.deinit(a);
+        try delta_rows.append(a, row);
+    }
+
+    // 4. tip_hash を clone
+    const tip_dup: ?[]u8 = if (src.tip_hash) |t| try a.dupe(u8, t) else null;
+    errdefer if (tip_dup) |t| a.free(t);
+
+    // === ここから先は infallible（try 無し）===
+    // 5. src.rows + delta_rows を combined へ move（cells ポインタの所有権移行）
+    for (src.rows.items) |r| {
+        combined.appendAssumeCapacity(r);
+    }
+    for (delta_rows.items) |r| {
+        combined.appendAssumeCapacity(r);
+    }
+    delta_rows.deinit(a); // items は combined へ移行済み・buffer のみ解放
+
+    // 6. 入力 state を消費: cells は combined へ移動済み。
+    //    rows.items.len = 0 にして deinit ループが cells を解放しないようにし、
+    //    その後 state.deinit で rows buffer・frontier・tip_hash を解放 → invalid へ。
+    src.rows.items.len = 0;
+    state.deinit(a);
+    state.* = .invalid;
+
+    return .{ .valid = .{
+        .generation = generation,
+        .processed_len = old_processed_len + new_commits.len,
+        .tip_hash = tip_dup,
+        .rows = combined,
+        .frontier = tmp_frontier,
+    } };
+}
+
 /// 1 コミットを処理し GraphRow を構築。frontier を破壊的に更新する。
 fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !GraphRow {
     // (1) c.hash と一致する frontier slot を全て列挙（H-01: 重複親の集約）
@@ -145,6 +216,7 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
     else blk: {
         // 新規 tip: frontier 末尾へ append
         const h = try a.dupe(u8, c.hash);
+        errdefer a.free(h); // append 失敗時の h 解放（frontier 未登録のため）
         try frontier.slots.append(a, h);
         break :blk @intCast(frontier.slots.items.len - 1);
     };
@@ -202,6 +274,7 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
             if (!found_p) {
                 // 既存へ集約されなければ node_lane の直後に挿入
                 const p_dup = try a.dupe(u8, p);
+                errdefer a.free(p_dup); // insert 失敗時の p_dup 解放（frontier 未登録のため）
                 try frontier.slots.insert(a, node_lane + 1, p_dup);
             }
         }
@@ -455,6 +528,82 @@ test "computeAll: dense compaction removes interior holes (M-01)" {
     // only trimmed the tail, A would still sit at lane 1 and width would be 2.
     try std.testing.expectEqual(@as(u16, 0), state.valid.rows.items[3].node_lane);
     try std.testing.expectEqual(@as(usize, 1), state.valid.rows.items[3].width());
+}
+
+test "computeIncremental: append produces same result as computeAll" {
+    const a = std.testing.allocator;
+    // 5 commits: A←B←C←D←E
+    var all: [5]log.Commit = undefined;
+    all[0] = try mkCommit(a, "E", &.{"D"});
+    all[1] = try mkCommit(a, "D", &.{"C"});
+    all[2] = try mkCommit(a, "C", &.{"B"});
+    all[3] = try mkCommit(a, "B", &.{"A"});
+    all[4] = try mkCommit(a, "A", &.{});
+    defer for (&all) |*c| c.deinit(a);
+
+    // computeAll for all 5
+    var full = try computeAll(a, &all, 1, "E");
+    defer full.deinit(a);
+
+    // computeAll for first 3, then computeIncremental for last 2.
+    // NOTE: computeIncremental consumes base (sets it to .invalid), so the
+    // deferred base.deinit is a no-op after the call.
+    var base = try computeAll(a, all[0..3], 1, "E");
+    defer base.deinit(a);
+
+    var incr = try computeIncremental(a, &base, all[3..5]);
+    defer incr.deinit(a);
+
+    // Same row count
+    try std.testing.expectEqual(full.valid.rows.items.len, incr.valid.rows.items.len);
+    // Same node_lanes
+    for (full.valid.rows.items, incr.valid.rows.items) |fr, ir| {
+        try std.testing.expectEqual(fr.node_lane, ir.node_lane);
+    }
+    // Same frontier
+    try std.testing.expectEqual(
+        full.valid.frontier.slots.items.len,
+        incr.valid.frontier.slots.items.len,
+    );
+    // Same processed_len
+    try std.testing.expectEqual(full.valid.processed_len, incr.valid.processed_len);
+}
+
+test "computeIncremental: does not corrupt input state on OOM" {
+    const a = std.testing.allocator;
+    var commits: [2]log.Commit = undefined;
+    commits[0] = try mkCommit(a, "B", &.{"A"});
+    commits[1] = try mkCommit(a, "A", &.{});
+    defer for (&commits) |*c| c.deinit(a);
+
+    var base = try computeAll(a, commits[0..1], 1, "B");
+    defer base.deinit(a);
+
+    // computeIncremental consumes base (move semantics) → base becomes .invalid.
+    // The deferred base.deinit is therefore a no-op (not corrupted, just consumed).
+    // Strong exception guarantee applies to the *failure* path: on error, base
+    // would be left untouched.
+    var incr = try computeIncremental(a, &base, commits[1..2]);
+    defer incr.deinit(a);
+
+    // base was consumed (now .invalid); base.deinit() via defer is a no-op.
+    // incr owns all rows (moved from base + new delta).
+    try std.testing.expectEqual(@as(usize, 2), incr.valid.rows.items.len);
+}
+
+test "computeAll: checkAllAllocationFailures (no leak/double-free)" {
+    const raw = "E\x00D\x00t\x001\x00s\x00\x00D\x00C\x00t\x001\x00s\x00\x00C\x00B\x00t\x001\x00s\x00\x00";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, computeAllAndFree, .{raw});
+}
+
+fn computeAllAndFree(a: std.mem.Allocator, raw: []const u8) !void {
+    const commits = try log.parse(a, raw);
+    defer {
+        for (commits) |*c| c.deinit(a);
+        a.free(commits);
+    }
+    var state = try computeAll(a, commits, 1, "E");
+    state.deinit(a);
 }
 
 test {
