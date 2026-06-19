@@ -61,7 +61,7 @@ pub fn logArgv(a: std.mem.Allocator, skip: usize, max_count: usize) ![]const []c
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(a);
     try list.appendSlice(a, &.{
-        "git", "-c", "core.quotePath=false", "log",
+        "git", "-c", "core.quotePath=false", "log", "--topo-order",
     });
     if (skip > 0) {
         const skip_arg = try std.fmt.allocPrint(a, "--skip={d}", .{skip});
@@ -77,6 +77,37 @@ pub fn logArgv(a: std.mem.Allocator, skip: usize, max_count: usize) ![]const []c
         "--decorate=short",
         "--no-color",
     });
+    return list.toOwnedSlice(a);
+}
+
+/// `git log --topo-order --skip=N --max-count=100 <tip_hash>` argv。
+/// ★H-06/H-07: paging 間で tip hash を固定し同一 snapshot を参照する。
+pub fn logPageArgv(
+    a: std.mem.Allocator,
+    skip: usize,
+    max_count: usize,
+    tip_hash: []const u8,
+) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(a);
+    try list.appendSlice(a, &.{
+        "git", "-c", "core.quotePath=false", "log", "--topo-order",
+    });
+    if (skip > 0) {
+        const skip_arg = try std.fmt.allocPrint(a, "--skip={d}", .{skip});
+        errdefer a.free(skip_arg);
+        try list.append(a, skip_arg);
+    }
+    const max_arg = try std.fmt.allocPrint(a, "--max-count={d}", .{max_count});
+    errdefer a.free(max_arg);
+    try list.append(a, max_arg);
+    try list.appendSlice(a, &.{
+        "--pretty=format:%H%x00%P%x00%an%x00%at%x00%s%x00%d",
+        "-z",
+        "--decorate=short",
+        "--no-color",
+    });
+    try list.append(a, tip_hash);
     return list.toOwnedSlice(a);
 }
 
@@ -372,6 +403,43 @@ test "logArgv: skip=100 includes --skip=100" {
     };
     try std.testing.expect(found_skip != null);
     try std.testing.expectEqualStrings("--skip=100", found_skip.?);
+}
+
+test "logArgv: includes --topo-order" {
+    const a = std.testing.allocator;
+    const argv = try logArgv(a, 0, 100);
+    defer {
+        for (argv) |arg| {
+            if (std.mem.startsWith(u8, arg, "--max-count=") or
+                std.mem.startsWith(u8, arg, "--skip=")) a.free(arg);
+        }
+        a.free(argv);
+    }
+    var has_topo = false;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--topo-order")) has_topo = true;
+    }
+    try std.testing.expect(has_topo);
+}
+
+test "logPageArgv: includes --topo-order, tip_hash last" {
+    const a = std.testing.allocator;
+    const argv = try logPageArgv(a, 100, 100, "abc123");
+    defer {
+        for (argv) |arg| {
+            if (std.mem.startsWith(u8, arg, "--max-count=") or
+                std.mem.startsWith(u8, arg, "--skip=")) a.free(arg);
+        }
+        a.free(argv);
+    }
+    // tip_hash is the last arg
+    try std.testing.expectEqualStrings("abc123", argv[argv.len - 1]);
+    // --topo-order present
+    var has_topo = false;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--topo-order")) has_topo = true;
+    }
+    try std.testing.expect(has_topo);
 }
 
 test "showNameStatusArgv: --diff-merges=first-parent --format= --name-status -z" {
