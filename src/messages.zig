@@ -47,7 +47,7 @@ pub const Msg = union(enum) {
     diff_loaded: []u8,
     // --- TODO 2 phase 1: log/detail 結果系（H1 構造体化） ---
     log_loaded: LogLoaded,
-    log_page_loaded: LogLoaded,
+    log_page_loaded: LogPageLoaded,
     log_page_failed: LogPageFailed,
     log_page_failed_silent: LogPageFailedSilent,
     commit_detail_loaded: CommitDetailLoaded,
@@ -59,6 +59,13 @@ pub const Msg = union(enum) {
         request_skip: usize,
         request_max_count: usize,
         request_generation: u64,
+        entries: []@import("git/log.zig").Commit,
+    };
+    pub const LogPageLoaded = struct {
+        request_skip: usize,
+        request_max_count: usize,
+        request_generation: u64,
+        request_tip: []u8, // 所有 — H-07: model.log_paging_tip と一致
         entries: []@import("git/log.zig").Commit,
     };
     pub const LogPageFailed = struct {
@@ -93,9 +100,14 @@ pub const Msg = union(enum) {
                 a.free(entries);
             },
             .diff_loaded => |s| a.free(s),
-            .log_loaded, .log_page_loaded => |ll| {
+            .log_loaded => |ll| {
                 for (ll.entries) |*c| c.deinit(a);
                 a.free(ll.entries);
+            },
+            .log_page_loaded => |lpl| {
+                a.free(lpl.request_tip);
+                for (lpl.entries) |*c| c.deinit(a);
+                a.free(lpl.entries);
             },
             .log_page_failed => |lpf| a.free(lpf.error_text),
             .log_page_failed_silent => {},
@@ -166,7 +178,7 @@ pub const AppCmd = union(enum) {
     apply_patch: ApplyPatch,
     // --- TODO 2 phase 1: log/detail 副作用 ---
     load_log: LoadLog,
-    load_log_page: LoadLog,
+    load_log_page: LoadLogPage,
     load_commit_detail: []u8,
     load_detail_diff: LoadDetailDiff,
     quit,
@@ -179,6 +191,12 @@ pub const AppCmd = union(enum) {
     /// デフォルト null 必須: 既存の8箇所の `.{ .patch=..., .reverse=... }` リテラル呼出を壊さないため。
     pub const ApplyPatch = struct { patch: []u8, reverse: bool, git_dir: ?[]const u8 = null };
     pub const LoadLog = struct { skip: usize, max_count: usize, generation: u64 };
+    pub const LoadLogPage = struct {
+        skip: usize,
+        max_count: usize,
+        generation: u64,
+        tip_hash: []u8, // 所有
+    };
     pub const LoadDetailDiff = struct { hash: []u8, path: []u8 };
 
     pub fn deinit(self: *AppCmd, a: std.mem.Allocator) void {
@@ -203,9 +221,11 @@ pub const AppCmd = union(enum) {
             .none,
             .refresh_status,
             .load_log,
-            .load_log_page,
             .quit,
             => {},
+            .load_log_page => |llp| {
+                a.free(llp.tip_hash);
+            },
             .load_commit_detail => |h| a.free(h),
             .load_detail_diff => |ldd| {
                 a.free(ldd.hash);
@@ -338,6 +358,28 @@ test "Msg.log_loaded deinit frees entries without leak" {
     msg.deinit(a);
 }
 
+test "Msg.log_page_loaded deinit frees request_tip and entries" {
+    const a = std.testing.allocator;
+    const log = @import("git/log.zig");
+    const entries = try a.alloc(log.Commit, 1);
+    entries[0] = .{
+        .hash = try a.dupe(u8, "h1"),
+        .parents = try a.alloc([]u8, 0),
+        .author = try a.dupe(u8, "a1"),
+        .epoch_sec = 1,
+        .subject = try a.dupe(u8, "s1"),
+        .refs = try a.dupe(u8, ""),
+    };
+    var msg = Msg{ .log_page_loaded = .{
+        .request_skip = 0,
+        .request_max_count = 100,
+        .request_generation = 1,
+        .request_tip = try a.dupe(u8, "tip123"),
+        .entries = entries,
+    } };
+    msg.deinit(a);
+}
+
 test "Msg.log_page_failed deinit frees error_text" {
     const a = std.testing.allocator;
     var msg = Msg{ .log_page_failed = .{
@@ -378,6 +420,17 @@ test "Msg.detail_diff_loaded deinit frees hash/path/text" {
 test "AppCmd.load_log has no owned payload (deinit is no-op)" {
     const a = std.testing.allocator;
     var cmd = AppCmd{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 1 } };
+    cmd.deinit(a);
+}
+
+test "AppCmd.load_log_page owns tip_hash and frees on deinit" {
+    const a = std.testing.allocator;
+    var cmd = AppCmd{ .load_log_page = .{
+        .skip = 0,
+        .max_count = 100,
+        .generation = 1,
+        .tip_hash = try a.dupe(u8, "tiphash"),
+    } };
     cmd.deinit(a);
 }
 
