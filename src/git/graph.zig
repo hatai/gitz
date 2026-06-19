@@ -361,6 +361,90 @@ test "computeAll: tip_hash is duplicated and owned" {
     try std.testing.expectEqualStrings("H", state.valid.tip_hash.?);
 }
 
+test "computeAll: branch (C←A, B←A, 2 lanes)" {
+    const a = std.testing.allocator;
+    // topo-order newest first: C, B, A
+    var commits: [3]log.Commit = undefined;
+    commits[0] = try mkCommit(a, "C", &.{"A"});
+    commits[1] = try mkCommit(a, "B", &.{"A"});
+    commits[2] = try mkCommit(a, "A", &.{});
+    defer for (&commits) |*c| c.deinit(a);
+
+    var state = try computeAll(a, &commits, 1, "C");
+    defer state.deinit(a);
+    const v = state.valid;
+
+    // Row 0 (C): lane 0, 1 column
+    try std.testing.expectEqual(@as(u16, 0), v.rows.items[0].node_lane);
+    try std.testing.expectEqual(@as(usize, 1), v.rows.items[0].width());
+
+    // Row 1 (B): lane 1 (new tip), B's parent A aggregates to existing lane 0
+    try std.testing.expectEqual(@as(u16, 1), v.rows.items[1].node_lane);
+    try std.testing.expectEqual(@as(usize, 2), v.rows.items[1].width());
+    // col 0: A coming from above + continuing down
+    try std.testing.expect(v.rows.items[1].cells[0].up);
+    try std.testing.expect(v.rows.items[1].cells[0].down);
+    // col 1: B node, up from new tip, left connection to col 0 (aggregation)
+    try std.testing.expect(v.rows.items[1].cells[1].is_node);
+    try std.testing.expect(v.rows.items[1].cells[1].left);
+
+    // Row 2 (A): lane 0 (compacted)
+    try std.testing.expectEqual(@as(u16, 0), v.rows.items[2].node_lane);
+    try std.testing.expectEqual(@as(usize, 1), v.rows.items[2].width());
+    try std.testing.expect(v.rows.items[2].cells[0].is_node);
+}
+
+test "computeAll: merge (D=merge(B,C), B←A, C←A)" {
+    const a = std.testing.allocator;
+    // topo-order: D, C, B, A
+    var commits: [4]log.Commit = undefined;
+    commits[0] = try mkCommit(a, "D", &.{ "B", "C" });
+    commits[1] = try mkCommit(a, "C", &.{"A"});
+    commits[2] = try mkCommit(a, "B", &.{"A"});
+    commits[3] = try mkCommit(a, "A", &.{});
+    defer for (&commits) |*c| c.deinit(a);
+
+    var state = try computeAll(a, &commits, 1, "D");
+    defer state.deinit(a);
+    const v = state.valid;
+
+    // Row 0 (D, merge): lane 0, parents B(lane0) + C(lane1 inserted)
+    try std.testing.expectEqual(@as(u16, 0), v.rows.items[0].node_lane);
+    try std.testing.expectEqual(@as(usize, 2), v.rows.items[0].width());
+    try std.testing.expect(v.rows.items[0].cells[0].is_node);
+    try std.testing.expect(v.rows.items[0].cells[0].down); // B continues
+    try std.testing.expect(v.rows.items[0].cells[1].down); // C continues
+
+    // Row 1 (C): lane 1
+    try std.testing.expectEqual(@as(u16, 1), v.rows.items[1].node_lane);
+
+    // Row 2 (B): lane 0, B's parent A aggregates with C's parent A (H-01)
+    try std.testing.expectEqual(@as(u16, 0), v.rows.items[2].node_lane);
+    // B connects horizontally to A's lane
+    try std.testing.expect(v.rows.items[2].cells[0].is_node);
+
+    // Row 3 (A): lane 0 (compacted)
+    try std.testing.expectEqual(@as(u16, 0), v.rows.items[3].node_lane);
+}
+
+test "computeAll: dense compaction removes interior holes (M-01)" {
+    const a = std.testing.allocator;
+    // A root, B←A, C←A, D=merge(B,C)
+    // After D: frontier=[B,C]. After C consumed: [B,A]. After B consumed+aggregated: [A].
+    // Interior hole at position 0 is removed by compaction.
+    var commits: [4]log.Commit = undefined;
+    commits[0] = try mkCommit(a, "D", &.{ "B", "C" });
+    commits[1] = try mkCommit(a, "C", &.{"A"});
+    commits[2] = try mkCommit(a, "B", &.{"A"});
+    commits[3] = try mkCommit(a, "A", &.{});
+    defer for (&commits) |*c| c.deinit(a);
+
+    var state = try computeAll(a, &commits, 1, "D");
+    defer state.deinit(a);
+    // After all processing, frontier should be empty (A is root)
+    try std.testing.expectEqual(@as(usize, 0), state.valid.frontier.slots.items.len);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
