@@ -240,7 +240,7 @@ fn reapWorker(app: *App) void {
 /// in-flight 操作と同様 reducer の busy ゲートで弾かれる（pending 上書きによる無音消失を防ぐ）。
 fn maybeAutoRefresh(app: *App) void {
     const now = nowMs(app);
-    if (!autorefresh.shouldAutoRefresh(now, app.last_auto_refresh_ms, auto_refresh_interval_ms, app.worker != null, app.pending != null)) return;
+    if (!autorefresh.shouldAutoRefresh(now, app.last_auto_refresh_ms, auto_refresh_interval_ms, app.worker != null, app.pending != null, app.model.view_mode)) return;
     app.last_auto_refresh_ms = now;
     dispatchSideEffect(app, .refresh_status);
 }
@@ -338,16 +338,18 @@ var g_click_state: input.ClickState = .{};
 
 fn handleKey(app: *App, program: *ProgramT, k: zz.KeyEvent) void {
     // commit フォーカス時: 編集キー（文字/Enter/Backspace/矢印）は TextArea が正本。
-    // keyToMsg はそれらに null を返すので、null かつ commit フォーカスなら TextArea へ委譲。
+    // keyToMsgForMode はそれらに null を返すので、null かつ changes モード + commit フォーカスなら
+    // TextArea へ委譲する（log モードに commit フォーカスは無い・M5 正規化で .changes へ戻る）。
     const abstract = input.fromZigzagKey(k);
     if (abstract) |key| {
-        if (input.keyToMsg(app.model.focus, key)) |m| {
+        if (input.keyToMsgForMode(app.model.view_mode, app.model.focus, app.model.detail_kind, key)) |m| {
             step(app, program, m);
             return;
         }
     }
-    // グローバル命令にならなかったキー。commit フォーカスなら TextArea で編集する。
-    if (app.model.focus == .commit) {
+    // グローバル命令にならなかったキー。changes モード + commit フォーカスなら TextArea で編集する。
+    // log モードでは commit フォーカスに遷移しない（M5・keyToMsgForLog が 'c' に null を返す）。
+    if (app.model.view_mode == .changes and app.model.focus == .commit) {
         app.textarea.handleKey(k);
         syncCommitText(app);
     }
@@ -355,16 +357,55 @@ fn handleKey(app: *App, program: *ProgramT, k: zz.KeyEvent) void {
 
 fn handleMouse(app: *App, program: *ProgramT, m: zz.MouseEvent) void {
     if (!app.model.mouse_enabled) return;
-    const layout = viewmod.computeLayout(g_program.context.width, g_program.context.height, 5);
-    // changesRowLayout 用の scratch（見出し3 + ファイル数）。arena ではなく一時スタック確保。
-    var scratch_buf: [256]viewmod.ChangesRow = undefined;
-    const need = app.model.files.items.len + 3;
-    const scratch: []viewmod.ChangesRow = if (need <= scratch_buf.len)
-        scratch_buf[0..need]
-    else
-        scratch_buf[0..];
-    const ev = input.fromZigzagMouse(m, &app.model, layout, &g_click_state, nowMs(app), scratch);
-    if (input.mouseToMsg(ev)) |msg| step(app, program, msg);
+    const w = g_program.context.width;
+    const h = g_program.context.height;
+    // changes/log 両モードの scratch をスタックに確保（使わない側は参照しない）。
+    var changes_scratch: [256]viewmod.ChangesRow = undefined;
+    var log_scratch: [256]viewmod.LogRow = undefined;
+    var detail_scratch: [256]viewmod.DetailRow = undefined;
+
+    // ViewMode 別にレイアウトを組み立て、対応する adapter へ委譲する（H7: 既存 fromZigzagMouse は変更しない）。
+    const ev = switch (app.model.view_mode) {
+        .changes => blk: {
+            const layout = viewmod.computeLayout(w, h, 5);
+            // changesRowLayout 用の scratch（見出し3 + ファイル数）。256 を超える場合は全体を使う。
+            const need = app.model.files.items.len + 3;
+            const scratch: []viewmod.ChangesRow = if (need <= changes_scratch.len)
+                changes_scratch[0..need]
+            else
+                changes_scratch[0..];
+            // log_mode 用の dummy layout/scratch（参照されないが型のために渡す）。
+            break :blk input.fromZigzagMouseForMode(
+                .changes,
+                m,
+                &app.model,
+                layout,
+                .{ .log = .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .detail = .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .status = .{ .x = 0, .y = 0, .w = 0, .h = 0 } },
+                &g_click_state,
+                nowMs(app),
+                scratch,
+                log_scratch[0..],
+                detail_scratch[0..],
+            );
+        },
+        .log => blk: {
+            const layout = viewmod.computeLogLayout(w, h);
+            // changes 用の dummy layout/scratch（参照されないが型のために渡す）。
+            break :blk input.fromZigzagMouseForMode(
+                .log,
+                m,
+                &app.model,
+                .{ .changes = .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .diff = .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .commit = .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .status = .{ .x = 0, .y = 0, .w = 0, .h = 0 } },
+                layout,
+                &g_click_state,
+                nowMs(app),
+                changes_scratch[0..],
+                log_scratch[0..],
+                detail_scratch[0..],
+            );
+        },
+    };
+    if (input.mouseToMsgForMode(app.model.view_mode, ev, app.model.detail_kind)) |msg| step(app, program, msg);
 }
 
 /// 初回 status を **start() 前に同期実行**して Model を埋める（first-frame の空表示を避ける）。

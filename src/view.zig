@@ -21,25 +21,60 @@ const Section = @import("git/status.zig").Section;
 pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
 pub const Layout = struct { changes: Rect, diff: Rect, commit: Rect, status: Rect };
 
+/// 共通ヘルパ（L3）: status 1 行確保・top の最低高さ 1・u16 clamp。
+/// changes/log 両モードのレイアウト計算で共有する（極小端末でも underflow しない）。
+/// 戻り値 `top_h` は status 以外の領域（changes モードなら changes+commit、log モードなら log+detail）。
+/// 呼び出し側は top_h を commit/log/detail の高さ配分に使う。
+fn computeTopAndStatus(w: u16, h: u16) struct { top_h: u16, status_h: u16 } {
+    _ = w;
+    const status_h: u16 = 1;
+    // status(1) + top(最低1) = 最低2行を確保（top の内訳は呼び出し側で更に clamp）。
+    const min_h: u16 = status_h + 1;
+    const hh = if (h < min_h) min_h else h;
+    return .{ .top_h = hh - status_h, .status_h = status_h };
+}
+
 /// 端末サイズから各ペインの矩形を決める純粋関数。
 /// 左 40% を Changes、右 60% を Diff、下部 commit_h 行を Commit、最下行を status。
 /// 極小端末でも underflow しないようにクランプする。
+/// ★L3: status/height の基本計算は `computeTopAndStatus` を基にしつつ、commit 最低 1 行を
+///   追加で保証する（changes モードは commit ペインが必須のため top 領域を更に commit と top で配分）。
 pub fn computeLayout(w: u16, h: u16, commit_h_req: u16) Layout {
+    // changes モードは status(1) + commit(最低1) + top(最低1) = 最低 3 行を確保する。
+    // computeTopAndStatus は status+top の最低 2 行しか保証しないため、ここで追加の clamp を行う。
     const status_h: u16 = 1;
-    // status(1) + commit(最低1) + top(最低1) = 最低3行を確保。
-    const min_h: u16 = status_h + 1 + 1;
+    const min_h: u16 = status_h + 1 + 1; // status + commit(最低1) + top(最低1) = 3
     const hh = if (h < min_h) min_h else h;
+    const top_total: u16 = hh - status_h; // commit + changes/diff 用の top 領域
     var commit_h = commit_h_req;
-    if (commit_h + status_h + 1 > hh) commit_h = hh - status_h - 1;
-    const top_h: u16 = hh - commit_h - status_h;
+    if (commit_h + 1 > top_total) commit_h = top_total - 1; // top 最低 1 行を残す
+    const top_h: u16 = top_total - commit_h;
     // u16 乗算のオーバーフロー回避のため u32 で計算してから戻す。
     const left_w: u16 = if (w == 0) 0 else @intCast(@as(u32, w) * 40 / 100);
     const right_w: u16 = w - left_w;
+    // status の y 座標は (top_h + commit_h) = top_total（hh - status_h と同義）。
     return .{
         .changes = .{ .x = 0, .y = 0, .w = left_w, .h = top_h },
         .diff = .{ .x = left_w, .y = 0, .w = right_w, .h = top_h },
         .commit = .{ .x = 0, .y = top_h, .w = w, .h = commit_h },
-        .status = .{ .x = 0, .y = hh - status_h, .w = w, .h = status_h },
+        .status = .{ .x = 0, .y = top_h + commit_h, .w = w, .h = status_h },
+    };
+}
+
+// --- TODO 2 phase 1: log モードのレイアウト（spec §3.3） ---
+
+/// log モードのレイアウト矩形。左 40% log、右 60% detail、下 status 1 行。
+pub const LogLayout = struct { log: Rect, detail: Rect, status: Rect };
+
+/// log モードのレイアウト（左 40% log、右 60% detail、下 status 1 行）。
+/// ★L3: `computeTopAndStatus` を共有し、極小端末でも underflow しない。
+pub fn computeLogLayout(w: u16, h: u16) LogLayout {
+    const ts = computeTopAndStatus(w, h);
+    const left_w: u16 = if (w == 0) 0 else @intCast(@as(u32, w) * 40 / 100);
+    return .{
+        .log = .{ .x = 0, .y = 0, .w = left_w, .h = ts.top_h },
+        .detail = .{ .x = left_w, .y = 0, .w = w - left_w, .h = ts.top_h },
+        .status = .{ .x = 0, .y = ts.top_h, .w = w, .h = ts.status_h },
     };
 }
 
@@ -79,6 +114,34 @@ fn renderFileLine(
 /// クリック行 row を `changesRowLayout` に通して `storage_index` を引けば
 /// `Msg.select_index` を正しく作れる（見出し行は null なので無視できる）。
 pub const ChangesRow = struct { section: Section, storage_index: ?usize };
+
+// --- TODO 2 phase 1: log/detail ペインの行レイアウト（spec §3.5・changesRowLayout と同型） ---
+
+/// log ペインの 1 行ぶんを表す。見出し行は無く全行がコミット行。`storage_index` は
+/// `model.log_commits.items` の添字。input.fromZigzagMouseForLog がクリック行→index 解決に使う。
+pub const LogRow = struct { storage_index: ?usize };
+
+/// detail ファイル一覧の 1 行ぶんを表す。`storage_index` は `model.detail_files.items` の添字。
+/// detail_kind == .files のときのみ意味を持つ（.diff では行数が変動するため未使用）。
+pub const DetailRow = struct { storage_index: ?usize };
+
+/// log ペインの表示行を列挙する純粋関数（見出し無し・全行がコミット行）。
+/// 描画とマウス当たり判定の双方が共有しズレを防ぐ（changesRowLayout と同契約）。
+/// row 配列を `out` に詰め、詰めた行数を返す（`out.len` で上限クランプ）。
+pub fn logRowLayout(model: *const Model, out: []LogRow) usize {
+    const n = @min(out.len, model.log_commits.items.len);
+    for (0..n) |i| out[i] = .{ .storage_index = i };
+    return n;
+}
+
+/// detail ファイル一覧の表示行を列挙する純粋関数。
+/// detail_kind != .files のときは 0（diff ビューでは行レイアウトを使わない）。
+pub fn detailRowLayout(model: *const Model, out: []DetailRow) usize {
+    if (model.detail_kind != .files) return 0;
+    const n = @min(out.len, model.detail_files.items.len);
+    for (0..n) |i| out[i] = .{ .storage_index = i };
+    return n;
+}
 
 /// Changes ペインの行レイアウト（見出し + ファイル行）を**純粋に**列挙する。
 /// 描画とマウス当たり判定の双方がこの 1 関数を共有することで、両者のズレを構造的に防ぐ。
@@ -298,6 +361,133 @@ fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
     return std.fmt.allocPrint(a, "{s}  {s}", .{ base, hint }) catch base;
 }
 
+// --- TODO 2 phase 1: log/detail ペインの描画（spec §3.6） ---
+//
+// log モードは読み取り専用。stage/選択ハイライトは持たない（commit 行だけ reverse で選択表示）。
+// detail は files/diff の 2 状態。files は `<status> <path>`（rename は `R old → new`）。
+// diff は `+`/`-` 色分けのみ（選択ハイライト・カーソルマーカー無し・changes の renderDiff とは別物）。
+// いずれも std.mem.join(a, "\n", ...) でプレーン改行結合し（★M9: zz.joinVertical は使わない）、
+// 最後に fitPane でペイン幅/高さへクランプする（changes と同一の fitPane gotcha 適用）。
+
+/// log ペインの描画。`<short-hash> <subject> <refs>` 形式（spec §3.6 / §5）。
+/// 選択行（`log_selected`）は reverse で強調。`log_scroll` からのウィンドウを描画し、
+/// 選択が可視範囲に入るよう `log_scroll` を調整する（changes の changes_scroll と同型・唯一の writer）。
+fn renderLog(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
+    const a = ctx.allocator;
+    if (model.log_commits.items.len == 0) return "(no commits)";
+
+    const limit: usize = if (height == 0) 1 else height;
+    const total = model.log_commits.items.len;
+
+    // 選択（格納 index == visual row・見出し無し）が可視範囲に入るよう log_scroll を更新（唯一の writer）。
+    model.log_scroll = ensureVisible(model.log_scroll, model.log_selected, limit);
+    // log_scroll が末尾超過にならないようクランプ（行数が減ったケース）。
+    if (model.log_scroll >= total) model.log_scroll = if (total == 0) 0 else total - 1;
+
+    var lines: std.ArrayList([]const u8) = .empty; // arena なので deinit 不要
+    const start = model.log_scroll;
+    const end = @min(total, start + limit);
+    for (model.log_commits.items[start..end], start..) |c, i| {
+        const selected = (i == model.log_selected);
+        const short_hash = if (c.hash.len >= 7) c.hash[0..7] else c.hash;
+        const line: []const u8 = if (c.refs.len > 0)
+            (std.fmt.allocPrint(a, "{s} {s} {s}", .{ short_hash, c.subject, c.refs }) catch short_hash)
+        else
+            (std.fmt.allocPrint(a, "{s} {s}", .{ short_hash, c.subject }) catch short_hash);
+        if (selected) {
+            const style = zz.Style{ .reverse_attr = true };
+            const styled = style.render(a, line) catch line;
+            lines.append(a, styled) catch {};
+        } else {
+            lines.append(a, line) catch {};
+        }
+    }
+    if (lines.items.len == 0) return "(no commits)";
+    // プレーン改行で結合（★M9: zz.joinVertical はパディングで短い行に "..." が付くため使わない）。
+    return std.mem.join(a, "\n", lines.items) catch "(log render error)";
+}
+
+/// detail ペインの描画。`detail_kind` で files/diff を切替（spec §3.6 / §4）。
+fn renderDetail(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
+    return switch (model.detail_kind) {
+        .files => renderDetailFiles(model, ctx, height),
+        .diff => renderDetailDiff(model, ctx, height),
+    };
+}
+
+/// detail ファイル一覧の描画。`<status> <path>`（rename は `R old → new`、copy は `C old => new`）。
+/// 選択行（`detail_selected`）は reverse で強調。`detail_scroll` からのウィンドウを描画し、
+/// 選択が可視範囲に入るよう `detail_scroll` を調整する（changes/log と同型・唯一の writer）。
+fn renderDetailFiles(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
+    const a = ctx.allocator;
+    if (model.detail_files.items.len == 0) return "(no files)";
+
+    const limit: usize = if (height == 0) 1 else height;
+    const total = model.detail_files.items.len;
+
+    model.detail_scroll = ensureVisible(model.detail_scroll, model.detail_selected, limit);
+    if (model.detail_scroll >= total) model.detail_scroll = if (total == 0) 0 else total - 1;
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    const start = model.detail_scroll;
+    const end = @min(total, start + limit);
+    for (model.detail_files.items[start..end], start..) |e, i| {
+        const selected = (i == model.detail_selected);
+        const line: []const u8 = switch (e.status) {
+            'R' => (std.fmt.allocPrint(a, "R {s} -> {s}", .{ e.orig_path orelse "?", e.path }) catch e.path),
+            'C' => (std.fmt.allocPrint(a, "C {s} => {s}", .{ e.orig_path orelse "?", e.path }) catch e.path),
+            else => (std.fmt.allocPrint(a, "{c} {s}", .{ e.status, e.path }) catch e.path),
+        };
+        if (selected) {
+            const style = zz.Style{ .reverse_attr = true };
+            const styled = style.render(a, line) catch line;
+            lines.append(a, styled) catch {};
+        } else {
+            lines.append(a, line) catch {};
+        }
+    }
+    if (lines.items.len == 0) return "(no files)";
+    return std.mem.join(a, "\n", lines.items) catch "(detail render error)";
+}
+
+/// detail diff の描画。`+`/`-` 色分けのみ（選択ハイライト・カーソルマーカー無し・読み取り専用）。
+/// `detail_diff_scroll` からのウィンドウを描画する。diff は changes の renderDiff とは別物
+///（log は読み取り専用で stage 対象ではないため selection/anchor/cursor を持たない）。
+fn renderDetailDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
+    const a = ctx.allocator;
+    if (model.detail_diff.len == 0) return "(no diff)";
+
+    const add_style = zz.Style{ .foreground = zz.Color.green };
+    const del_style = zz.Style{ .foreground = zz.Color.red };
+
+    const limit: usize = if (height == 0) 1 else height;
+
+    // 総行数（changes renderDiff と同じ計算・trailing newline で空トークンが増える点も同一）。
+    var total_lines: usize = 0;
+    {
+        var cit = std.mem.splitScalar(u8, model.detail_diff, '\n');
+        while (cit.next()) |_| total_lines += 1;
+    }
+    const scroll_off = clampScroll(model.detail_diff_scroll, total_lines);
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, model.detail_diff, '\n');
+    var idx: usize = 0;
+    while (it.next()) |line| : (idx += 1) {
+        if (idx < scroll_off) continue;
+        if (lines.items.len >= limit) break;
+        const styled: []const u8 = if (line.len > 0 and line[0] == '+')
+            (add_style.render(a, line) catch line)
+        else if (line.len > 0 and line[0] == '-')
+            (del_style.render(a, line) catch line)
+        else
+            line;
+        lines.append(a, styled) catch break;
+    }
+    if (lines.items.len == 0) return "";
+    return std.mem.join(a, "\n", lines.items) catch "(detail diff render error)";
+}
+
 /// 各ペインの内容を矩形 `r` のセル数に合わせて整形する。
 /// - 高さ: `r.h` 行を超える行は捨てる（行単位なので ANSI を壊さない）。
 /// - 幅: 各行を `r.w` 桁に**切り詰めてから** `zz.place.place` で `r.w` 桁に右パディングする。
@@ -347,14 +537,22 @@ fn fitPane(a: std.mem.Allocator, content: []const u8, r: Rect) []const u8 {
 /// すべての一時文字列は `ctx.allocator`（フレーム arena）で確保し、内部の `!` は catch で
 /// フォールバック文字列に落とす。Task 11 のランタイムがこれを `Model.view` から呼ぶ想定。
 ///
-/// spec §5 のレイアウト適用: `computeLayout` が返す 4 矩形（changes / diff / commit / status）を
-/// すべて `fitPane` で各ペインのセル数に整形してから結合する。これにより左 40% / 右 60% の
-/// 横分割と上段の高さが実際に enforce される（separator は不要 — 各ペインが自前の右パディングを
-/// 持つので join 時の隙間文字列を入れると合計幅が端末幅を超えて折り返す）。
-/// 幅は下限保証（`fitPane` の注記参照）。
-/// `model` は **`*Model`**（renderChanges が ensure-visible で `changes_scroll` を更新する唯一の
-/// writer のため）。他の render ヘルパは `*const Model` のままで coerce される。
+/// `view_mode` で分岐（spec §3.6）:
+/// - `.changes`: 既存 4 矩形（changes / diff / commit / status）。`renderChangesMode` へ抽出。
+/// - `.log`: log（左 40%）| detail（右 60%）の上段 + status（下 1 行）。`renderLogMode`。
+/// いずれも `fitPane` で各ペインをセル数に整形してから結合する（separator 無し・幅超過折り返し防止）。
+/// `model` は **`*Model`**（renderChanges/renderLog/renderDetailFiles が ensure-visible で
+/// 各 scroll フィールドを更新する唯一の writer たちのため）。
 pub fn render(model: *Model, ctx: *const zz.Context) []const u8 {
+    return switch (model.view_mode) {
+        .changes => renderChangesMode(model, ctx),
+        .log => renderLogMode(model, ctx),
+    };
+}
+
+/// changes モードの描画（既存の `render` 本体から抽出・spec §5 のレイアウト）。
+/// `computeLayout` の 4 矩形（changes / diff / commit / status）を `fitPane` で整形して結合する。
+fn renderChangesMode(model: *Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
     const layout = computeLayout(ctx.width, ctx.height, 5);
 
@@ -367,6 +565,22 @@ pub fn render(model: *Model, ctx: *const zz.Context) []const u8 {
     // 各ペインは fitPane で幅を確保済みなので separator は入れない（入れると幅超過で折り返す）。
     const top = zz.joinHorizontal(a, &.{ changes, diff }) catch changes;
     return zz.joinVertical(a, &.{ top, commit, status }) catch top;
+}
+
+/// log モードの描画（spec §3.6）。log（左 40%）| detail（右 60%）の上段 + status（下 1 行）。
+/// `computeLogLayout` の 3 矩形（log / detail / status）を `fitPane` で整形して結合する。
+/// commit ペインは持たない（log モードは読み取り専用・コミット編集は changes モードのみ）。
+fn renderLogMode(model: *Model, ctx: *const zz.Context) []const u8 {
+    const a = ctx.allocator;
+    const layout = computeLogLayout(ctx.width, ctx.height);
+
+    const log = fitPane(a, renderLog(model, ctx, layout.log.h), layout.log);
+    const detail = fitPane(a, renderDetail(model, ctx, layout.detail.h), layout.detail);
+    const status = fitPane(a, renderStatus(model, ctx), layout.status);
+
+    // 上段（Log | Detail）を横結合し、その下に Status を縦結合する（changes と同様に separator 無し）。
+    const top = zz.joinHorizontal(a, &.{ log, detail }) catch log;
+    return zz.joinVertical(a, &.{ top, status }) catch top;
 }
 
 test "ensureVisible scrolls to reveal selection above/below/within window" {
@@ -499,6 +713,196 @@ test "fitPane keeps short lines intact and only truncates long ones (no spurious
     const row1 = it.next().?;
     // 長い行は 20 桁に収まる（切り詰め）。
     try std.testing.expectEqual(@as(usize, 20), zz.width(row1));
+}
+
+// ====================== TODO 2 phase 1: log モードの純粋関数テスト ======================
+
+test "computeTopAndStatus reserves 1 status row and keeps top >= 1" {
+    // 通常サイズ: top_h = h - 1, status_h = 1。
+    const ts1 = computeTopAndStatus(100, 30);
+    try std.testing.expectEqual(@as(u16, 29), ts1.top_h);
+    try std.testing.expectEqual(@as(u16, 1), ts1.status_h);
+    // 極小 (h=1): min_h=2 へクランプ → top_h=1, status_h=1（top 最低 1 行を確保）。
+    const ts2 = computeTopAndStatus(10, 1);
+    try std.testing.expectEqual(@as(u16, 1), ts2.top_h);
+    try std.testing.expectEqual(@as(u16, 1), ts2.status_h);
+    // h=0: 同様に min_h=2 へ。
+    const ts3 = computeTopAndStatus(10, 0);
+    try std.testing.expectEqual(@as(u16, 1), ts3.top_h);
+    try std.testing.expectEqual(@as(u16, 1), ts3.status_h);
+}
+
+test "computeLayout still produces same rectangles after computeTopAndStatus refactor (regression)" {
+    // リファクタ前の既存テストと同一の期待値（回帰保護）。
+    const l = computeLayout(100, 30, 5);
+    try std.testing.expectEqual(@as(u16, 40), l.changes.w);
+    try std.testing.expectEqual(@as(u16, 60), l.diff.w);
+    try std.testing.expectEqual(@as(u16, 1), l.status.h);
+    try std.testing.expectEqual(@as(u16, 5), l.commit.h);
+    try std.testing.expectEqual(@as(u16, 24), l.changes.h); // top_h(29-5=24)
+    // status は最下行: y = top_h + commit_h = 24 + 5 = 29。
+    try std.testing.expectEqual(@as(u16, 29), l.status.y);
+    // changes と diff の合計幅 == w。
+    try std.testing.expectEqual(@as(u16, 100), @as(u16, l.changes.w + l.diff.w));
+    // 高さの合計 == hh（ここでは h=30）。
+    try std.testing.expectEqual(@as(u16, 30), @as(u16, l.changes.h + l.commit.h + l.status.h));
+}
+
+test "computeLayout clamps on tiny terminals without underflow (regression after refactor)" {
+    // h=1 でも top/commit/status がそれぞれ最低 1 行を確保（min_h=2 → hh=2 → top と status で配分）。
+    const l = computeLayout(10, 1, 5);
+    try std.testing.expect(l.changes.h >= 1);
+    try std.testing.expect(l.commit.h >= 1);
+    try std.testing.expectEqual(@as(u16, 1), l.status.h);
+}
+
+test "computeLogLayout splits width 40/60 with status row at bottom" {
+    const l = computeLogLayout(100, 30);
+    try std.testing.expectEqual(@as(u16, 40), l.log.w);
+    try std.testing.expectEqual(@as(u16, 60), l.detail.w);
+    try std.testing.expectEqual(@as(u16, 1), l.status.h);
+    // top_h = 29（status 1 行を引く）。
+    try std.testing.expectEqual(@as(u16, 29), l.log.h);
+    try std.testing.expectEqual(@as(u16, 29), l.detail.h);
+    // status は最下行。
+    try std.testing.expectEqual(@as(u16, 29), l.status.y);
+    // log と detail の合計幅 == w。
+    try std.testing.expectEqual(@as(u16, 100), @as(u16, l.log.w + l.detail.w));
+    // 高さの合計 == h。
+    try std.testing.expectEqual(@as(u16, 30), @as(u16, l.log.h + l.status.h));
+}
+
+test "computeLogLayout clamps on tiny terminals without underflow" {
+    // h=1: min_h=2 へクランプ → top_h=1, status_h=1。
+    const l = computeLogLayout(10, 1);
+    try std.testing.expect(l.log.h >= 1);
+    try std.testing.expect(l.detail.h >= 1);
+    try std.testing.expectEqual(@as(u16, 1), l.status.h);
+    try std.testing.expectEqual(@as(u16, 1), l.log.h); // top_h=1
+}
+
+test "computeLogLayout zero width yields zero pane widths" {
+    const l = computeLogLayout(0, 30);
+    try std.testing.expectEqual(@as(u16, 0), l.log.w);
+    // detail は w - left_w = 0 - 0 = 0。
+    try std.testing.expectEqual(@as(u16, 0), l.detail.w);
+}
+
+test "logRowLayout enumerates all commits as storage indices" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const log = @import("git/log.zig");
+    // 3 コミットを一度に組み立てて replaceLogCommits（deep-copy）へ渡す。
+    var commits: [3]log.Commit = undefined;
+    inline for ([_][]const u8{ "h1", "h2", "h3" }, 0..) |h, i| {
+        commits[i] = .{
+            .hash = try a.dupe(u8, h),
+            .parents = try a.alloc([]u8, 0),
+            .author = try a.dupe(u8, "a"),
+            .epoch_sec = 1,
+            .subject = try a.dupe(u8, "s"),
+            .refs = try a.dupe(u8, ""),
+        };
+    }
+    defer for (&commits) |*c| c.deinit(a);
+    try m.replaceLogCommits(&commits);
+
+    var buf: [16]LogRow = undefined;
+    const n = logRowLayout(&m, &buf);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(?usize, 0), buf[0].storage_index);
+    try std.testing.expectEqual(@as(?usize, 1), buf[1].storage_index);
+    try std.testing.expectEqual(@as(?usize, 2), buf[2].storage_index);
+}
+
+test "logRowLayout clamps to the provided output slice" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const log = @import("git/log.zig");
+    var commits: [5]log.Commit = undefined;
+    inline for ([_][]const u8{ "a", "b", "c", "d", "e" }, 0..) |h, i| {
+        commits[i] = .{
+            .hash = try a.dupe(u8, h),
+            .parents = try a.alloc([]u8, 0),
+            .author = try a.dupe(u8, "x"),
+            .epoch_sec = 1,
+            .subject = try a.dupe(u8, "s"),
+            .refs = try a.dupe(u8, ""),
+        };
+    }
+    defer for (&commits) |*c| c.deinit(a);
+    try m.replaceLogCommits(&commits);
+
+    var buf: [3]LogRow = undefined; // 3 件で打ち切り
+    const n = logRowLayout(&m, &buf);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(?usize, 0), buf[0].storage_index);
+    try std.testing.expectEqual(@as(?usize, 2), buf[2].storage_index);
+}
+
+test "logRowLayout on empty log returns 0" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var buf: [4]LogRow = undefined;
+    try std.testing.expectEqual(@as(usize, 0), logRowLayout(&m, &buf));
+}
+
+test "detailRowLayout enumerates files when detail_kind is files" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.detail_kind = .files;
+    const show = @import("git/show.zig");
+    var entries: [3]show.NameStatus = undefined;
+    entries[0] = .{ .status = 'M', .path = try a.dupe(u8, "f.txt"), .orig_path = null };
+    entries[1] = .{ .status = 'A', .path = try a.dupe(u8, "g.txt"), .orig_path = null };
+    entries[2] = .{ .status = 'D', .path = try a.dupe(u8, "h.txt"), .orig_path = null };
+    defer for (&entries) |*e| e.deinit(a);
+    try m.replaceDetailFiles(&entries);
+
+    var buf: [16]DetailRow = undefined;
+    const n = detailRowLayout(&m, &buf);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(?usize, 0), buf[0].storage_index);
+    try std.testing.expectEqual(@as(?usize, 1), buf[1].storage_index);
+    try std.testing.expectEqual(@as(?usize, 2), buf[2].storage_index);
+}
+
+test "detailRowLayout returns 0 when detail_kind is diff" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.detail_kind = .diff;
+    // files があっても .diff では 0 を返す（行レイアウトを使わない）。
+    const show = @import("git/show.zig");
+    var entries: [1]show.NameStatus = undefined;
+    entries[0] = .{ .status = 'M', .path = try a.dupe(u8, "f.txt"), .orig_path = null };
+    defer entries[0].deinit(a);
+    try m.replaceDetailFiles(&entries);
+
+    var buf: [4]DetailRow = undefined;
+    try std.testing.expectEqual(@as(usize, 0), detailRowLayout(&m, &buf));
+}
+
+test "detailRowLayout clamps to the provided output slice" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.detail_kind = .files;
+    const show = @import("git/show.zig");
+    var entries: [3]show.NameStatus = undefined;
+    entries[0] = .{ .status = 'M', .path = try a.dupe(u8, "a"), .orig_path = null };
+    entries[1] = .{ .status = 'M', .path = try a.dupe(u8, "b"), .orig_path = null };
+    entries[2] = .{ .status = 'M', .path = try a.dupe(u8, "c"), .orig_path = null };
+    defer for (&entries) |*e| e.deinit(a);
+    try m.replaceDetailFiles(&entries);
+
+    var buf: [2]DetailRow = undefined; // 2 件で打ち切り
+    const n = detailRowLayout(&m, &buf);
+    try std.testing.expectEqual(@as(usize, 2), n);
 }
 
 test {
