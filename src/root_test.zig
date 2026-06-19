@@ -18,4 +18,5 @@ test {
     _ = @import("diff/hunk.zig"); // 部分ステージング
     _ = @import("autorefresh.zig"); // 自動リフレッシュ
     _ = @import("git/log.zig"); // TODO 2 phase 1: log パーサ
+    _ = @import("git/show.zig"); // TODO 2 phase 1: show name-status パーサ
 }
