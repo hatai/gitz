@@ -2,6 +2,7 @@ const std = @import("std");
 const status = @import("git/status.zig");
 const log_mod = @import("git/log.zig");
 const show_mod = @import("git/show.zig");
+const graph_mod = @import("git/graph.zig");
 
 /// 最後に load_diff を発行したファイル識別子（層 1: codex B1 対策）。path のみで追跡すると
 /// partial stage で `? f` → `1 AM` 展開時の section 変化を取り逃がすため、section も持つ。
@@ -59,6 +60,10 @@ pub const Model = struct {
     detail_diff_owner_hash: ?[]u8,
     detail_diff_owner_path: ?[]u8,
 
+    // --- TODO 2 phase 2: graph display + paging tip ---
+    log_graph_state: graph_mod.GraphState,
+    log_paging_tip: ?[]u8,
+
     pub fn init(a: std.mem.Allocator, repo_root: []const u8) !Model {
         return .{
             .allocator = a,
@@ -98,6 +103,10 @@ pub const Model = struct {
             .detail_diff_scroll = 0,
             .detail_diff_owner_hash = null,
             .detail_diff_owner_path = null,
+
+            // --- TODO 2 phase 2: graph display + paging tip ---
+            .log_graph_state = .invalid,
+            .log_paging_tip = null,
         };
     }
 
@@ -126,6 +135,10 @@ pub const Model = struct {
         a.free(self.detail_diff);
         if (self.detail_diff_owner_hash) |h| a.free(h);
         if (self.detail_diff_owner_path) |p| a.free(p);
+
+        // --- TODO 2 phase 2 ---
+        self.log_graph_state.deinit(a);
+        if (self.log_paging_tip) |t| a.free(t);
     }
 
     /// files を新しいエントリ集合で置換。entries は**複製**する（借用しない）。entries 自体の所有権は
@@ -328,6 +341,30 @@ pub const Model = struct {
         const a = self.allocator;
         if (self.log_restore_hash) |old| a.free(old);
         self.log_restore_hash = null;
+    }
+
+    /// phase 2: log_graph_state を新規 state へ置換（旧を deinit）。
+    pub fn setLogGraphState(self: *Model, new_state: graph_mod.GraphState) void {
+        self.log_graph_state.deinit(self.allocator);
+        self.log_graph_state = new_state;
+    }
+    /// phase 2: log_graph_state を .invalid へ（旧を deinit）。
+    pub fn invalidateLogGraph(self: *Model) void {
+        self.log_graph_state.deinit(self.allocator);
+        self.log_graph_state = .invalid;
+    }
+    /// phase 2: log_paging_tip をセット（旧を free して dup）。
+    pub fn setLogPagingTip(self: *Model, hash: []const u8) !void {
+        const a = self.allocator;
+        const new = try a.dupe(u8, hash);
+        if (self.log_paging_tip) |old| a.free(old);
+        self.log_paging_tip = new;
+    }
+    /// phase 2: log_paging_tip をクリア。
+    pub fn clearLogPagingTip(self: *Model) void {
+        const a = self.allocator;
+        if (self.log_paging_tip) |old| a.free(old);
+        self.log_paging_tip = null;
     }
 
     /// 表示順の section ランク（staged が先頭、untracked が末尾）。
@@ -847,4 +884,24 @@ test "setLogRestoreHash / clearLogRestoreHash cycle without leak" {
     try std.testing.expectEqualStrings("h1", m.log_restore_hash.?);
     m.clearLogRestoreHash();
     try std.testing.expectEqual(@as(?[]u8, null), m.log_restore_hash);
+}
+
+// --- TODO 2 phase 2: graph state + paging tip helpers ---
+
+test "Model.log_graph_state initializes to .invalid" {
+    var m = try Model.init(std.testing.allocator, "/r");
+    defer m.deinit();
+    try std.testing.expect(m.log_graph_state == .invalid);
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_paging_tip);
+}
+
+test "setLogPagingTip / clearLogPagingTip cycle without leak" {
+    var m = try Model.init(std.testing.allocator, "/r");
+    defer m.deinit();
+    try m.setLogPagingTip("abc");
+    try std.testing.expectEqualStrings("abc", m.log_paging_tip.?);
+    try m.setLogPagingTip("def");
+    try std.testing.expectEqualStrings("def", m.log_paging_tip.?);
+    m.clearLogPagingTip();
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_paging_tip);
 }
