@@ -19,4 +19,5 @@ test {
     _ = @import("autorefresh.zig"); // 自動リフレッシュ
     _ = @import("git/log.zig"); // TODO 2 phase 1: log パーサ
     _ = @import("git/show.zig"); // TODO 2 phase 1: show name-status パーサ
+    _ = @import("git/graph.zig"); // TODO 2 phase 2: グラフレーン割当
 }
