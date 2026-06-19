@@ -146,7 +146,7 @@ fn workerRun(app: *App, cmd_in: AppCmd) void {
 fn isMutating(cmd: AppCmd) bool {
     return switch (cmd) {
         .stage, .unstage, .commit, .apply_patch => true,
-        .none, .quit, .refresh_status, .load_diff => false,
+        .none, .quit, .refresh_status, .load_diff, .load_log, .load_log_page, .load_commit_detail, .load_detail_diff => false,
     };
 }
 
@@ -182,7 +182,7 @@ fn applyAppCmd(app: *App, program: anytype, cmd: AppCmd) void {
     switch (cmd) {
         .none => {},
         .quit => program.quit(),
-        .refresh_status, .stage, .unstage, .load_diff, .commit, .apply_patch => dispatchSideEffect(app, cmd),
+        .refresh_status, .stage, .unstage, .load_diff, .commit, .apply_patch, .load_log, .load_log_page, .load_commit_detail, .load_detail_diff => dispatchSideEffect(app, cmd),
     }
 }
 
@@ -379,7 +379,7 @@ fn seedInitialStatus(app: *App) void {
     first.deinit(app.gpa);
     defer cmd1.deinit(app.gpa);
     switch (cmd1) {
-        .load_diff, .stage, .unstage, .commit, .refresh_status => {
+        .load_diff, .stage, .unstage, .commit, .refresh_status, .load_log, .load_log_page, .load_commit_detail, .load_detail_diff => {
             var second = appcmd.run(app.gpa, app.io, app.cwd, cmd1) catch return;
             var cmd2 = update.update(&app.model, second) catch {
                 second.deinit(app.gpa);

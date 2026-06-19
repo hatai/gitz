@@ -4,6 +4,8 @@
 const std = @import("std");
 const Model = @import("model.zig").Model;
 const Focus = @import("model.zig").Focus;
+const ViewMode = @import("model.zig").ViewMode;
+const DetailKind = @import("model.zig").DetailKind;
 const msgs = @import("messages.zig");
 const Msg = msgs.Msg;
 const AppCmd = msgs.AppCmd;
@@ -76,7 +78,12 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             // staged なら unstage、それ以外（unstaged/untracked）は stage
             return if (f.section == .staged) .{ .unstage = op } else .{ .stage = op };
         },
-        .request_refresh => return .refresh_status,
+        .request_refresh => {
+            // log モード時は M11/R3/R4: generation 更新 + 状態クリア + log_restore_hash 退避 → load_log 発火。
+            // changes モード時は従来どおり refresh_status。
+            if (model.view_mode == .log) return try handleRequestRefreshLog(model);
+            return .refresh_status;
+        },
         .request_commit => {
             // busy 中（直前の副作用が実行中）の Ctrl+S は無視する。二重コミットを防ぐ（基準7/UX）。
             if (model.busy) return .none;
@@ -252,36 +259,361 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             try model.setStr(&model.commit_message, "");
             return .refresh_status;
         },
-        // --- TODO 2 phase 1: log/detail の Msg バリアント（スタブ・後続タスクで実装） ---
-        // 入力系・結果系ともに Model 変更・副作用なしの no-op。バリアント追加のみを先行し、
-        // update.zig の reducer ロジックは別タスクで実装する（exhaustive switch を通すための最小スタブ）。
-        .toggle_view_mode,
-        .log_cursor_down,
-        .log_cursor_up,
-        .log_open_detail,
-        .log_scroll_down,
-        .log_scroll_up,
-        .detail_cursor_down,
-        .detail_cursor_up,
-        .detail_select_file,
-        .detail_back_to_files,
-        .detail_files_scroll_down,
-        .detail_files_scroll_up,
-        .detail_diff_scroll_down,
-        .detail_diff_scroll_up,
-        .log_select_index,
-        .detail_select_index,
-        .log_loaded,
-        .log_page_loaded,
-        .log_page_failed,
-        .log_page_failed_silent,
-        .commit_detail_loaded,
-        .detail_diff_loaded,
-        => return .none,
+        // --- TODO 2 phase 1: log/detail の reducer arms（spec §1.6 権威） ---
+        .toggle_view_mode => return try handleToggleViewMode(model),
+        .log_cursor_down => return try handleLogCursorDown(model),
+        .log_cursor_up => return try handleLogCursorUp(model),
+        .log_open_detail => return try handleLogOpenDetail(model),
+        .log_scroll_down => {
+            // ★R13: scroll は page と無関係・R18 ゲート不要。len 以下へクランプ。
+            if (model.log_scroll < model.log_commits.items.len) model.log_scroll += 1;
+            return .none;
+        },
+        .log_scroll_up => {
+            if (model.log_scroll > 0) model.log_scroll -= 1;
+            return .none;
+        },
+        .detail_cursor_down => {
+            // R2 空 guard。R18 ゲート不要（detail 内移動は log page と無関係）。
+            if (model.detail_files.items.len == 0) return .none;
+            if (model.detail_selected + 1 < model.detail_files.items.len) model.detail_selected += 1;
+            return .none;
+        },
+        .detail_cursor_up => {
+            if (model.detail_files.items.len == 0) return .none;
+            if (model.detail_selected > 0) model.detail_selected -= 1;
+            return .none;
+        },
+        .detail_select_file => return try handleDetailSelectFile(model),
+        .detail_back_to_files => {
+            // L4: 純粋な state 切替・R18 ゲート不要。
+            model.detail_kind = .files;
+            try model.setStr(&model.detail_diff, "");
+            model.detail_diff_scroll = 0;
+            model.clearDetailDiffOwner();
+            return .none;
+        },
+        .detail_files_scroll_down => {
+            if (model.detail_scroll < model.detail_files.items.len) model.detail_scroll += 1;
+            return .none;
+        },
+        .detail_files_scroll_up => {
+            if (model.detail_scroll > 0) model.detail_scroll -= 1;
+            return .none;
+        },
+        .detail_diff_scroll_down => {
+            // ★R13: detail_diff 行数未満へクランプ。空 diff は no-op（underflow 防止）。
+            const total = diffLineCount(model.detail_diff);
+            if (total == 0) return .none;
+            if (model.detail_diff_scroll < total - 1) model.detail_diff_scroll += 1;
+            return .none;
+        },
+        .detail_diff_scroll_up => {
+            if (model.detail_diff_scroll > 0) model.detail_diff_scroll -= 1;
+            return .none;
+        },
+        .log_select_index => |i| return try handleLogSelectIndex(model, i),
+        .detail_select_index => |i| return try handleDetailSelectIndex(model, i),
+
+        // --- 結果系 arms（R3 view_mode 検証 + H1 stale reject）---
+        .log_loaded => |ll| return try handleLogLoaded(model, ll),
+        .log_page_loaded => |ll| return try handleLogPageLoaded(model, ll),
+        .log_page_failed => |lpf| return try handleLogPageFailed(model, lpf.request_generation, lpf.request_skip, lpf.error_text),
+        .log_page_failed_silent => |lpfs| return try handleLogPageFailedSilent(model, lpfs.request_generation, lpfs.request_skip),
+        .commit_detail_loaded => |cdl| return try handleCommitDetailLoaded(model, cdl),
+        .detail_diff_loaded => |ddl| return try handleDetailDiffLoaded(model, ddl),
     }
 }
 
-/// model.diff_owner（最後に load_diff を発行したファイル）が現在の selected ファイルと一致するか。
+// =============================================================================
+// TODO 2 phase 1: log/detail reducer arms（spec §1.6 権威・純粋・allocator 不要なら除く）
+// =============================================================================
+
+/// R2 空 guard: log_commits が空のとき detail 系状態を消去して `.none` を返す。
+/// log_cursor_*/log_open_detail/log_select_index の先頭で使う（items[0]/len-1 panic 回避）。
+/// 純粋。戻り値: 空なら true（呼び出し元は return .none すること）。
+fn logEmptyGuard(model: *Model) !bool {
+    if (model.log_commits.items.len == 0) {
+        model.clearDetailOwner();
+        try model.replaceDetailFiles(&.{});
+        try model.setStr(&model.detail_diff, "");
+        return true;
+    }
+    return false;
+}
+
+/// M5/R3: `toggle_view_mode` arm。changes→log で generation 更新＋log 初期化＋load_log 発火。
+/// log→changes で generation 更新（遅延結果の無効化）＋refresh_status。
+fn handleToggleViewMode(model: *Model) !AppCmd {
+    switch (model.view_mode) {
+        .changes => {
+            model.view_mode = .log;
+            model.focus = .changes; // ★M5 正規化（.commit から入っても .changes へ）
+            model.log_request_generation += 1; // ★R3: 以前の遅延結果を無効化
+            model.log_page_requested = null;
+            model.log_has_more = false;
+            model.clearDetailOwner();
+            model.clearDetailDiffOwner();
+            try model.replaceDetailFiles(&.{});
+            try model.setStr(&model.detail_diff, "");
+            return .{ .load_log = .{
+                .skip = 0,
+                .max_count = 100,
+                .generation = model.log_request_generation,
+            } };
+        },
+        .log => {
+            model.view_mode = .changes;
+            model.focus = .changes; // ★M5: 復元しない・固定
+            model.log_request_generation += 1; // ★R3: 遅延 log 系結果を全て stale 化
+            model.log_page_requested = null;
+            return .refresh_status;
+        },
+    }
+}
+
+/// M1/R2/R17/R18: `log_cursor_down` arm。
+/// - R2 空 guard → no-op。
+/// - log_selected を末尾まで動かす。
+/// - R17 paging trigger（has_more & 無要求 & len>=5 & selected>=len-5）→ load_log_page。
+/// - R18 pending ゲート（page in-flight）→ .none（page 完了で log_page_loaded arm が detail 再発火）。
+/// - それ以外 → setDetailOwnerHash + load_commit_detail（★R16 payload-first）。
+fn handleLogCursorDown(model: *Model) !AppCmd {
+    if (try logEmptyGuard(model)) return .none;
+    const len = model.log_commits.items.len;
+    if (model.log_selected + 1 < len) model.log_selected += 1;
+    // ★R17 underflow 対策: len >= 5 を条件へ含めて len-5 の underflow を防ぐ。
+    if (model.log_has_more and model.log_page_requested == null and len >= 5 and model.log_selected >= len - 5) {
+        model.log_page_requested = len; // ★R11: 期待 skip を保持
+        return .{ .load_log_page = .{
+            .skip = len,
+            .max_count = 100,
+            .generation = model.log_request_generation,
+        } };
+    }
+    // ★R18: page in-flight 中は load_commit_detail を発火しない（page 完了で自動発火）。
+    if (model.log_page_requested != null) return .none;
+    return try loadCommitDetailForSelection(model);
+}
+
+/// R2/R18: `log_cursor_up` arm。selected を減らし setDetailOwnerHash + load_commit_detail。
+fn handleLogCursorUp(model: *Model) !AppCmd {
+    if (try logEmptyGuard(model)) return .none;
+    // ★R18: page in-flight 中は .none（page 完了で log_page_loaded arm が発火）。
+    if (model.log_page_requested != null) return .none;
+    if (model.log_selected > 0) model.log_selected -= 1;
+    return try loadCommitDetailForSelection(model);
+}
+
+/// R2/R18: `log_open_detail` arm。現在選択 hash で明示的 detail 再取得。
+fn handleLogOpenDetail(model: *Model) !AppCmd {
+    if (try logEmptyGuard(model)) return .none;
+    if (model.log_page_requested != null) return .none; // ★R18
+    return try loadCommitDetailForSelection(model);
+}
+
+/// 現在の log_selected の hash を使って setDetailOwnerHash + load_commit_detail を発行する共通ヘルパ。
+/// ★R16 payload-first: dupe 成功後に setDetailOwnerHash（OOM で owner が更新されるが cmd が返らない
+///   「意味論不一致」を避ける）。呼び出し側で log_commits 非空・page 非in-flight を保証すること。
+fn loadCommitDetailForSelection(model: *Model) !AppCmd {
+    const hash = model.log_commits.items[model.log_selected].hash;
+    const hash_dup = try model.allocator.dupe(u8, hash);
+    errdefer model.allocator.free(hash_dup);
+    try model.setDetailOwnerHash(hash); // ★R16: payload 構築成功後に owner 記録
+    return .{ .load_commit_detail = hash_dup };
+}
+
+/// R2/R16/R18: `detail_select_file` arm。.files → .diff へ移行し load_detail_diff を発火。
+/// ★R16 payload-first: hash/path の dupe を先に（errdefer）、成功後に setDetailDiffOwner。
+fn handleDetailSelectFile(model: *Model) !AppCmd {
+    if (model.detail_files.items.len == 0) return .none; // R2
+    if (model.log_page_requested != null) return .none; // ★R18: page 中は diff 表示を遅延
+    // ★R16: payload を先に構築（hash と path を dupe・errdefer でリークガード）。
+    const hash_dup = try model.allocator.dupe(u8, model.log_commits.items[model.log_selected].hash);
+    errdefer model.allocator.free(hash_dup);
+    const path_dup = try model.allocator.dupe(u8, model.detail_files.items[model.detail_selected].path);
+    errdefer model.allocator.free(path_dup);
+    // 成功後: state 更新 + cmd 発行（所有権移譲）。
+    model.detail_kind = .diff;
+    try model.setDetailDiffOwner(hash_dup, path_dup); // 内部で dup するので hash_dup/path_dup を消費しない
+    model.detail_diff_scroll = 0;
+    // hash_dup/path_dup は load_detail_diff の所有へ。setDetailDiffOwner は別に dup 済み。
+    return .{ .load_detail_diff = .{ .hash = hash_dup, .path = path_dup } };
+}
+
+/// R2/R14/R18: `log_select_index: |i|` arm。マウスクリックで選択移動＋focus=.changes。
+/// 範囲内なら log_selected=i へ。その後 detail 再ロード経路へ（page 中は focus のみ更新）。
+fn handleLogSelectIndex(model: *Model, i: usize) !AppCmd {
+    if (try logEmptyGuard(model)) return .none;
+    // ★R18: page in-flight 中は選択と focus だけ更新し detail ロードは page 完了後へ遅延。
+    if (model.log_page_requested != null) {
+        if (i < model.log_commits.items.len) model.log_selected = i;
+        model.focus = .changes; // ★R14: クリックで left ペインへフォーカス
+        return .none;
+    }
+    if (i < model.log_commits.items.len) model.log_selected = i;
+    model.focus = .changes; // ★R14
+    return try loadCommitDetailForSelection(model);
+}
+
+/// R14: `detail_select_index: |i|` arm。.files 中ならファイル選択＋focus=.diff。.diff 中は無視。
+fn handleDetailSelectIndex(model: *Model, i: usize) !AppCmd {
+    if (model.detail_kind == .files and i < model.detail_files.items.len) {
+        model.detail_selected = i;
+        model.focus = .diff; // ★R14: クリックで right ペインへフォーカス
+    }
+    // detail_kind == .diff のときは無視（diff 中はマウスクリックでファイル移動しない）。
+    return .none;
+}
+
+/// M11/R3/R4: `request_refresh` arm（log モード時）。generation 更新＋状態クリア＋restore hash 退避。
+fn handleRequestRefreshLog(model: *Model) !AppCmd {
+    model.log_request_generation += 1; // ★R3
+    model.log_page_requested = null;
+    model.log_has_more = false;
+    // ★R4: 選択 hash を refresh 前に退避（空なら clear）。
+    if (model.log_commits.items.len > 0) {
+        try model.setLogRestoreHash(model.log_commits.items[model.log_selected].hash);
+    } else {
+        model.clearLogRestoreHash();
+    }
+    try model.replaceLogCommits(&.{}); // 一旦空へ
+    model.clearDetailOwner();
+    try model.replaceDetailFiles(&.{});
+    try model.setStr(&model.detail_diff, "");
+    model.detail_kind = .files;
+    return .{ .load_log = .{
+        .skip = 0,
+        .max_count = 100,
+        .generation = model.log_request_generation,
+    } };
+}
+
+// =============================================================================
+// 結果系 arms（H1 stale reject + R3 view_mode 検証）
+// =============================================================================
+
+/// R3: log モード外の結果は stale（mode 切替前の遅延）→ `.none`。
+/// 全 log/detail 結果 arm の先頭で呼ぶ。
+fn inLogMode(model: *const Model) bool {
+    return model.view_mode == .log;
+}
+
+/// H1: optional string 同士の一致判定（detail_owner_hash vs request_hash 等）。
+/// どちらかが null、または slice 内容不一致で false。
+fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
+    const aa = a orelse return b == null;
+    const bb = b orelse return false;
+    return std.mem.eql(u8, aa, bb);
+}
+
+/// H1/H3/M3/R4: `log_loaded` arm（初回ロード結果）。
+/// - stale reject: view_mode / generation / skip==0 のいずれか不一致で破棄。
+/// - 適用: replaceLogCommits → R4 restore hash で選択復元 → log_has_more 設定 → R2 空 guard →
+///   setDetailOwnerHash + load_commit_detail。
+fn handleLogLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
+    // ★R3/H1: stale reject。
+    if (!inLogMode(model)) return .none;
+    if (ll.request_generation != model.log_request_generation) return .none;
+    if (ll.request_skip != 0) return .none;
+    try model.replaceLogCommits(ll.entries);
+    // ★R4: 退避 hash があれば選択を hash 一致で復元（無ければ 0）。
+    if (model.log_restore_hash) |h| {
+        var found: ?usize = null;
+        for (model.log_commits.items, 0..) |c, idx| {
+            if (std.mem.eql(u8, c.hash, h)) {
+                found = idx;
+                break;
+            }
+        }
+        model.log_selected = found orelse 0;
+        model.clearLogRestoreHash();
+    } else {
+        model.log_selected = 0;
+    }
+    // M3: log_has_more = (entries.len >= request_max_count)
+    model.log_has_more = ll.entries.len >= ll.request_max_count;
+    model.log_page_requested = null;
+    model.detail_kind = .files;
+    // R2 空 guard。
+    if (model.log_commits.items.len == 0) {
+        model.clearDetailOwner();
+        try model.replaceDetailFiles(&.{});
+        return .none;
+    }
+    return try loadCommitDetailForSelection(model);
+}
+
+/// H1/H3/M3/R10/R11/R22: `log_page_loaded` arm（追加ページ結果）。
+/// - stale reject: view_mode / generation / skip==log_page_requested のいずれか不一致で破棄。
+/// - ★R22: log_page_requested を appendLogCommits の**前に** null 化（OOM でも paging 再試行可能）。
+/// - R10: 非空なら load_commit_detail で選択/detail 整合性を回復。
+fn handleLogPageLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
+    // ★R3/H1/R11: stale reject（期待 skip は model.log_page_requested と照合）。
+    if (!inLogMode(model)) return .none;
+    if (ll.request_generation != model.log_request_generation) return .none;
+    const expected_skip = model.log_page_requested orelse return .none; // 既に別経路で消化済み
+    if (ll.request_skip != expected_skip) return .none;
+    // ★R22: appendLogCommits の前に page_requested を null 化（OOM で reducer が error return
+    //   しても page_requested は既に null・次回 down で再試行可能）。
+    model.log_page_requested = null;
+    try model.appendLogCommits(ll.entries);
+    model.log_has_more = ll.entries.len >= ll.request_max_count;
+    // ★R10: 選択が存在すれば load_commit_detail で選択/detail 整合性を回復。
+    if (model.log_commits.items.len == 0) return .none;
+    return try loadCommitDetailForSelection(model);
+}
+
+/// H2/R7/R11: `log_page_failed` arm。page_requested を下ろし error_text を設定。
+fn handleLogPageFailed(model: *Model, request_generation: u64, request_skip: usize, error_text: []const u8) !AppCmd {
+    if (!inLogMode(model)) return .none;
+    if (request_generation != model.log_request_generation) return .none;
+    // ★R11: page_requested が既に別 skip に切り替わっていれば破棄（一致時のみ処理）。
+    if (model.log_page_requested) |rp| {
+        if (request_skip != rp) return .none;
+    } else {
+        // page_requested が null のときは既に消化済みかキャンセル済み → 破棄。
+        return .none;
+    }
+    model.log_page_requested = null;
+    try model.setStr(&model.error_text, error_text);
+    return .none;
+}
+
+/// R21: `log_page_failed_silent` arm。log_page_failed と同じだが error_text 設定なし。
+fn handleLogPageFailedSilent(model: *Model, request_generation: u64, request_skip: usize) !AppCmd {
+    if (!inLogMode(model)) return .none;
+    if (request_generation != model.log_request_generation) return .none;
+    if (model.log_page_requested) |rp| {
+        if (request_skip != rp) return .none;
+    } else {
+        return .none;
+    }
+    model.log_page_requested = null;
+    return .none;
+}
+
+/// H1/R3: `commit_detail_loaded` arm。detail_owner_hash 一致判定で stale reject。
+fn handleCommitDetailLoaded(model: *Model, cdl: msgs.Msg.CommitDetailLoaded) !AppCmd {
+    if (!inLogMode(model)) return .none;
+    if (!optEql(model.detail_owner_hash, cdl.request_hash)) return .none;
+    try model.replaceDetailFiles(cdl.entries);
+    model.detail_selected = 0;
+    model.detail_kind = .files;
+    return .none;
+}
+
+/// H1/R3: `detail_diff_loaded` arm。detail_diff_owner hash/path 二重一致で stale reject。
+fn handleDetailDiffLoaded(model: *Model, ddl: msgs.Msg.DetailDiffLoaded) !AppCmd {
+    if (!inLogMode(model)) return .none;
+    if (!optEql(model.detail_diff_owner_hash, ddl.request_hash)) return .none;
+    if (!optEql(model.detail_diff_owner_path, ddl.request_path)) return .none;
+    try model.setStr(&model.detail_diff, ddl.text);
+    model.detail_diff_scroll = 0;
+    return .none;
+}
+
+
 /// 一致しない（ファイル切替・外部プロセスで selected が別へクランプ・初回ロード前）は false。
 /// 純粋・allocator 不要。層 1（codex B1 対策）。
 fn isDiffOwnerCurrent(model: *const Model) bool {
@@ -1213,4 +1545,1099 @@ test "select_hunk followed by auto-refresh preserves anchor (Bug 1 e2e analog)" 
     // 層 1（owner 一致）+ 層 2（anchor=h0本文, cursor=同h0）で保持
     try std.testing.expectEqual(@as(?usize, 4), m.diff_anchor);
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
+}
+
+// =============================================================================
+// TODO 2 phase 1: log/detail reducer arm テスト（spec §1.6 権威）
+// =============================================================================
+
+const log_mod = @import("git/log.zig");
+const show_mod = @import("git/show.zig");
+
+/// テスト用 Commit を構築（全フィールド dup・呼び出し側が c.deinit(a) で解放）。
+fn mkCommit(a: std.mem.Allocator, hash: []const u8, subject: []const u8) !log_mod.Commit {
+    return .{
+        .hash = try a.dupe(u8, hash),
+        .parents = try a.alloc([]u8, 0),
+        .author = try a.dupe(u8, "tester"),
+        .epoch_sec = 1000,
+        .subject = try a.dupe(u8, subject),
+        .refs = try a.dupe(u8, ""),
+    };
+}
+
+/// テスト用 NameStatus を構築（path のみ dup・呼び出し側が ns.deinit(a) で解放）。
+fn mkNameStatus(a: std.mem.Allocator, code: u8, path: []const u8) !show_mod.NameStatus {
+    return .{
+        .status = code,
+        .path = try a.dupe(u8, path),
+        .orig_path = null,
+    };
+}
+
+/// log ビュー前提の Model をセットアップ（view_mode=.log・log_commits を N 件・log_has_more=true）。
+fn seedLogModel(a: std.mem.Allocator, n: usize) !Model {
+    var m = try Model.init(a, "/r");
+    m.view_mode = .log;
+    m.log_request_generation = 1;
+    m.log_has_more = true;
+    const commits = try a.alloc(log_mod.Commit, n);
+    for (commits, 0..) |*c, i| {
+        const hash_buf = try std.fmt.allocPrint(a, "h{x:0>4}", .{i});
+        defer a.free(hash_buf);
+        c.* = try mkCommit(a, hash_buf, "subject");
+    }
+    try m.replaceLogCommits(commits);
+    for (commits) |*c| c.deinit(a);
+    a.free(commits);
+    return m;
+}
+
+// ----------------------------- toggle_view_mode -----------------------------
+
+test "toggle_view_mode: changes→log sets view_mode/focus/generation, clears log state, returns load_log" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try std.testing.expectEqual(ViewMode.changes, m.view_mode);
+    var cmd = try update(&m, .toggle_view_mode);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_log);
+    try std.testing.expectEqual(@as(usize, 0), cmd.load_log.skip);
+    try std.testing.expectEqual(@as(usize, 100), cmd.load_log.max_count);
+    try std.testing.expectEqual(@as(u64, 1), cmd.load_log.generation);
+    try std.testing.expectEqual(ViewMode.log, m.view_mode);
+    try std.testing.expectEqual(Focus.changes, m.focus); // M5: .commit からでも .changes へ正規化
+    try std.testing.expectEqual(@as(u64, 1), m.log_request_generation); // R3: 初期 0 から +1
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
+    try std.testing.expect(!m.log_has_more);
+}
+
+test "toggle_view_mode: log→changes increments generation, clears page, returns refresh_status" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_request_generation = 5; // 既に増分済みの前提
+    m.log_page_requested = 100; // in-flight ページ要求あり
+    var cmd = try update(&m, .toggle_view_mode);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .refresh_status);
+    try std.testing.expectEqual(ViewMode.changes, m.view_mode);
+    try std.testing.expectEqual(Focus.changes, m.focus);
+    try std.testing.expectEqual(@as(u64, 6), m.log_request_generation); // R3: +1 で遅延結果無効化
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
+}
+
+// ----------------------------- log_cursor_down -----------------------------
+
+test "log_cursor_down: empty log clears detail state and returns none (R2)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.view_mode = .log;
+    // 詳細状態を汚しておく（空 guard で消去されること）
+    try m.setDetailOwnerHash("stale");
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f.txt"));
+    try m.setStr(&m.detail_diff, "stale");
+    var cmd = try update(&m, .log_cursor_down);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_owner_hash);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_files.items.len);
+    try std.testing.expectEqualStrings("", m.detail_diff);
+}
+
+test "log_cursor_down: moves selection and loads commit_detail" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    var cmd = try update(&m, .log_cursor_down);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail);
+    try std.testing.expectEqual(@as(usize, 1), m.log_selected);
+    try std.testing.expectEqualStrings("h0001", cmd.load_commit_detail);
+    try std.testing.expectEqualStrings("h0001", m.detail_owner_hash.?); // owner も記録
+}
+
+test "log_cursor_down: clamps at last commit" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 2);
+    defer m.deinit();
+    m.log_selected = 1; // 末尾
+    var cmd = try update(&m, .log_cursor_down);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail);
+    try std.testing.expectEqual(@as(usize, 1), m.log_selected); // 末尾で停止
+}
+
+test "log_cursor_down: triggers paging when has_more and near end (R17 len>=5)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 5); // len == 5 (R17 境界値)
+    defer m.deinit();
+    m.log_selected = 0; // まだ境界外（selected < len-5 == 0）
+    // 1 回目の down: selected=0→1。1 >= len-5(0) を満たすので page が発火する。
+    var c1 = try update(&m, .log_cursor_down);
+    defer c1.deinit(a);
+    try std.testing.expect(c1 == .load_log_page);
+    try std.testing.expectEqual(@as(usize, 1), m.log_selected);
+    try std.testing.expectEqual(@as(usize, 5), c1.load_log_page.skip);
+    try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested); // R11
+}
+
+test "log_cursor_down: R17 prevents underflow when len < 5" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3); // len < 5 → len-5 underflow するはずの条件
+    defer m.deinit();
+    m.log_selected = 2; // 末尾
+    var cmd = try update(&m, .log_cursor_down);
+    defer cmd.deinit(a);
+    // len >= 5 を満たさないので page 発火せず load_commit_detail
+    try std.testing.expect(cmd == .load_commit_detail);
+}
+
+test "log_cursor_down: R18 gates load_commit_detail during in-flight page" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 100; // page in-flight
+    var cmd = try update(&m, .log_cursor_down);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none); // R18: detail load を発火しない
+    try std.testing.expectEqual(@as(usize, 1), m.log_selected); // 選択移動は起きる
+}
+
+// ----------------------------- log_cursor_up -----------------------------
+
+test "log_cursor_up: empty log returns none (R2)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.view_mode = .log;
+    var cmd = try update(&m, .log_cursor_up);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "log_cursor_up: moves selection down and loads detail" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_selected = 2;
+    var cmd = try update(&m, .log_cursor_up);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail);
+    try std.testing.expectEqual(@as(usize, 1), m.log_selected);
+    try std.testing.expectEqualStrings("h0001", cmd.load_commit_detail);
+    try std.testing.expectEqualStrings("h0001", m.detail_owner_hash.?);
+}
+
+test "log_cursor_up: clamps at 0" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_selected = 0;
+    var cmd = try update(&m, .log_cursor_up);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail);
+    try std.testing.expectEqual(@as(usize, 0), m.log_selected);
+}
+
+test "log_cursor_up: R18 gates detail load during in-flight page" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 50;
+    var cmd = try update(&m, .log_cursor_up);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+// ----------------------------- log_open_detail -----------------------------
+
+test "log_open_detail: empty returns none (R2)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.view_mode = .log;
+    var cmd = try update(&m, .log_open_detail);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "log_open_detail: loads detail for current selection" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_selected = 2;
+    var cmd = try update(&m, .log_open_detail);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail);
+    try std.testing.expectEqualStrings("h0002", cmd.load_commit_detail);
+}
+
+test "log_open_detail: R18 gates during in-flight page" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 50;
+    var cmd = try update(&m, .log_open_detail);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+// ----------------------------- scroll arms -----------------------------
+
+test "log_scroll_down/up adjust log_scroll without affecting selection or paging" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 5);
+    defer m.deinit();
+    var c1 = try update(&m, .log_scroll_down);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), m.log_scroll);
+    try std.testing.expectEqual(@as(usize, 0), m.log_selected); // 選択は不変
+    var c2 = try update(&m, .log_scroll_up);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), m.log_scroll);
+    // 0 未満へは行かない
+    var c3 = try update(&m, .log_scroll_up);
+    c3.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), m.log_scroll);
+}
+
+test "log_scroll_down clamps at log_commits length" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var c = try update(&m, .log_scroll_down);
+        c.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 3), m.log_scroll);
+}
+
+test "detail_files_scroll_down/up adjust detail_scroll" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f2"));
+    var c1 = try update(&m, .detail_files_scroll_down);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), m.detail_scroll);
+    var c2 = try update(&m, .detail_files_scroll_up);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_scroll);
+}
+
+test "detail_diff_scroll clamps at line count - 1 (empty is no-op)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    // 空 diff は no-op
+    var c0 = try update(&m, .detail_diff_scroll_down);
+    c0.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_diff_scroll);
+    // 4 トークン（"a\nb\nc\n" → cap 3）
+    try m.setStr(&m.detail_diff, "a\nb\nc\n");
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var c = try update(&m, .detail_diff_scroll_down);
+        c.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 3), m.detail_diff_scroll);
+    var c2 = try update(&m, .detail_diff_scroll_up);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), m.detail_diff_scroll);
+}
+
+// ----------------------------- detail_cursor_* -----------------------------
+
+test "detail_cursor_down/up: empty detail_files is no-op (R2)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    var c1 = try update(&m, .detail_cursor_down);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_selected);
+    var c2 = try update(&m, .detail_cursor_up);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_selected);
+}
+
+test "detail_cursor_down/up: move detail_selected and return none" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f2"));
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f3"));
+    var c1 = try update(&m, .detail_cursor_down);
+    c1.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), m.detail_selected);
+    var c2 = try update(&m, .detail_cursor_down);
+    c2.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), m.detail_selected);
+    var c3 = try update(&m, .detail_cursor_down);
+    c3.deinit(a); // 末尾で停止
+    try std.testing.expectEqual(@as(usize, 2), m.detail_selected);
+    var c4 = try update(&m, .detail_cursor_up);
+    c4.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), m.detail_selected);
+}
+
+// ----------------------------- detail_select_file -----------------------------
+
+test "detail_select_file: empty detail_files is no-op (R2)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    var cmd = try update(&m, .detail_select_file);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "detail_select_file: sets detail_kind=.diff and returns load_detail_diff (R16 payload-first)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "src/f.txt"));
+    var cmd = try update(&m, .detail_select_file);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_detail_diff);
+    try std.testing.expectEqualStrings("h0000", cmd.load_detail_diff.hash);
+    try std.testing.expectEqualStrings("src/f.txt", cmd.load_detail_diff.path);
+    try std.testing.expectEqual(DetailKind.diff, m.detail_kind);
+    try std.testing.expectEqualStrings("h0000", m.detail_diff_owner_hash.?);
+    try std.testing.expectEqualStrings("src/f.txt", m.detail_diff_owner_path.?);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_diff_scroll);
+}
+
+test "detail_select_file: R18 gates during in-flight page" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f.txt"));
+    m.log_page_requested = 100;
+    var cmd = try update(&m, .detail_select_file);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(DetailKind.files, m.detail_kind); // 切替無し
+}
+
+// ----------------------------- detail_back_to_files -----------------------------
+
+test "detail_back_to_files: resets state to .files, clears diff and owner" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    m.detail_kind = .diff;
+    try m.setStr(&m.detail_diff, "diff body");
+    m.detail_diff_scroll = 5;
+    try m.setDetailDiffOwner("h0000", "f.txt");
+    var cmd = try update(&m, .detail_back_to_files);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(DetailKind.files, m.detail_kind);
+    try std.testing.expectEqualStrings("", m.detail_diff);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_diff_scroll);
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_diff_owner_hash);
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_diff_owner_path);
+}
+
+// ----------------------------- log_select_index / detail_select_index -----------------------------
+
+test "log_select_index: sets log_selected and focus=.changes, loads detail" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 5);
+    defer m.deinit();
+    m.focus = .commit;
+    var cmd = try update(&m, .{ .log_select_index = 3 });
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail);
+    try std.testing.expectEqual(@as(usize, 3), m.log_selected);
+    try std.testing.expectEqual(Focus.changes, m.focus); // R14
+    try std.testing.expectEqualStrings("h0003", cmd.load_commit_detail);
+}
+
+test "log_select_index: empty returns none (R2)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.view_mode = .log;
+    var cmd = try update(&m, .{ .log_select_index = 0 });
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "log_select_index: out-of-range is ignored but focus set, returns detail for current selection" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_selected = 1;
+    var cmd = try update(&m, .{ .log_select_index = 99 }); // 範囲外
+    defer cmd.deinit(a);
+    // log_selected は変化しない（範囲外は無視）。detail load は現選択で発火。
+    try std.testing.expect(cmd == .load_commit_detail);
+    try std.testing.expectEqual(@as(usize, 1), m.log_selected);
+    try std.testing.expectEqualStrings("h0001", cmd.load_commit_detail);
+}
+
+test "log_select_index: R18 gates detail load but updates selection and focus" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 5);
+    defer m.deinit();
+    m.log_page_requested = 100;
+    m.focus = .commit;
+    var cmd = try update(&m, .{ .log_select_index = 2 });
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(usize, 2), m.log_selected);
+    try std.testing.expectEqual(Focus.changes, m.focus); // R14: focus は更新
+}
+
+test "detail_select_index: .files mode sets detail_selected and focus=.diff" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f2"));
+    m.detail_kind = .files;
+    m.focus = .commit;
+    var cmd = try update(&m, .{ .detail_select_index = 1 });
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(usize, 1), m.detail_selected);
+    try std.testing.expectEqual(Focus.diff, m.focus); // R14
+}
+
+test "detail_select_index: out-of-range in .files mode is ignored" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
+    m.detail_kind = .files;
+    m.detail_selected = 0;
+    var cmd = try update(&m, .{ .detail_select_index = 99 });
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_selected); // 変化無し
+}
+
+test "detail_select_index: .diff mode ignores click (no file move)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
+    m.detail_kind = .diff;
+    m.detail_selected = 0;
+    var cmd = try update(&m, .{ .detail_select_index = 0 });
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    // .diff 中はマウスクリックでファイル選択を変更しない
+}
+
+// ----------------------------- request_refresh (log mode) -----------------------------
+
+test "request_refresh in log mode: increments generation, saves restore hash, clears state, returns load_log" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_selected = 2;
+    m.log_request_generation = 5;
+    try m.setDetailOwnerHash("stale");
+    // mkNameStatus は所有 NameStatus を返すので、replaceDetailFiles 後に明示的に deinit する。
+    var ns = try mkNameStatus(a, 'M', "f.txt");
+    try m.replaceDetailFiles(&.{ns});
+    ns.deinit(a);
+    var cmd = try update(&m, .request_refresh);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_log);
+    try std.testing.expectEqual(@as(u64, 6), cmd.load_log.generation); // R3 +1
+    try std.testing.expectEqual(@as(usize, 0), cmd.load_log.skip);
+    // R4: 選択 hash 退避
+    try std.testing.expectEqualStrings("h0002", m.log_restore_hash.?);
+    // 状態クリア
+    try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_owner_hash);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_files.items.len);
+    try std.testing.expectEqual(DetailKind.files, m.detail_kind);
+    try std.testing.expect(!m.log_has_more);
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
+}
+
+test "request_refresh in log mode: empty log clears restore hash instead of saving" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.view_mode = .log;
+    m.log_request_generation = 1;
+    try m.setLogRestoreHash("stale");
+    var cmd = try update(&m, .request_refresh);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_log);
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_restore_hash); // 空なので clear
+}
+
+test "request_refresh in changes mode: returns refresh_status (unchanged)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var cmd = try update(&m, .request_refresh);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .refresh_status);
+}
+
+// ----------------------------- log_loaded -----------------------------
+
+test "log_loaded: rejects when not in log mode (R3 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    m.view_mode = .changes; // log から抜けた後の遅延結果
+    const entries = try a.alloc(log_mod.Commit, 0);
+    defer a.free(entries);
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len); // 適用されない
+}
+
+test "log_loaded: rejects when generation mismatch (H1 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    m.log_request_generation = 7; // 要求時と異なる
+    const entries = try a.alloc(log_mod.Commit, 0);
+    defer a.free(entries);
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "log_loaded: rejects when skip != 0 (H3 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    const entries = try a.alloc(log_mod.Commit, 0);
+    defer a.free(entries);
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 50, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "log_loaded: fresh apply with restore hash restores selection (R4)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    try m.setLogRestoreHash("h0002"); // R4: 退避済み
+    const entries = try a.alloc(log_mod.Commit, 3);
+    entries[0] = try mkCommit(a, "h0000", "s0");
+    entries[1] = try mkCommit(a, "h0001", "s1");
+    entries[2] = try mkCommit(a, "h0002", "s2");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail);
+    try std.testing.expectEqual(@as(usize, 3), m.log_commits.items.len);
+    try std.testing.expectEqual(@as(usize, 2), m.log_selected); // R4: hash 一致で復元
+    try std.testing.expectEqualStrings("h0002", cmd.load_commit_detail);
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_restore_hash); // 復元後にクリア
+    // entries.len(3) < max_count(100) → has_more = false
+    try std.testing.expect(!m.log_has_more);
+}
+
+test "log_loaded: has_more is false when entries < max_count (M3)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    const entries = try a.alloc(log_mod.Commit, 3);
+    entries[0] = try mkCommit(a, "h0000", "s0");
+    entries[1] = try mkCommit(a, "h0001", "s1");
+    entries[2] = try mkCommit(a, "h0002", "s2");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(!m.log_has_more);
+}
+
+test "log_loaded: has_more is true when entries >= max_count (M3)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    // max_count == 3 で entries も 3 → has_more = true
+    const entries = try a.alloc(log_mod.Commit, 3);
+    entries[0] = try mkCommit(a, "h0000", "s0");
+    entries[1] = try mkCommit(a, "h0001", "s1");
+    entries[2] = try mkCommit(a, "h0002", "s2");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 3, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(m.log_has_more);
+}
+
+test "log_loaded: empty result clears detail state (R2)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    try m.setDetailOwnerHash("stale");
+    const entries = try a.alloc(log_mod.Commit, 0);
+    defer a.free(entries);
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_owner_hash);
+}
+
+// ----------------------------- log_page_loaded -----------------------------
+
+test "log_page_loaded: rejects when generation mismatch (H1 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 3; // 期待 skip
+    m.log_request_generation = 99;
+    const entries = try a.alloc(log_mod.Commit, 0);
+    defer a.free(entries);
+    var msg = Msg{ .log_page_loaded = .{
+        .request_skip = 3, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, 3), m.log_page_requested); // 変化無し
+}
+
+test "log_page_loaded: rejects when skip != log_page_requested (R11 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 3; // 期待 skip
+    const entries = try a.alloc(log_mod.Commit, 0);
+    defer a.free(entries);
+    var msg = Msg{ .log_page_loaded = .{
+        .request_skip = 99, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "log_page_loaded: rejects when log_page_requested already null" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = null; // 既に消化済み
+    const entries = try a.alloc(log_mod.Commit, 0);
+    defer a.free(entries);
+    var msg = Msg{ .log_page_loaded = .{
+        .request_skip = 3, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "log_page_loaded: appends entries, clears page_requested (R22), reloads detail (R10)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3); // h0000..h0002
+    defer m.deinit();
+    m.log_page_requested = 3; // 期待 skip
+    m.log_has_more = true;
+    // 追加分 2 件
+    const entries = try a.alloc(log_mod.Commit, 2);
+    entries[0] = try mkCommit(a, "h0003", "s3");
+    entries[1] = try mkCommit(a, "h0004", "s4");
+    var msg = Msg{ .log_page_loaded = .{
+        .request_skip = 3, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail); // R10
+    try std.testing.expectEqual(@as(usize, 5), m.log_commits.items.len); // 3 + 2
+    try std.testing.expectEqualStrings("h0004", m.log_commits.items[4].hash);
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested); // R22 クリア
+    try std.testing.expect(!m.log_has_more); // entries.len(2) < max_count(100) → false
+    try std.testing.expectEqualStrings("h0000", cmd.load_commit_detail); // R10: 現選択で再ロード
+}
+
+test "log_page_loaded: empty append is no-op for detail but still clears page_requested" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 3;
+    const entries = try a.alloc(log_mod.Commit, 0);
+    defer a.free(entries);
+    var msg = Msg{ .log_page_loaded = .{
+        .request_skip = 3, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_commit_detail); // 既存 3 件あるので R10 で再ロード
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
+}
+
+// ----------------------------- log_page_failed -----------------------------
+
+test "log_page_failed: clears page_requested and sets error_text" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 5;
+    var msg = Msg{ .log_page_failed = .{
+        .request_skip = 5, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
+    try std.testing.expectEqualStrings("boom", m.error_text);
+}
+
+test "log_page_failed: rejects on generation mismatch" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 5;
+    m.log_request_generation = 99;
+    var msg = Msg{ .log_page_failed = .{
+        .request_skip = 5, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested); // 変化無し
+    try std.testing.expectEqualStrings("", m.error_text);
+}
+
+test "log_page_failed: rejects on skip mismatch (R11)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 5;
+    var msg = Msg{ .log_page_failed = .{
+        .request_skip = 99, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested); // 変化無し
+}
+
+test "log_page_failed: rejects when page_requested already null" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = null;
+    var msg = Msg{ .log_page_failed = .{
+        .request_skip = 5, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqualStrings("", m.error_text);
+}
+
+// ----------------------------- log_page_failed_silent -----------------------------
+
+test "log_page_failed_silent: clears page_requested without setting error_text" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 5;
+    try m.setStr(&m.error_text, "preexisting");
+    var msg = Msg{ .log_page_failed_silent = .{ .request_skip = 5, .request_generation = 1 } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
+    try std.testing.expectEqualStrings("preexisting", m.error_text); // 変更無し
+}
+
+test "log_page_failed_silent: rejects on stale generation" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_page_requested = 5;
+    m.log_request_generation = 99;
+    var msg = Msg{ .log_page_failed_silent = .{ .request_skip = 5, .request_generation = 1 } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested); // 変化無し
+}
+
+// ----------------------------- commit_detail_loaded -----------------------------
+
+test "commit_detail_loaded: rejects when not in log mode (R3 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    m.view_mode = .changes;
+    try m.setDetailOwnerHash("h0000");
+    const entries = try a.alloc(show_mod.NameStatus, 1);
+    entries[0] = try mkNameStatus(a, 'M', "f.txt");
+    var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "h0000"), .entries = entries } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_files.items.len); // 適用されない
+}
+
+test "commit_detail_loaded: rejects when hash mismatch (H1 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.setDetailOwnerHash("h0000"); // owner
+    const entries = try a.alloc(show_mod.NameStatus, 1);
+    entries[0] = try mkNameStatus(a, 'M', "f.txt");
+    var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "DIFFERENT"), .entries = entries } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_files.items.len); // 適用されない
+}
+
+test "commit_detail_loaded: rejects when detail_owner_hash is null" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    // owner 未設定
+    const entries = try a.alloc(show_mod.NameStatus, 1);
+    entries[0] = try mkNameStatus(a, 'M', "f.txt");
+    var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "h0000"), .entries = entries } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+}
+
+test "commit_detail_loaded: fresh apply replaces detail_files and resets selection" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.setDetailOwnerHash("h0000");
+    m.detail_selected = 5;
+    m.detail_kind = .diff;
+    const entries = try a.alloc(show_mod.NameStatus, 2);
+    entries[0] = try mkNameStatus(a, 'M', "f1");
+    entries[1] = try mkNameStatus(a, 'A', "f2");
+    var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "h0000"), .entries = entries } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(usize, 2), m.detail_files.items.len);
+    try std.testing.expectEqualStrings("f1", m.detail_files.items[0].path);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_selected); // リセット
+    try std.testing.expectEqual(DetailKind.files, m.detail_kind); // リセット
+}
+
+// ----------------------------- detail_diff_loaded -----------------------------
+
+test "detail_diff_loaded: rejects when not in log mode (R3 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    m.view_mode = .changes;
+    try m.setDetailDiffOwner("h0000", "f.txt");
+    var msg = Msg{ .detail_diff_loaded = .{
+        .request_hash = try a.dupe(u8, "h0000"),
+        .request_path = try a.dupe(u8, "f.txt"),
+        .text = try a.dupe(u8, "diff body"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqualStrings("", m.detail_diff); // 適用されない
+}
+
+test "detail_diff_loaded: rejects when hash mismatch (H1 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.setDetailDiffOwner("h0000", "f.txt");
+    var msg = Msg{ .detail_diff_loaded = .{
+        .request_hash = try a.dupe(u8, "WRONG"),
+        .request_path = try a.dupe(u8, "f.txt"),
+        .text = try a.dupe(u8, "diff body"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqualStrings("", m.detail_diff);
+}
+
+test "detail_diff_loaded: rejects when path mismatch (H1 stale)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.setDetailDiffOwner("h0000", "f.txt");
+    var msg = Msg{ .detail_diff_loaded = .{
+        .request_hash = try a.dupe(u8, "h0000"),
+        .request_path = try a.dupe(u8, "WRONG"),
+        .text = try a.dupe(u8, "diff body"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqualStrings("", m.detail_diff);
+}
+
+test "detail_diff_loaded: fresh apply sets detail_diff and resets scroll" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try m.setDetailDiffOwner("h0000", "f.txt");
+    m.detail_diff_scroll = 99;
+    var msg = Msg{ .detail_diff_loaded = .{
+        .request_hash = try a.dupe(u8, "h0000"),
+        .request_path = try a.dupe(u8, "f.txt"),
+        .text = try a.dupe(u8, "diff body\n+new line\n"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqualStrings("diff body\n+new line\n", m.detail_diff);
+    try std.testing.expectEqual(@as(usize, 0), m.detail_diff_scroll);
+}
+
+test "detail_diff_loaded: rejects when owner is null" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    // owner 未設定
+    var msg = Msg{ .detail_diff_loaded = .{
+        .request_hash = try a.dupe(u8, "h0000"),
+        .request_path = try a.dupe(u8, "f.txt"),
+        .text = try a.dupe(u8, "diff body"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqualStrings("", m.detail_diff);
+}
+
+// ----------------------------- optEql helper -----------------------------
+
+test "optEql: both null returns true" {
+    try std.testing.expect(optEql(null, null));
+}
+
+test "optEql: one null returns false" {
+    try std.testing.expect(!optEql(null, "x"));
+    try std.testing.expect(!optEql("x", null));
+}
+
+test "optEql: matching strings returns true" {
+    try std.testing.expect(optEql("hello", "hello"));
+}
+
+test "optEql: differing strings returns false" {
+    try std.testing.expect(!optEql("hello", "world"));
+}
+
+// ----------------------------- 複合シナリオ: toggle → load → cursor -----------------------------
+
+test "end-to-end: toggle_view_mode then log_loaded then log_cursor_down coordinates detail owner" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 1) toggle → load_log
+    var c1 = try update(&m, .toggle_view_mode);
+    defer c1.deinit(a);
+    try std.testing.expect(c1 == .load_log);
+    const gen = c1.load_log.generation;
+    // 2) log_loaded 結果適用（同 generation）
+    const entries = try a.alloc(log_mod.Commit, 2);
+    entries[0] = try mkCommit(a, "h0000", "s0");
+    entries[1] = try mkCommit(a, "h0001", "s1");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = gen, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var c2 = try update(&m, msg);
+    defer c2.deinit(a);
+    try std.testing.expect(c2 == .load_commit_detail); // 初回詳細ロード
+    try std.testing.expectEqualStrings("h0000", m.detail_owner_hash.?);
+    // 3) log_cursor_down → 次のコミットへ
+    var c3 = try update(&m, .log_cursor_down);
+    defer c3.deinit(a);
+    try std.testing.expect(c3 == .load_commit_detail);
+    try std.testing.expectEqual(@as(usize, 1), m.log_selected);
+    try std.testing.expectEqualStrings("h0001", m.detail_owner_hash.?);
+}
+
+test "end-to-end: paging flow (cursor near end → page → append → detail reload)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 5); // len == 5
+    defer m.deinit();
+    // log_has_more=true なので、selected を境界まで進めると page trigger
+    m.log_selected = 0;
+    // selected >= len-5 == 0 を満たす（selected=0 は既に境界）→ 次の down で page
+    var c1 = try update(&m, .log_cursor_down);
+    defer c1.deinit(a);
+    try std.testing.expect(c1 == .load_log_page); // page 発火
+    try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested);
+    // page 結果到着: log_page_loaded arm が append + detail reload
+    const entries = try a.alloc(log_mod.Commit, 2);
+    entries[0] = try mkCommit(a, "h0005", "s5");
+    entries[1] = try mkCommit(a, "h0006", "s6");
+    var msg = Msg{ .log_page_loaded = .{
+        .request_skip = 5, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var c2 = try update(&m, msg);
+    defer c2.deinit(a);
+    try std.testing.expect(c2 == .load_commit_detail); // R10: 選択 hash で再ロード
+    try std.testing.expectEqual(@as(usize, 7), m.log_commits.items.len); // 5 + 2
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested); // クリア
+    // page 完了後は通常の down が detail ロードを発火できる
+    var c3 = try update(&m, .log_cursor_down);
+    defer c3.deinit(a);
+    try std.testing.expect(c3 == .load_commit_detail);
 }
