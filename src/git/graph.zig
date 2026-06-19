@@ -131,7 +131,7 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
 
     // before frontier のスナップショット（cells の up 接続用）—
     // 新規 tip append 前に取得することで、追加 slot に up 接続が付かないようにする
-    // （新規 tip は前 行から伝播していないため up=false が正）。
+    // （新規 tip は前行から伝播していないため up=false が正）。
     const before_len = frontier.slots.items.len;
     var before_has: []bool = try a.alloc(bool, before_len);
     defer a.free(before_has);
@@ -165,8 +165,6 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
     }
 
     // (4) parents の配置
-    var branch_lanes: std.ArrayList(usize) = .empty;
-    defer branch_lanes.deinit(a);
     if (c.parents.len == 0) {
         // root: lane 終了
     } else {
@@ -192,23 +190,19 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
         }
         // 追加親（merge）: dense 挿入
         for (c.parents[1..]) |p| {
-            var found_p: ?usize = null;
-            for (frontier.slots.items, 0..) |slot, i| {
+            var found_p: bool = false;
+            for (frontier.slots.items) |slot| {
                 if (slot) |h| {
                     if (std.mem.eql(u8, h, p)) {
-                        found_p = i;
+                        found_p = true;
                         break;
                     }
                 }
             }
-            if (found_p) |fi| {
-                // 既存へ集約
-                try branch_lanes.append(a, fi);
-            } else {
-                // node_lane の直後に挿入
+            if (!found_p) {
+                // 既存へ集約されなければ node_lane の直後に挿入
                 const p_dup = try a.dupe(u8, p);
                 try frontier.slots.insert(a, node_lane + 1, p_dup);
-                try branch_lanes.append(a, node_lane + 1);
             }
         }
     }
@@ -266,16 +260,40 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
 
 fn mkCommit(a: std.mem.Allocator, hash: []const u8, parents: []const []const u8) !log.Commit {
     var ps: std.ArrayList([]u8) = .empty;
-    for (parents) |p| {
-        try ps.append(a, try a.dupe(u8, p));
+    errdefer {
+        for (ps.items) |p| a.free(p);
+        ps.deinit(a);
     }
+    for (parents) |p| {
+        const p_dup = try a.dupe(u8, p);
+        errdefer a.free(p_dup);
+        try ps.append(a, p_dup);
+    }
+    const parents_slice = try ps.toOwnedSlice(a);
+    errdefer {
+        for (parents_slice) |p| a.free(p);
+        a.free(parents_slice);
+    }
+
+    const h = try a.dupe(u8, hash);
+    errdefer a.free(h);
+
+    const author = try a.dupe(u8, "tester");
+    errdefer a.free(author);
+
+    const subject = try a.dupe(u8, "subj");
+    errdefer a.free(subject);
+
+    const refs = try a.dupe(u8, "");
+    errdefer a.free(refs);
+
     return .{
-        .hash = try a.dupe(u8, hash),
-        .parents = try ps.toOwnedSlice(a),
-        .author = try a.dupe(u8, "tester"),
+        .hash = h,
+        .parents = parents_slice,
+        .author = author,
         .epoch_sec = 1000,
-        .subject = try a.dupe(u8, "subj"),
-        .refs = try a.dupe(u8, ""),
+        .subject = subject,
+        .refs = refs,
     };
 }
 
@@ -303,14 +321,23 @@ test "computeAll: linear history (3 commits, 1 lane)" {
     try std.testing.expect(v.rows.items[0].cells[0].is_node);
     try std.testing.expect(v.rows.items[0].cells[0].down);
     try std.testing.expect(!v.rows.items[0].cells[0].up);
+    // Row 0: no horizontal connections
+    try std.testing.expect(!v.rows.items[0].cells[0].left);
+    try std.testing.expect(!v.rows.items[0].cells[0].right);
     // Row 1 (B): up + node + down
     try std.testing.expect(v.rows.items[1].cells[0].up);
     try std.testing.expect(v.rows.items[1].cells[0].is_node);
     try std.testing.expect(v.rows.items[1].cells[0].down);
+    // Row 1: no horizontal connections
+    try std.testing.expect(!v.rows.items[1].cells[0].left);
+    try std.testing.expect(!v.rows.items[1].cells[0].right);
     // Row 2 (A, root): up + node, no down
     try std.testing.expect(v.rows.items[2].cells[0].up);
     try std.testing.expect(v.rows.items[2].cells[0].is_node);
     try std.testing.expect(!v.rows.items[2].cells[0].down);
+    // Row 2: no horizontal connections
+    try std.testing.expect(!v.rows.items[2].cells[0].left);
+    try std.testing.expect(!v.rows.items[2].cells[0].right);
     // frontier after processing: empty (A is root)
     try std.testing.expectEqual(@as(usize, 0), v.frontier.slots.items.len);
 }
