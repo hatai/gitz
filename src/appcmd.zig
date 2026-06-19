@@ -99,6 +99,10 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
             if (sres.exit_code != 0) return .{ .git_error = try a.dupe(u8, sres.stderr) };
             return .{ .status_loaded = try statusmod.parse(a, sres.stdout) };
         },
+        // --- TODO 2 phase 1: log/detail 副作用コマンド（スタブ・後続タスクで実装） ---
+        // バリアント追加のみを先行。実行ロジック（git log/show 呼び出し）は別タスクで実装する。
+        // 現時点では安全値として .committed を返す（呼び出し側が未使用でも deinit 可能）。
+        .load_log, .load_log_page, .load_commit_detail, .load_detail_diff => return .committed,
     }
 }
 

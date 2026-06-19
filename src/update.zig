@@ -252,6 +252,32 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             try model.setStr(&model.commit_message, "");
             return .refresh_status;
         },
+        // --- TODO 2 phase 1: log/detail の Msg バリアント（スタブ・後続タスクで実装） ---
+        // 入力系・結果系ともに Model 変更・副作用なしの no-op。バリアント追加のみを先行し、
+        // update.zig の reducer ロジックは別タスクで実装する（exhaustive switch を通すための最小スタブ）。
+        .toggle_view_mode,
+        .log_cursor_down,
+        .log_cursor_up,
+        .log_open_detail,
+        .log_scroll_down,
+        .log_scroll_up,
+        .detail_cursor_down,
+        .detail_cursor_up,
+        .detail_select_file,
+        .detail_back_to_files,
+        .detail_files_scroll_down,
+        .detail_files_scroll_up,
+        .detail_diff_scroll_down,
+        .detail_diff_scroll_up,
+        .log_select_index,
+        .detail_select_index,
+        .log_loaded,
+        .log_page_loaded,
+        .log_page_failed,
+        .log_page_failed_silent,
+        .commit_detail_loaded,
+        .detail_diff_loaded,
+        => return .none,
     }
 }
 

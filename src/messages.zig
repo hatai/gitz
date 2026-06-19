@@ -25,6 +25,18 @@ pub const Msg = union(enum) {
     stage_hunk, // diff フォーカス時 H （現在ハンクを即 stage/unstage）
     select_line_at: usize, // diff クリックの絶対行（カーソルへ解決・anchor クリア）
     quit,
+    // --- TODO 2 phase 1: log/detail 入力系 ---
+    toggle_view_mode,
+    log_cursor_down, log_cursor_up,
+    log_open_detail,
+    log_scroll_down, log_scroll_up,
+    detail_cursor_down, detail_cursor_up,
+    detail_select_file,
+    detail_back_to_files,
+    detail_files_scroll_down, detail_files_scroll_up,
+    detail_diff_scroll_down, detail_diff_scroll_up,
+    log_select_index: usize,
+    detail_select_index: usize,
     select_index: usize, // マウスでファイル行クリック
     set_focus: Focus, // ペインクリックでフォーカス変更
     // commit テキスト編集自体は zigzag TextArea が正本（多行・カーソル・多バイトを担う）。
@@ -33,8 +45,40 @@ pub const Msg = union(enum) {
     // 解釈器からの結果（所有: 複製済み）
     status_loaded: []status.StatusEntry,
     diff_loaded: []u8,
+    // --- TODO 2 phase 1: log/detail 結果系（H1 構造体化） ---
+    log_loaded: LogLoaded,
+    log_page_loaded: LogLoaded,
+    log_page_failed: LogPageFailed,
+    log_page_failed_silent: LogPageFailedSilent,
+    commit_detail_loaded: CommitDetailLoaded,
+    detail_diff_loaded: DetailDiffLoaded,
     git_error: []u8,
     committed,
+
+    pub const LogLoaded = struct {
+        request_skip: usize,
+        request_max_count: usize,
+        request_generation: u64,
+        entries: []@import("git/log.zig").Commit,
+    };
+    pub const LogPageFailed = struct {
+        request_skip: usize,
+        request_generation: u64,
+        error_text: []u8,
+    };
+    pub const LogPageFailedSilent = struct {
+        request_skip: usize,
+        request_generation: u64,
+    };
+    pub const CommitDetailLoaded = struct {
+        request_hash: []u8,
+        entries: []@import("git/show.zig").NameStatus,
+    };
+    pub const DetailDiffLoaded = struct {
+        request_hash: []u8,
+        request_path: []u8,
+        text: []u8,
+    };
 
     pub fn deinit(self: *Msg, a: std.mem.Allocator) void {
         // 網羅的 switch: 所有バリアントを追加したら必ずここに解放処理を書く
@@ -49,6 +93,22 @@ pub const Msg = union(enum) {
                 a.free(entries);
             },
             .diff_loaded => |s| a.free(s),
+            .log_loaded, .log_page_loaded => |ll| {
+                for (ll.entries) |*c| c.deinit(a);
+                a.free(ll.entries);
+            },
+            .log_page_failed => |lpf| a.free(lpf.error_text),
+            .log_page_failed_silent => {},
+            .commit_detail_loaded => |cdl| {
+                a.free(cdl.request_hash);
+                for (cdl.entries) |*e| e.deinit(a);
+                a.free(cdl.entries);
+            },
+            .detail_diff_loaded => |ddl| {
+                a.free(ddl.request_hash);
+                a.free(ddl.request_path);
+                a.free(ddl.text);
+            },
             .git_error => |s| a.free(s),
             // 借用 / 単純: 解放不要（commit_text_changed は reducer 側が複製するため借用）
             .key_down,
@@ -70,6 +130,23 @@ pub const Msg = union(enum) {
             .stage_hunk,
             .select_line_at,
             .quit,
+            // --- TODO 2 phase 1: log/detail 入力系（所有ペイロードなし） ---
+            .toggle_view_mode,
+            .log_cursor_down,
+            .log_cursor_up,
+            .log_open_detail,
+            .log_scroll_down,
+            .log_scroll_up,
+            .detail_cursor_down,
+            .detail_cursor_up,
+            .detail_select_file,
+            .detail_back_to_files,
+            .detail_files_scroll_down,
+            .detail_files_scroll_up,
+            .detail_diff_scroll_down,
+            .detail_diff_scroll_up,
+            .log_select_index,
+            .detail_select_index,
             .select_index,
             .set_focus,
             .commit_text_changed,
@@ -87,6 +164,11 @@ pub const AppCmd = union(enum) {
     load_diff: LoadDiff,
     commit: []u8, // 所有: メッセージ複製
     apply_patch: ApplyPatch,
+    // --- TODO 2 phase 1: log/detail 副作用 ---
+    load_log: LoadLog,
+    load_log_page: LoadLog,
+    load_commit_detail: []u8,
+    load_detail_diff: LoadDetailDiff,
     quit,
 
     pub const OwnedPath = struct { path: []u8, orig_path: ?[]u8, section: Section };
@@ -96,6 +178,8 @@ pub const AppCmd = union(enum) {
     /// git_dir: 絶対 git-dir（worktree/submodule 対応）。null = フォールバック（cwd 相対 .git/...）。
     /// デフォルト null 必須: 既存の8箇所の `.{ .patch=..., .reverse=... }` リテラル呼出を壊さないため。
     pub const ApplyPatch = struct { patch: []u8, reverse: bool, git_dir: ?[]const u8 = null };
+    pub const LoadLog = struct { skip: usize, max_count: usize, generation: u64 };
+    pub const LoadDetailDiff = struct { hash: []u8, path: []u8 };
 
     pub fn deinit(self: *AppCmd, a: std.mem.Allocator) void {
         // 網羅的 switch: 所有バリアントを追加したら必ずここに解放処理を書く
@@ -118,8 +202,15 @@ pub const AppCmd = union(enum) {
             // 単純: 解放不要
             .none,
             .refresh_status,
+            .load_log,
+            .load_log_page,
             .quit,
             => {},
+            .load_commit_detail => |h| a.free(h),
+            .load_detail_diff => |ldd| {
+                a.free(ldd.hash);
+                a.free(ldd.path);
+            },
         }
     }
 };
@@ -224,5 +315,80 @@ test "AppCmd.load_diff deinit frees path and orig_path without leak" {
         .orig_path = try a.dupe(u8, "old.txt"),
         .section = .unstaged,
     } };
+    cmd.deinit(a);
+}
+
+// --- TODO 2 phase 1: Msg/AppCmd 新バリアントの deinit 検証 ---
+
+test "Msg.log_loaded deinit frees entries without leak" {
+    const a = std.testing.allocator;
+    const log = @import("git/log.zig");
+    const entries = try a.alloc(log.Commit, 1);
+    entries[0] = .{
+        .hash = try a.dupe(u8, "h1"),
+        .parents = try a.alloc([]u8, 0),
+        .author = try a.dupe(u8, "a1"),
+        .epoch_sec = 1,
+        .subject = try a.dupe(u8, "s1"),
+        .refs = try a.dupe(u8, ""),
+    };
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1, .entries = entries,
+    } };
+    msg.deinit(a);
+}
+
+test "Msg.log_page_failed deinit frees error_text" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .log_page_failed = .{
+        .request_skip = 100, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
+    } };
+    msg.deinit(a);
+}
+
+test "Msg.log_page_failed_silent deinit is no-op (no payload)" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .log_page_failed_silent = .{ .request_skip = 100, .request_generation = 1 } };
+    msg.deinit(a);
+}
+
+test "Msg.commit_detail_loaded deinit frees request_hash and entries" {
+    const a = std.testing.allocator;
+    const show = @import("git/show.zig");
+    const entries = try a.alloc(show.NameStatus, 1);
+    entries[0] = .{
+        .status = 'M',
+        .path = try a.dupe(u8, "f.txt"),
+        .orig_path = null,
+    };
+    var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "abc"), .entries = entries } };
+    msg.deinit(a);
+}
+
+test "Msg.detail_diff_loaded deinit frees hash/path/text" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .detail_diff_loaded = .{
+        .request_hash = try a.dupe(u8, "abc"),
+        .request_path = try a.dupe(u8, "src/f.txt"),
+        .text = try a.dupe(u8, "diff body"),
+    } };
+    msg.deinit(a);
+}
+
+test "AppCmd.load_log has no owned payload (deinit is no-op)" {
+    const a = std.testing.allocator;
+    var cmd = AppCmd{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 1 } };
+    cmd.deinit(a);
+}
+
+test "AppCmd.load_commit_detail owns hash and frees on deinit" {
+    const a = std.testing.allocator;
+    var cmd = AppCmd{ .load_commit_detail = try a.dupe(u8, "abc123") };
+    cmd.deinit(a);
+}
+
+test "AppCmd.load_detail_diff owns hash/path and frees on deinit" {
+    const a = std.testing.allocator;
+    var cmd = AppCmd{ .load_detail_diff = .{ .hash = try a.dupe(u8, "abc"), .path = try a.dupe(u8, "f.txt") } };
     cmd.deinit(a);
 }
