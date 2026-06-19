@@ -5,6 +5,8 @@ const std = @import("std");
 const cmds = @import("git/commands.zig");
 const process = @import("git/process.zig");
 const statusmod = @import("git/status.zig");
+const log = @import("git/log.zig");
+const show = @import("git/show.zig");
 const msgs = @import("messages.zig");
 const Msg = msgs.Msg;
 const AppCmd = msgs.AppCmd;
@@ -99,11 +101,137 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
             if (sres.exit_code != 0) return .{ .git_error = try a.dupe(u8, sres.stderr) };
             return .{ .status_loaded = try statusmod.parse(a, sres.stdout) };
         },
-        // --- TODO 2 phase 1: log/detail 副作用コマンド（スタブ・後続タスクで実装） ---
-        // バリアント追加のみを先行。実行ロジック（git log/show 呼び出し）は別タスクで実装する。
-        // 現時点では安全値として .committed を返す（呼び出し側が未使用でも deinit 可能）。
-        .load_log, .load_log_page, .load_commit_detail, .load_detail_diff => return .committed,
+        // --- TODO 2 phase 1: log/detail 副作用コマンド ---
+        // spec §1.7: load_log と load_log_page はロジックを共有（cmd tag で結果 Msg を切替）。
+        .load_log => |c| return runLogInt(a, io, cwd, c, false),
+        .load_log_page => |c| return runLogInt(a, io, cwd, c, true),
+        .load_commit_detail => |hash_req| {
+            const argv = try cmds.showNameStatusArgv(a, hash_req);
+            defer a.free(argv);
+            var res = process.run(a, io, argv, cwd) catch
+                return .{ .git_error = try a.dupe(u8, "git show 実行エラー") };
+            defer res.deinit(a);
+            if (res.exit_code != 0) {
+                // detail は reducer で stale reject されるので git_error で安全。
+                const text = a.dupe(u8, res.stderr) catch return .{ .git_error = try a.dupe(u8, "git show 失敗") };
+                return .{ .git_error = text };
+            }
+            // R26: entries は parse が所有確保済み。hash を dupe。順序厳守。
+            const entries = try show.parseNameStatus(a, res.stdout);
+            errdefer {
+                for (entries) |*e| e.deinit(a);
+                a.free(entries);
+            }
+            const hash = try a.dupe(u8, hash_req);
+            errdefer a.free(hash);
+            return .{ .commit_detail_loaded = .{ .request_hash = hash, .entries = entries } };
+        },
+        .load_detail_diff => |ldd| {
+            const argv = try cmds.showFileDiffArgv(a, ldd.hash, ldd.path);
+            defer a.free(argv);
+            var res = process.run(a, io, argv, cwd) catch
+                return .{ .git_error = try a.dupe(u8, "git show 実行エラー") };
+            defer res.deinit(a);
+            if (res.exit_code != 0) {
+                const text = a.dupe(u8, res.stderr) catch return .{ .git_error = try a.dupe(u8, "git show 失敗") };
+                return .{ .git_error = text };
+            }
+            // R26: text/hash/path の 3 つを所有。順序: text → hash → path。
+            const text = try a.dupe(u8, res.stdout);
+            errdefer a.free(text);
+            const hash = try a.dupe(u8, ldd.hash);
+            errdefer a.free(hash);
+            const path = try a.dupe(u8, ldd.path);
+            errdefer a.free(path);
+            return .{ .detail_diff_loaded = .{ .request_hash = hash, .request_path = path, .text = text } };
+        },
     }
+}
+
+/// Run git log and return result Msg. Command tag determines log_loaded vs log_page_loaded.
+/// R5/R6/R7/R19/R20/R21/R23: headState tri-state・全エラー経路を catch して log_page_failed へ。
+fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, is_page: bool) !Msg {
+    const cmd_tag = if (is_page) Msg.log_page_loaded else Msg.log_loaded;
+    // R20: headState 呼び出しを catch（spawn/OOM も log_page_failed へ）。
+    const hs = cmds.headState(a, io, cwd) catch
+        return mkPageFailedOrSilent(a, cmd, "git リポジトリ状態の確認に失敗");
+    switch (hs) {
+        .unborn => {
+            // R6: 空配列を返す・cmd tag で Msg を切替。
+            const entries = try a.alloc(log.Commit, 0);
+            errdefer a.free(entries);
+            return @as(Msg, switch (cmd_tag) {
+                .log_loaded => .{ .log_loaded = .{
+                    .request_skip = cmd.skip,
+                    .request_max_count = cmd.max_count,
+                    .request_generation = cmd.generation,
+                    .entries = entries,
+                } },
+                .log_page_loaded => .{ .log_page_loaded = .{
+                    .request_skip = cmd.skip,
+                    .request_max_count = cmd.max_count,
+                    .request_generation = cmd.generation,
+                    .entries = entries,
+                } },
+                else => unreachable,
+            });
+        },
+        .err => return mkPageFailedOrSilent(a, cmd, "git リポジトリ状態が壊れています"),
+        .ok => {},
+    }
+    // git log 実行。R7/R21: spawn/parse/OOM も catch して log_page_failed へ。
+    const argv = try cmds.logArgv(a, cmd.skip, cmd.max_count);
+    defer freeLogArgv(a, argv);
+    var res = process.run(a, io, argv, cwd) catch
+        return mkPageFailedOrSilent(a, cmd, "git log 実行エラー");
+    defer res.deinit(a);
+    if (res.exit_code != 0) {
+        const text = a.dupe(u8, res.stderr) catch return mkPageFailedSilent(cmd);
+        return .{ .log_page_failed = .{ .request_skip = cmd.skip, .request_generation = cmd.generation, .error_text = text } };
+    }
+    const entries = log.parse(a, res.stdout) catch
+        return mkPageFailedOrSilent(a, cmd, "git log パース失敗");
+    errdefer {
+        for (entries) |*c| c.deinit(a);
+        a.free(entries);
+    }
+    return @as(Msg, switch (cmd_tag) {
+        .log_loaded => .{ .log_loaded = .{
+            .request_skip = cmd.skip,
+            .request_max_count = cmd.max_count,
+            .request_generation = cmd.generation,
+            .entries = entries,
+        } },
+        .log_page_loaded => .{ .log_page_loaded = .{
+            .request_skip = cmd.skip,
+            .request_max_count = cmd.max_count,
+            .request_generation = cmd.generation,
+            .entries = entries,
+        } },
+        else => unreachable,
+    });
+}
+
+/// R20/R21/R23b: prefix を所有 []u8 へ複製して log_page_failed を構築。OOM で silent 版へ fallback。
+fn mkPageFailedOrSilent(a: std.mem.Allocator, cmd: AppCmd.LoadLog, prefix: []const u8) Msg {
+    const text = a.dupe(u8, prefix) catch return mkPageFailedSilent(cmd);
+    return .{ .log_page_failed = .{ .request_skip = cmd.skip, .request_generation = cmd.generation, .error_text = text } };
+}
+
+/// R21: OOM 極限の silent 版。payload 無し・log_page_requested を確実に下ろすことだけが目的。
+fn mkPageFailedSilent(cmd: AppCmd.LoadLog) Msg {
+    return .{ .log_page_failed_silent = .{ .request_skip = cmd.skip, .request_generation = cmd.generation } };
+}
+
+/// Free logArgv result: logArgv は静的リテラル + 動的文字列 (--skip=, --max-count=) を含む。
+/// 動的文字列だけ free し、argv スライス自体も free する。
+fn freeLogArgv(a: std.mem.Allocator, argv: []const []const u8) void {
+    for (argv) |arg| {
+        if (std.mem.startsWith(u8, arg, "--skip=") or std.mem.startsWith(u8, arg, "--max-count=")) {
+            a.free(arg);
+        }
+    }
+    a.free(argv);
 }
 
 // 副作用コマンドを実行 → 失敗なら git_error、成功なら status を読み直して status_loaded を返す
@@ -714,4 +842,132 @@ test "apply_patch stages a partial hunk of a renamed file (git mv + unstaged mod
     defer r2.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "+X\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "-b\n") != null);
+}
+
+// --- TODO 2 phase 1: log/detail 副作用の結合テスト ---
+
+test "load_log returns log_loaded with 3 commits on a populated repo" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // 3 コミット作成（各コミットで 1 ファイル追加）。
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    try repo.writeFile(io, "b.txt", "b\n");
+    try repo.git(a, io, &.{ "git", "add", "b.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c2" });
+    try repo.writeFile(io, "c.txt", "c\n");
+    try repo.git(a, io, &.{ "git", "add", "c.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c3" });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 1 } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expectEqual(@as(usize, 3), msg.log_loaded.entries.len);
+    // 最新コミットが先頭（逆順）。
+    try std.testing.expectEqualStrings("c3", msg.log_loaded.entries[0].subject);
+    try std.testing.expectEqualStrings("c1", msg.log_loaded.entries[2].subject);
+    // request metadata の転写確認。
+    try std.testing.expectEqual(@as(usize, 0), msg.log_loaded.request_skip);
+    try std.testing.expectEqual(@as(usize, 100), msg.log_loaded.request_max_count);
+    try std.testing.expectEqual(@as(u64, 1), msg.log_loaded.request_generation);
+}
+
+test "load_log on empty (unborn) repo returns log_loaded with 0 entries" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // commit なし・untracked ファイルのみ（HEAD 未生成 = unborn）。
+    try repo.writeFile(io, "x.txt", "x\n");
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 7 } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expectEqual(@as(usize, 0), msg.log_loaded.entries.len);
+    try std.testing.expectEqual(@as(u64, 7), msg.log_loaded.request_generation);
+}
+
+test "load_log_page returns log_page_loaded and respects skip" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // 5 コミット作成。
+    var i: u8 = 0;
+    while (i < 5) : (i += 1) {
+        const name = try std.fmt.allocPrint(a, "f{d}.txt", .{i});
+        defer a.free(name);
+        try repo.writeFile(io, name, "x\n");
+        try repo.git(a, io, &.{ "git", "add", name });
+        const msg_str = try std.fmt.allocPrint(a, "m{d}", .{i});
+        defer a.free(msg_str);
+        try repo.git(a, io, &.{ "git", "commit", "-q", "-m", msg_str });
+    }
+    // skip=2, max_count=100 → 先頭2件（m4, m3）を飛ばして m2,m1,m0 の 3 件。
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log_page = .{ .skip = 2, .max_count = 100, .generation = 3 } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_page_loaded);
+    try std.testing.expectEqual(@as(usize, 3), msg.log_page_loaded.entries.len);
+    try std.testing.expectEqualStrings("m2", msg.log_page_loaded.entries[0].subject);
+    try std.testing.expectEqual(@as(usize, 2), msg.log_page_loaded.request_skip);
+    try std.testing.expectEqual(@as(u64, 3), msg.log_page_loaded.request_generation);
+}
+
+test "load_commit_detail returns commit_detail_loaded with name-status entries" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // 初期 commit 後、2 ファイル変更（modify + add）の commit を作る。
+    try repo.writeFile(io, "a.txt", "1\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    try repo.writeFile(io, "a.txt", "1\n2\n"); // modify
+    try repo.writeFile(io, "b.txt", "new\n"); // add
+    try repo.git(a, io, &.{ "git", "add", "a.txt", "b.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "second" });
+    // HEAD のハッシュを取得。
+    var hr = try process.run(a, io, &.{ "git", "rev-parse", "HEAD" }, repo.cwd());
+    defer hr.deinit(a);
+    const hash = try a.dupe(u8, std.mem.trimEnd(u8, hr.stdout, "\n"));
+    defer a.free(hash);
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_commit_detail = try a.dupe(u8, hash) });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .commit_detail_loaded);
+    try std.testing.expectEqualStrings(hash, msg.commit_detail_loaded.request_hash);
+    // 2 エントリ（a.txt=M, b.txt=A）。順序は git 依存だが両方含まれることを検証。
+    try std.testing.expectEqual(@as(usize, 2), msg.commit_detail_loaded.entries.len);
+    var found_m = false;
+    var found_a = false;
+    for (msg.commit_detail_loaded.entries) |e| {
+        if (std.mem.eql(u8, e.path, "a.txt") and e.status == 'M') found_m = true;
+        if (std.mem.eql(u8, e.path, "b.txt") and e.status == 'A') found_a = true;
+    }
+    try std.testing.expect(found_m and found_a);
+}
+
+test "load_detail_diff returns detail_diff_loaded with diff text" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "1\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "init" });
+    try repo.writeFile(io, "a.txt", "1\n2\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "second" });
+    // HEAD のハッシュを取得。
+    var hr = try process.run(a, io, &.{ "git", "rev-parse", "HEAD" }, repo.cwd());
+    defer hr.deinit(a);
+    const hash = try a.dupe(u8, std.mem.trimEnd(u8, hr.stdout, "\n"));
+    defer a.free(hash);
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_detail_diff = .{ .hash = try a.dupe(u8, hash), .path = try a.dupe(u8, "a.txt") } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .detail_diff_loaded);
+    try std.testing.expectEqualStrings(hash, msg.detail_diff_loaded.request_hash);
+    try std.testing.expectEqualStrings("a.txt", msg.detail_diff_loaded.request_path);
+    // 追加行 +2 が diff 本文に含まれる。
+    try std.testing.expect(std.mem.indexOf(u8, msg.detail_diff_loaded.text, "+2") != null);
 }
