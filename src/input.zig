@@ -18,6 +18,8 @@ const std = @import("std");
 const zz = @import("zigzag");
 const Model = @import("model.zig").Model;
 const Focus = @import("model.zig").Focus;
+const ViewMode = @import("model.zig").ViewMode;
+const DetailKind = @import("model.zig").DetailKind;
 const Msg = @import("messages.zig").Msg;
 const view = @import("view.zig");
 
@@ -61,6 +63,7 @@ pub fn keyToMsg(focus: Focus, key: Key) ?Msg {
                 'c' => .focus_commit,
                 'r' => .request_refresh,
                 'q' => .quit,
+                'L' => .toggle_view_mode,
                 else => null,
             },
             .down => .diff_cursor_down,
@@ -80,6 +83,7 @@ pub fn keyToMsg(focus: Focus, key: Key) ?Msg {
             'c' => .focus_commit,
             'r' => .request_refresh,
             'q' => .quit,
+            'L' => .toggle_view_mode,
             else => null,
         },
         .down => .key_down,
@@ -107,6 +111,17 @@ pub const MouseEvent = struct {
     on_diff: bool = false,
     /// diff ペインクリック時の **絶対 diff 行番号**（diff_scroll + ペイン相対行）。null=diff 外。
     diff_line: ?usize = null,
+    // --- TODO 2 phase 1: log/detail ビューのマウスヒットテスト結果 ---
+    /// log ペイン内の格納インデックス（`Model.log_commits.items` の添字）。null=log 外/見出し。
+    log_row: ?usize = null,
+    /// detail ファイル一覧内の格納インデックス（`Model.detail_files.items` の添字）。
+    detail_row: ?usize = null,
+    /// log ペイン上のイベントか（ホイール対象判定）。
+    on_log: bool = false,
+    /// detail ペイン上のイベントか（ホイール対象判定）。
+    on_detail: bool = false,
+    /// detail diff ペイン上のイベントか（ホイール対象判定・将来拡張用）。
+    on_detail_diff: bool = false,
 };
 
 pub fn mouseToMsg(ev: MouseEvent) ?Msg {
@@ -126,6 +141,276 @@ pub fn mouseToMsg(ev: MouseEvent) ?Msg {
         .wheel_up => if (ev.on_diff) .scroll_diff_up else null,
         // press 以外のマウスイベント（release/drag/move）と非左/非ホイールボタンは無視。
         .ignore => null,
+    };
+}
+
+// ====================== TODO 2 phase 1: ViewMode 別入力ルーティング ======================
+//
+// 既存 `keyToMsg`/`mouseToMsg` は changes ビュー専用（regression 安全）。本節は **ViewMode 別**
+// の新エントリポイントを追加し、mode==.changes は既存関数へ delegating、mode==.log は log 専用
+// のキーマップ/マウスルーティングを返す。`fromZigzagMouseForMode`（log レイアウトでヒットテスト
+// する wrapper）は view.LogLayout が存在しないため Task 9/10 で追加する（本タスクの対象外）。
+
+/// `ViewMode` 別にキー→Msg を決めるエントリポイント。
+/// ★H7: 既存 `keyToMsg` は変更せず、mode==.changes のときは delegating する（回帰安全）。
+/// ★R25: detail_kind 引数追加。focus==.diff（detail 右ペイン）の detail が files/diff で
+///   キー割当を変えるため。focus==.changes（log 左ペイン）では detail_kind を無視。
+pub fn keyToMsgForMode(mode: ViewMode, focus: Focus, detail_kind: DetailKind, key: Key) ?Msg {
+    return switch (mode) {
+        .changes => keyToMsg(focus, key), // 既存へ delegating（detail_kind は無視）
+        .log => keyToMsgForLog(focus, detail_kind, key),
+    };
+}
+
+/// log ビューのキーマップ（spec §3.4）。
+/// - L/q/r/tab は focus/detail_kind に関わらずグローバル。
+/// - focus==.changes（左: log ペイン）: j/k/↓/↑ で log_cursor、Enter/Space で log_open_detail、
+///   Ctrl+d/u で log_scroll。
+/// - focus==.diff（右: detail ペイン）: detail_kind で files/diff を切替。
+///   files: j/k で detail_cursor、Enter で select、Ctrl+d/u で files_scroll。
+///   diff: j/k/Ctrl+d/u で diff_scroll、Esc/Backspace/u で back_to_files、Enter は no-op。
+/// changes 系キー（s/space で stage、c commit、v/#/H 選択）は log mode では未割当（null）。
+fn keyToMsgForLog(focus: Focus, detail_kind: DetailKind, key: Key) ?Msg {
+    // L/q/r はグローバル（focus/detail_kind に依存しない）。tab も focus_next でグローバル。
+    switch (key) {
+        .char => |c| {
+            if (c == 'L') return .toggle_view_mode;
+            if (c == 'q') return .quit;
+            if (c == 'r') return .request_refresh;
+        },
+        .tab => return .focus_next,
+        else => {},
+    }
+
+    if (focus == .changes) {
+        // 左: log ペイン
+        return switch (key) {
+            .char => |c| switch (c) {
+                'j' => .log_cursor_down,
+                'k' => .log_cursor_up,
+                ' ' => .log_open_detail, // space は fromZigzagKey で char=' ' に正規化済み
+                else => null,
+            },
+            .down => .log_cursor_down,
+            .up => .log_cursor_up,
+            .enter => .log_open_detail,
+            .ctrl_d => .log_scroll_down,
+            .ctrl_u => .log_scroll_up,
+            else => null,
+        };
+    }
+
+    // focus == .diff: 右: detail ペイン。detail_kind で files/diff を切替。
+    return switch (detail_kind) {
+        .files => switch (key) {
+            .char => |c| switch (c) {
+                'j' => .detail_cursor_down,
+                'k' => .detail_cursor_up,
+                else => null,
+            },
+            .down => .detail_cursor_down,
+            .up => .detail_cursor_up,
+            .enter => .detail_select_file,
+            .ctrl_d => .detail_files_scroll_down,
+            .ctrl_u => .detail_files_scroll_up,
+            // Esc/Backspace/u in .files は no-op（既に files ビューにいる）
+            else => null,
+        },
+        .diff => switch (key) {
+            .char => |c| switch (c) {
+                'j' => .detail_diff_scroll_down,
+                'k' => .detail_diff_scroll_up,
+                'u' => .detail_back_to_files,
+                else => null,
+            },
+            .down => .detail_diff_scroll_down,
+            .up => .detail_diff_scroll_up,
+            .enter => null, // diff ビューでは no-op
+            .escape, .backspace => .detail_back_to_files,
+            .ctrl_d => .detail_diff_scroll_down,
+            .ctrl_u => .detail_diff_scroll_up,
+            else => null,
+        },
+    };
+}
+
+/// `ViewMode` 別にマウスイベント→Msg を決めるエントリポイント。
+/// ★H7: 既存 `mouseToMsg` は変更せず、mode==.changes のときは delegating する（回帰安全）。
+/// ★R24: ホイールは scroll 系のみ（cursor 移動はしない・1 Msg 制約）。
+/// ★R25: detail_kind 引数で files/diff の scroll 先を切り替え。
+pub fn mouseToMsgForMode(mode: ViewMode, ev: MouseEvent, detail_kind: DetailKind) ?Msg {
+    return switch (mode) {
+        .changes => mouseToMsg(ev), // 既存へ delegating
+        .log => mouseToMsgForLog(ev, detail_kind),
+    };
+}
+
+/// log ビューのマウスルーティング（spec §3.5）。
+/// - left_click: log_row → log_select_index、detail_row → detail_select_index、
+///   それ以外は pane → set_focus。
+/// - wheel_down/up: on_log → log_scroll、on_detail → detail_kind で files/diff の scroll。
+/// - left_double は phase 1 では stage 無しのため no-op。
+fn mouseToMsgForLog(ev: MouseEvent, detail_kind: DetailKind) ?Msg {
+    return switch (ev.kind) {
+        .left_click => blk: {
+            if (ev.log_row) |r| break :blk .{ .log_select_index = r };
+            if (ev.detail_row) |r| break :blk .{ .detail_select_index = r };
+            if (ev.pane) |p| break :blk .{ .set_focus = p };
+            break :blk null;
+        },
+        .left_double => null, // phase 1: stage 無し・単クリック相当だが no-op
+        .wheel_down => blk: {
+            if (ev.on_log) break :blk .log_scroll_down;
+            if (ev.on_detail) {
+                break :blk switch (detail_kind) {
+                    .files => .detail_files_scroll_down,
+                    .diff => .detail_diff_scroll_down,
+                };
+            }
+            break :blk null;
+        },
+        .wheel_up => blk: {
+            if (ev.on_log) break :blk .log_scroll_up;
+            if (ev.on_detail) {
+                break :blk switch (detail_kind) {
+                    .files => .detail_files_scroll_up,
+                    .diff => .detail_diff_scroll_up,
+                };
+            }
+            break :blk null;
+        },
+        .ignore => null,
+    };
+}
+
+// ====================== TODO 2 phase 1: fromZigzagMouseForMode wrapper ======================
+//
+// 既存 `fromZigzagMouse` は changes モード専用（回帰安全・H7）。本節は ViewMode 別の新エントリ
+// ポイントを追加し、mode==.changes は既存関数へ delegating、mode==.log は log レイアウト
+// （view.LogLayout）で log/detail ペインのヒットテストを行い MouseEvent の log_row/detail_row/
+// on_log/on_detail を詰める。★R24: ホイールは scroll 系のみ（cursor 移動はしない・1 Msg 制約）。
+
+/// ViewMode 別マウスアダプタのエントリポイント。
+/// - `.changes`: 既存 `fromZigzagMouse` へ delegating（`changes_layout`/`changes_scratch` を使用）。
+/// - `.log`: `fromZigzagMouseForLog` へ delegating（`log_layout`/`log_scratch`/`detail_scratch` を使用）。
+/// 使わない側のレイアウト/scratch は呼び出し側でダミーを渡してよい（参照しないため）。
+pub fn fromZigzagMouseForMode(
+    mode: ViewMode,
+    ev: zz.MouseEvent,
+    model: *const Model,
+    changes_layout: view.Layout,
+    log_layout: view.LogLayout,
+    cs: *ClickState,
+    now_ms: i64,
+    changes_scratch: []view.ChangesRow,
+    log_scratch: []view.LogRow,
+    detail_scratch: []view.DetailRow,
+) MouseEvent {
+    return switch (mode) {
+        .changes => fromZigzagMouse(ev, model, changes_layout, cs, now_ms, changes_scratch),
+        .log => fromZigzagMouseForLog(ev, model, log_layout, cs, now_ms, log_scratch, detail_scratch),
+    };
+}
+
+/// log ビューのマウスヒットテスト（spec §3.5）。
+/// - ペイン判定: クリック座標と `log_layout` の各 Rect（log/detail）を照合し pane と on_log/on_detail を決める。
+///   log 左ペイン→ pane=.changes（Focus 値を流用・log ペインは .changes で表現）・on_log=true。
+///   detail 右ペイン→ pane=.diff（Focus 値を流用）・on_detail=true。
+/// - log ペイン内クリックなら表示行→`log_commits.items` の格納インデックスを `log_row` に入れる
+///   （`logRowLayout` が見出し無し・i 行目=格納 i なので `log_scroll + vr` で解決）。
+/// - detail ペイン（detail_kind==.files）内クリックなら表示行→`detail_files.items` の格納インデックスを
+///   `detail_row` に入れる（`detailRowLayout` で解決・`detail_scroll` を加算）。
+///   detail_kind==.diff では detail_row を設定しない（diff は読み取り専用・cursor 移動しない）。
+/// - ダブルクリック判定は `classifyClick`（changes と同型）。phase 1 では stage 無しで no-op になるが
+///   `left_double` を返す点は changes と同じ（`mouseToMsgForLog` が null を返す）。
+pub fn fromZigzagMouseForLog(
+    ev: zz.MouseEvent,
+    model: *const Model,
+    layout: view.LogLayout,
+    cs: *ClickState,
+    now_ms: i64,
+    log_scratch: []view.LogRow,
+    detail_scratch: []view.DetailRow,
+) MouseEvent {
+    const on_log = pointInRect(ev.x, ev.y, layout.log);
+    const on_detail = pointInRect(ev.x, ev.y, layout.detail);
+    // pane は Focus 値を流用（log 左 = .changes、detail 右 = .diff）。両ペイン外なら null。
+    const pane: ?Focus = if (on_log) .changes else if (on_detail) .diff else null;
+
+    // log ペイン内クリック: 表示行 vr に log_scroll を足して絶対 visual row（== 格納 index）を引く。
+    // logRowLayout は見出し無し・i 行目 = 格納 i なので、単純に `log_scroll + vr` が格納 index。
+    // 範囲外（vr が log_commits.items.len を超える）は null。
+    const log_row: ?usize = if (on_log) blk: {
+        if (ev.y < layout.log.y or ev.y >= layout.log.y + layout.log.h) break :blk null;
+        const vr = @as(usize, ev.y - layout.log.y);
+        const abs = model.log_scroll + vr;
+        if (abs >= model.log_commits.items.len) break :blk null;
+        _ = log_scratch; // logRowLayout は見出し無し・自明なので scratch を使わず直接 index 計算で十分
+        break :blk abs;
+    } else null;
+
+    // detail ペイン内クリック: detail_kind==.files のときだけ detail_row を解決。
+    // detailRowLayout を scratch 経由で呼び、表示行→格納 index を引く（detail_scroll を加算）。
+    const detail_row: ?usize = if (on_detail and model.detail_kind == .files) blk: {
+        if (ev.y < layout.detail.y or ev.y >= layout.detail.y + layout.detail.h) break :blk null;
+        const vr = @as(usize, ev.y - layout.detail.y);
+        const abs = model.detail_scroll + vr;
+        if (abs >= model.detail_files.items.len) break :blk null;
+        // detailRowLayout で有効性を再確認（i 行目 = 格納 i なので abs そのままでもよいが、
+        // 将来の見出し追加に備えて scratch 経由で解決する・範囲外は null）。
+        const n = view.detailRowLayout(model, detail_scratch);
+        if (abs >= n) break :blk null;
+        break :blk detail_scratch[abs].storage_index;
+    } else null;
+
+    // 共通ベースを一度組く。kind は全分岐で上書きされるためデフォルト .ignore は漏れない（制約5）。
+    const base = MouseEvent{
+        .pane = pane,
+        .log_row = log_row,
+        .detail_row = detail_row,
+        .on_log = on_log,
+        .on_detail = on_detail,
+        // .kind は MouseEvent.kind のデフォルト .ignore を使う（各分岐で必ず上書き）
+    };
+    return switch (ev.button) {
+        // ホイールは event_type に関係なく honor する（SGR では wheel も press 扱いで来る）。
+        // ★R24: scroll 系のみ。cursor 移動はしない（on_log/on_detail でどの scroll 系かは mouseToMsgForLog が決める）。
+        .wheel_up => blk: {
+            var m = base;
+            m.kind = .wheel_up;
+            break :blk m;
+        },
+        .wheel_down => blk: {
+            var m = base;
+            m.kind = .wheel_down;
+            break :blk m;
+        },
+        .left => blk: {
+            // press のみ click/double として扱う。release/drag/move は `ignore`（log_select_index/
+            // detail_select_index/set_focus を誤爆させない・changes と同型）。
+            if (ev.event_type != .press) {
+                var m = base;
+                m.kind = .ignore;
+                break :blk m;
+            }
+            // ダブルクリック判定は log_row（log ペイン）か detail_row（detail ペイン）で行う。
+            // phase 1 では stage 無しのため left_double は mouseToMsgForLog で null になるが、
+            // 分岐自体は changes と同型で残す（将来の stage 拡張の伏線）。
+            const click_row: ?usize = log_row orelse detail_row;
+            const kind: @FieldType(MouseEvent, "kind") = switch (classifyClick(cs, now_ms, click_row)) {
+                .double => .left_double,
+                .single => .left_click,
+            };
+            var m = base;
+            m.kind = kind;
+            break :blk m;
+        },
+        // 中/右/wheel_left/wheel_right/button_8..11/none と bare motion は何もしない。
+        else => blk: {
+            var m = base;
+            m.kind = .ignore;
+            break :blk m;
+        },
     };
 }
 
@@ -671,6 +956,516 @@ test "fromZigzagMouse: base fields propagate to all branches (factoring invarian
     try std.testing.expectEqual(Focus.diff, me.pane.?); // base から伝播
     try std.testing.expect(me.on_diff); // base から伝播
     try std.testing.expectEqual(@as(usize, 4), me.diff_line.?); // 2 + 2 = 4（base から伝播）
+}
+
+// ====================== TODO 2 phase 1: ViewMode 別入力ルーティングのテスト ======================
+
+test "keyToMsgForMode: changes mode delegates to keyToMsg" {
+    // 回帰安全: changes mode は既存 keyToMsg と同一結果。
+    try std.testing.expect(keyToMsgForMode(.changes, .changes, .files, .{ .char = 'j' }).? == .key_down);
+    try std.testing.expect(keyToMsgForMode(.changes, .changes, .files, .{ .char = 'q' }).? == .quit);
+    try std.testing.expect(keyToMsgForMode(.changes, .changes, .files, .{ .char = 's' }).? == .toggle_stage);
+    try std.testing.expect(keyToMsgForMode(.changes, .changes, .files, .tab).? == .focus_next);
+    // detail_kind は changes mode では無視される（files を渡しても diff を渡しても同じ）。
+    try std.testing.expect(keyToMsgForMode(.changes, .changes, .diff, .{ .char = 'j' }).? == .key_down);
+}
+
+test "keyToMsgForMode: log mode L toggles view mode (global)" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'L' }).? == .toggle_view_mode);
+    // focus/detail_kind に依存しない
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .{ .char = 'L' }).? == .toggle_view_mode);
+}
+
+test "keyToMsgForMode: log mode q quits (global)" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'q' }).? == .quit);
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .{ .char = 'q' }).? == .quit);
+}
+
+test "keyToMsgForMode: log mode r requests refresh (global)" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'r' }).? == .request_refresh);
+}
+
+test "keyToMsgForMode: log mode tab is focus_next (global)" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .tab).? == .focus_next);
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .tab).? == .focus_next);
+}
+
+test "keyToMsgForMode: log mode j in left pane is log_cursor_down" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'j' }).? == .log_cursor_down);
+}
+
+test "keyToMsgForMode: log mode k in left pane is log_cursor_up" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'k' }).? == .log_cursor_up);
+}
+
+test "keyToMsgForMode: log mode arrow down/up in left pane map to log cursor" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .down).? == .log_cursor_down);
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .up).? == .log_cursor_up);
+}
+
+test "keyToMsgForMode: log mode j in right pane (files) is detail_cursor_down" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .{ .char = 'j' }).? == .detail_cursor_down);
+}
+
+test "keyToMsgForMode: log mode j in right pane (diff) is detail_diff_scroll_down" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .{ .char = 'j' }).? == .detail_diff_scroll_down);
+}
+
+test "keyToMsgForMode: log mode k in right pane (files) is detail_cursor_up" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .{ .char = 'k' }).? == .detail_cursor_up);
+}
+
+test "keyToMsgForMode: log mode k in right pane (diff) is detail_diff_scroll_up" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .{ .char = 'k' }).? == .detail_diff_scroll_up);
+}
+
+test "keyToMsgForMode: log mode Enter in left pane is log_open_detail" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .enter).? == .log_open_detail);
+}
+
+test "keyToMsgForMode: log mode Space in left pane is log_open_detail" {
+    // space は fromZigzagKey で char=' ' に正規化されるため char arm で処理。
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = ' ' }).? == .log_open_detail);
+}
+
+test "keyToMsgForMode: log mode Enter in right pane (files) is detail_select_file" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .enter).? == .detail_select_file);
+}
+
+test "keyToMsgForMode: log mode Enter in right pane (diff) is no-op" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .enter) == null);
+}
+
+test "keyToMsgForMode: log mode Esc in right pane (diff) is detail_back_to_files" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .escape).? == .detail_back_to_files);
+}
+
+test "keyToMsgForMode: log mode Backspace in right pane (diff) is detail_back_to_files" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .backspace).? == .detail_back_to_files);
+}
+
+test "keyToMsgForMode: log mode 'u' in right pane (diff) is detail_back_to_files" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .{ .char = 'u' }).? == .detail_back_to_files);
+}
+
+test "keyToMsgForMode: log mode Esc in right pane (files) is no-op (already files)" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .escape) == null);
+}
+
+test "keyToMsgForMode: log mode s is unmapped (no stage)" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 's' }) == null);
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .{ .char = 's' }) == null);
+}
+
+test "keyToMsgForMode: log mode c is unmapped (no commit focus)" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'c' }) == null);
+}
+
+test "keyToMsgForMode: log mode v/#/H are unmapped (no line selection)" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .{ .char = 'v' }) == null);
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .{ .char = '#' }) == null);
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .{ .char = 'H' }) == null);
+}
+
+test "keyToMsgForMode: log mode Ctrl+d in left pane is log_scroll_down" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .ctrl_d).? == .log_scroll_down);
+}
+
+test "keyToMsgForMode: log mode Ctrl+u in left pane is log_scroll_up" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .ctrl_u).? == .log_scroll_up);
+}
+
+test "keyToMsgForMode: log mode Ctrl+d in right pane (files) is detail_files_scroll_down" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .ctrl_d).? == .detail_files_scroll_down);
+}
+
+test "keyToMsgForMode: log mode Ctrl+d in right pane (diff) is detail_diff_scroll_down" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .ctrl_d).? == .detail_diff_scroll_down);
+}
+
+test "keyToMsgForMode: log mode Ctrl+u in right pane (diff) is detail_diff_scroll_up" {
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .diff, .ctrl_u).? == .detail_diff_scroll_up);
+}
+
+test "keyToMsgForMode: log mode unmapped char returns null" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'z' }) == null);
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .{ .char = 'z' }) == null);
+}
+
+test "mouseToMsgForMode: changes mode delegates to mouseToMsg" {
+    const ev = MouseEvent{ .kind = .left_click, .file_row = 1 };
+    const msg = mouseToMsgForMode(.changes, ev, .files).?;
+    try std.testing.expect(msg == .select_index);
+    try std.testing.expectEqual(@as(usize, 1), msg.select_index);
+    // detail_kind は changes mode では無視
+    const msg2 = mouseToMsgForMode(.changes, ev, .diff).?;
+    try std.testing.expect(msg2 == .select_index);
+}
+
+test "mouseToMsgForMode: log mode click on log row yields log_select_index" {
+    const ev = MouseEvent{ .kind = .left_click, .log_row = 3 };
+    const msg = mouseToMsgForMode(.log, ev, .files).?;
+    try std.testing.expect(msg == .log_select_index);
+    try std.testing.expectEqual(@as(usize, 3), msg.log_select_index);
+}
+
+test "mouseToMsgForMode: log mode click on detail row yields detail_select_index" {
+    const ev = MouseEvent{ .kind = .left_click, .detail_row = 2 };
+    const msg = mouseToMsgForMode(.log, ev, .files).?;
+    try std.testing.expect(msg == .detail_select_index);
+    try std.testing.expectEqual(@as(usize, 2), msg.detail_select_index);
+}
+
+test "mouseToMsgForMode: log mode click on pane (no row) yields set_focus" {
+    const ev = MouseEvent{ .kind = .left_click, .pane = .changes };
+    const msg = mouseToMsgForMode(.log, ev, .files).?;
+    try std.testing.expect(msg == .set_focus);
+    try std.testing.expectEqual(Focus.changes, msg.set_focus);
+}
+
+test "mouseToMsgForMode: log mode click with no target is null" {
+    const ev = MouseEvent{ .kind = .left_click };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .files) == null);
+}
+
+test "mouseToMsgForMode: log mode left_double is no-op (phase 1 no stage)" {
+    const ev = MouseEvent{ .kind = .left_double, .log_row = 1 };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .files) == null);
+}
+
+test "mouseToMsgForMode: log mode wheel_down on log pane scrolls log" {
+    const ev = MouseEvent{ .kind = .wheel_down, .on_log = true };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .files).? == .log_scroll_down);
+}
+
+test "mouseToMsgForMode: log mode wheel_up on log pane scrolls log" {
+    const ev = MouseEvent{ .kind = .wheel_up, .on_log = true };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .files).? == .log_scroll_up);
+}
+
+test "mouseToMsgForMode: log mode wheel_down on detail pane (files) scrolls detail_files" {
+    const ev = MouseEvent{ .kind = .wheel_down, .on_detail = true };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .files).? == .detail_files_scroll_down);
+}
+
+test "mouseToMsgForMode: log mode wheel_down on detail pane (diff) scrolls detail_diff" {
+    const ev = MouseEvent{ .kind = .wheel_down, .on_detail = true };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .diff).? == .detail_diff_scroll_down);
+}
+
+test "mouseToMsgForMode: log mode wheel_up on detail pane (files) scrolls detail_files up" {
+    const ev = MouseEvent{ .kind = .wheel_up, .on_detail = true };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .files).? == .detail_files_scroll_up);
+}
+
+test "mouseToMsgForMode: log mode wheel_up on detail pane (diff) scrolls detail_diff up" {
+    const ev = MouseEvent{ .kind = .wheel_up, .on_detail = true };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .diff).? == .detail_diff_scroll_up);
+}
+
+test "mouseToMsgForMode: log mode wheel with no pane flag is null" {
+    const ev_down = MouseEvent{ .kind = .wheel_down };
+    const ev_up = MouseEvent{ .kind = .wheel_up };
+    try std.testing.expect(mouseToMsgForMode(.log, ev_down, .files) == null);
+    try std.testing.expect(mouseToMsgForMode(.log, ev_up, .files) == null);
+}
+
+test "mouseToMsgForMode: log mode ignore event is null" {
+    const ev = MouseEvent{ .kind = .ignore, .on_log = true };
+    try std.testing.expect(mouseToMsgForMode(.log, ev, .files) == null);
+}
+
+test "MouseEvent: new log/detail fields default to null/false" {
+    const ev = MouseEvent{};
+    try std.testing.expectEqual(@as(?usize, null), ev.log_row);
+    try std.testing.expectEqual(@as(?usize, null), ev.detail_row);
+    try std.testing.expect(!ev.on_log);
+    try std.testing.expect(!ev.on_detail);
+    try std.testing.expect(!ev.on_detail_diff);
+}
+
+test "MouseEvent: new fields can be set explicitly" {
+    const ev = MouseEvent{
+        .kind = .left_click,
+        .log_row = 5,
+        .detail_row = 7,
+        .on_log = true,
+        .on_detail = true,
+        .on_detail_diff = true,
+    };
+    try std.testing.expectEqual(@as(?usize, 5), ev.log_row);
+    try std.testing.expectEqual(@as(?usize, 7), ev.detail_row);
+    try std.testing.expect(ev.on_log);
+    try std.testing.expect(ev.on_detail);
+    try std.testing.expect(ev.on_detail_diff);
+}
+
+// ====================== TODO 2 phase 1: fromZigzagMouseForLog behavioral test ======================
+//
+// fromZigzagMouseForLog は tty/Io 不要な純粋関数（zz.MouseEvent は素の struct・now_ms は注入）。
+// log/detail ペインの当たり判定・log_row/detail_row 解析・スクロールオフセット考慮・
+// release/drag/move の ignore・ホイールの on_log/on_detail を検証する。
+
+/// log 用テスト Model を組む。log_commits に 3 件・detail_files に 2 件。呼び出し側が deinit する。
+fn buildLogMouseTestModel(a: std.mem.Allocator) !Model {
+    var m = try Model.init(a, "/r");
+    errdefer m.deinit();
+    const log = @import("git/log.zig");
+    var commits: [3]log.Commit = undefined;
+    inline for ([_][]const u8{ "h1hash", "h2hash", "h3hash" }, 0..) |h, i| {
+        commits[i] = .{
+            .hash = try a.dupe(u8, h),
+            .parents = try a.alloc([]u8, 0),
+            .author = try a.dupe(u8, "a"),
+            .epoch_sec = @as(i64, @intCast(i)),
+            .subject = try a.dupe(u8, "subj"),
+            .refs = try a.dupe(u8, ""),
+        };
+    }
+    defer for (&commits) |*c| c.deinit(a);
+    try m.replaceLogCommits(&commits);
+
+    const show = @import("git/show.zig");
+    var entries: [2]show.NameStatus = undefined;
+    entries[0] = .{ .status = 'M', .path = try a.dupe(u8, "f.txt"), .orig_path = null };
+    entries[1] = .{ .status = 'A', .path = try a.dupe(u8, "g.txt"), .orig_path = null };
+    defer for (&entries) |*e| e.deinit(a);
+    try m.replaceDetailFiles(&entries);
+    m.detail_kind = .files;
+    return m;
+}
+
+/// log レイアウト: 左 40% log（y in [0,6)）、右 60% detail（y in [0,6)）、status は下。
+/// log_scratch/detail_scratch のテストで使う固定レイアウト。
+const log_mouse_test_layout = view.LogLayout{
+    .log = .{ .x = 0, .y = 0, .w = 40, .h = 6 },
+    .detail = .{ .x = 40, .y = 0, .w = 40, .h = 6 },
+    .status = .{ .x = 0, .y = 6, .w = 80, .h = 1 },
+};
+
+test "fromZigzagMouseForLog: left press on log row 1 yields left_click -> log_select_index" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // log ペイン内 (x=5, y=1) → log_row = log_scroll(0) + 1 = 1。
+    const ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .left, .event_type = .press };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
+    try std.testing.expectEqual(@as(?usize, 1), me.log_row);
+    try std.testing.expect(me.on_log);
+    try std.testing.expect(!me.on_detail);
+    try std.testing.expectEqual(Focus.changes, me.pane.?);
+    const msg = mouseToMsgForMode(.log, me, .files).?;
+    try std.testing.expect(msg == .log_select_index);
+    try std.testing.expectEqual(@as(usize, 1), msg.log_select_index);
+}
+
+test "fromZigzagMouseForLog: left press on detail file row yields detail_select_index" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // detail ペイン内 (x=50, y=1) → detail_row = detail_scroll(0) + 1 = 1。
+    const ev = zz.MouseEvent{ .x = 50, .y = 1, .button = .left, .event_type = .press };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
+    try std.testing.expectEqual(@as(?usize, 1), me.detail_row);
+    try std.testing.expect(me.on_detail);
+    try std.testing.expect(!me.on_log);
+    try std.testing.expectEqual(Focus.diff, me.pane.?);
+    const msg = mouseToMsgForMode(.log, me, .files).?;
+    try std.testing.expect(msg == .detail_select_index);
+    try std.testing.expectEqual(@as(usize, 1), msg.detail_select_index);
+}
+
+test "fromZigzagMouseForLog: left press on detail pane when detail_kind=diff yields set_focus (no row)" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    m.detail_kind = .diff; // diff ビューでは detail_row を解決しない
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 50, .y = 1, .button = .left, .event_type = .press };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
+    try std.testing.expectEqual(@as(?usize, null), me.detail_row); // diff では null
+    try std.testing.expect(me.on_detail);
+    // detail_row 無し → set_focus へ（mouseToMsgForLog の left_click 分岐）。
+    const msg = mouseToMsgForMode(.log, me, .diff).?;
+    try std.testing.expect(msg == .set_focus);
+    try std.testing.expectEqual(Focus.diff, msg.set_focus);
+}
+
+test "fromZigzagMouseForLog: left press below rows yields set_focus (no row)" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // log ペイン内だが行数(3)を超える y=5 → log_row = null（範囲外）→ set_focus。
+    const ev = zz.MouseEvent{ .x = 5, .y = 5, .button = .left, .event_type = .press };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
+    try std.testing.expectEqual(@as(?usize, null), me.log_row);
+    const msg = mouseToMsgForMode(.log, me, .files).?;
+    try std.testing.expect(msg == .set_focus);
+}
+
+test "fromZigzagMouseForLog: release/drag on log pane is ignored" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // release は ignore（changes と同型・二重 select 防止）。
+    const rel = zz.MouseEvent{ .x = 5, .y = 1, .button = .left, .event_type = .release };
+    const me_rel = fromZigzagMouseForLog(rel, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me_rel.kind);
+    try std.testing.expect(mouseToMsgForMode(.log, me_rel, .files) == null);
+    const drg = zz.MouseEvent{ .x = 5, .y = 1, .button = .left, .event_type = .drag };
+    const me_drg = fromZigzagMouseForLog(drg, &m, log_mouse_test_layout, &cs, 1100, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me_drg.kind);
+    try std.testing.expect(mouseToMsgForMode(.log, me_drg, .files) == null);
+}
+
+test "fromZigzagMouseForLog: bare MOTION over log pane is ignored" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .none, .event_type = .move };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me.kind);
+    try std.testing.expect(mouseToMsgForMode(.log, me, .files) == null);
+}
+
+test "fromZigzagMouseForLog: right/middle press on log pane is ignored" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    const right = zz.MouseEvent{ .x = 5, .y = 1, .button = .right, .event_type = .press };
+    const me_right = fromZigzagMouseForLog(right, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me_right.kind);
+    const middle = zz.MouseEvent{ .x = 5, .y = 1, .button = .middle, .event_type = .press };
+    const me_middle = fromZigzagMouseForLog(middle, &m, log_mouse_test_layout, &cs, 1100, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me_middle.kind);
+}
+
+test "fromZigzagMouseForLog: wheel_down/up on log pane scrolls log" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // log ペイン上の wheel_down → on_log=true → mouseToMsgForLog が log_scroll_down を返す（R24）。
+    const ev_down = zz.MouseEvent{ .x = 5, .y = 1, .button = .wheel_down, .event_type = .press };
+    const me_down = fromZigzagMouseForLog(ev_down, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .wheel_down), me_down.kind);
+    try std.testing.expect(me_down.on_log);
+    try std.testing.expect(mouseToMsgForMode(.log, me_down, .files).? == .log_scroll_down);
+    const ev_up = zz.MouseEvent{ .x = 5, .y = 1, .button = .wheel_up, .event_type = .press };
+    const me_up = fromZigzagMouseForLog(ev_up, &m, log_mouse_test_layout, &cs, 1100, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .wheel_up), me_up.kind);
+    try std.testing.expect(mouseToMsgForMode(.log, me_up, .files).? == .log_scroll_up);
+}
+
+test "fromZigzagMouseForLog: wheel_down on detail pane (files) scrolls detail_files" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // detail ペイン上の wheel_down → on_detail=true → detail_kind=files で detail_files_scroll_down。
+    const ev = zz.MouseEvent{ .x = 50, .y = 1, .button = .wheel_down, .event_type = .press };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .wheel_down), me.kind);
+    try std.testing.expect(me.on_detail);
+    try std.testing.expect(mouseToMsgForMode(.log, me, .files).? == .detail_files_scroll_down);
+}
+
+test "fromZigzagMouseForLog: wheel_down on detail pane (diff) scrolls detail_diff" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    m.detail_kind = .diff;
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 50, .y = 1, .button = .wheel_down, .event_type = .press };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .wheel_down), me.kind);
+    try std.testing.expect(me.on_detail);
+    try std.testing.expect(mouseToMsgForMode(.log, me, .diff).? == .detail_diff_scroll_down);
+}
+
+test "fromZigzagMouseForLog: click resolves against log_scroll offset (windowed pane)" {
+    // log_scroll=1 のウィンドウで、ペイン相対行 0 のクリックは絶対 visual row 1（=格納 1）に解決される。
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    m.log_scroll = 1;
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    const ev = zz.MouseEvent{ .x = 5, .y = 0, .button = .left, .event_type = .press };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(?usize, 1), me.log_row); // 1 + 0 = 1
+    try std.testing.expect(mouseToMsgForMode(.log, me, .files).? == .log_select_index);
+    try std.testing.expectEqual(@as(usize, 1), mouseToMsgForMode(.log, me, .files).?.log_select_index);
+}
+
+test "fromZigzagMouseForLog: base fields propagate to all branches (factoring invariant)" {
+    // 制約5の回帰保護: ignore 系分岐（右クリック等）でも base フィールド（pane/on_log/on_detail/log_row）
+    // が伝播することを検証。将来のフィールド追加で特定分岐だけ取り残されるのを防ぐ。
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // log ペイン上で右クリック（else 分岐 = ignore）。kind は ignore だが、
+    // pane/on_log/log_row は base から伝播しているはず。
+    const ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .right, .event_type = .press };
+    const me = fromZigzagMouseForLog(ev, &m, log_mouse_test_layout, &cs, 1000, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .ignore), me.kind);
+    try std.testing.expectEqual(Focus.changes, me.pane.?); // base から伝播
+    try std.testing.expect(me.on_log); // base から伝播
+    try std.testing.expectEqual(@as(?usize, 1), me.log_row.?); // base から伝播
+}
+
+test "fromZigzagMouseForMode: changes mode delegates to fromZigzagMouse (regression)" {
+    // 回帰保護: mode==.changes のとき fromZigzagMouse と同一結果（log_layout/scratch は無視）。
+    var m = try buildMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var changes_scratch: [16]view.ChangesRow = undefined;
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // 表示行 1 = B（格納 index 1）。changes ペイン内 (x=5, y=1)。
+    const ev = zz.MouseEvent{ .x = 5, .y = 1, .button = .left, .event_type = .press };
+    const me = fromZigzagMouseForMode(.changes, ev, &m, mouse_test_layout, log_mouse_test_layout, &cs, 1000, &changes_scratch, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
+    try std.testing.expectEqual(@as(?usize, 1), me.file_row);
+    try std.testing.expect(!me.on_log); // changes モードでは log 系フィールドは触らない
+    try std.testing.expect(!me.on_detail);
+}
+
+test "fromZigzagMouseForMode: log mode delegates to fromZigzagMouseForLog" {
+    var m = try buildLogMouseTestModel(std.testing.allocator);
+    defer m.deinit();
+    var changes_scratch: [16]view.ChangesRow = undefined;
+    var log_scratch: [16]view.LogRow = undefined;
+    var detail_scratch: [16]view.DetailRow = undefined;
+    var cs = ClickState{};
+    // log ペイン内 (x=5, y=2) → log_row = 2。
+    const ev = zz.MouseEvent{ .x = 5, .y = 2, .button = .left, .event_type = .press };
+    const me = fromZigzagMouseForMode(.log, ev, &m, mouse_test_layout, log_mouse_test_layout, &cs, 1000, &changes_scratch, &log_scratch, &detail_scratch);
+    try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
+    try std.testing.expectEqual(@as(?usize, 2), me.log_row);
+    try std.testing.expect(me.on_log);
 }
 
 // zigzag 依存の pub 関数（fromZigzagKey/fromZigzagMouse）も型検査されるよう refAllDecls する。
