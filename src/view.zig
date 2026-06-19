@@ -17,6 +17,7 @@ const zz = @import("zigzag");
 const Model = @import("model.zig").Model;
 const Focus = @import("model.zig").Focus;
 const Section = @import("git/status.zig").Section;
+const graph_mod = @import("git/graph.zig");
 
 pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
 pub const Layout = struct { changes: Rect, diff: Rect, commit: Rect, status: Rect };
@@ -369,10 +370,68 @@ fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
 // いずれも std.mem.join(a, "\n", ...) でプレーン改行結合し（★M9: zz.joinVertical は使わない）、
 // 最後に fitPane でペイン幅/高さへクランプする（changes と同一の fitPane gotcha 適用）。
 
-/// log ペインの描画。`<short-hash> <subject> <refs>` 形式（spec §3.6 / §5）。
-/// 選択行（`log_selected`）は reverse で強調。`log_scroll` からのウィンドウを描画し、
-/// 選択が可視範囲に入るよう `log_scroll` を調整する（changes の changes_scroll と同型・唯一の writer）。
-fn renderLog(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
+/// `epoch_sec`（1970-01-01 00:00:00 UTC からの秒）を `YYYY-MM-DD`（UTC）へ整形する純粋関数。
+/// `std.time.epoch` API で年月日を計算（ローカルタイムゾーン非依存・UTC 固定）。
+/// 失敗時はフォールバック文字列を返す（呼び出し側で deinit 不要・arena 想定）。
+fn formatAuthorDateUTC(a: std.mem.Allocator, epoch_sec: i64) []const u8 {
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(epoch_sec) };
+    const day = es.getEpochDay().calculateYearDay();
+    const month_day = day.calculateMonthDay();
+    return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        @as(u32, day.year),
+        @as(u32, month_day.month.numeric()),
+        @as(u32, month_day.day_index + 1),
+    }) catch "????-??-??";
+}
+
+/// グラフレーンの 6 色ローテーション（Task 9）。レーン番号を色へ巡回割当てする。
+const LANE_COLORS = [_]zz.Color{
+    zz.Color.red, zz.Color.green, zz.Color.yellow,
+    zz.Color.blue, zz.Color.magenta, zz.Color.cyan,
+};
+
+/// レーン番号 → 色（6 色で巡回）。`lane % LANE_COLORS.len` で飽和なく割当て。
+fn laneColor(lane: u16) zz.Color {
+    return LANE_COLORS[lane % LANE_COLORS.len];
+}
+
+/// 1 コミット分のグラフセルを ANSI 色付き文字列へ組み立てる（Task 9）。
+/// 各セルは接続情報（up/down/left/right/is_node）から box-drawing 文字を選び、
+/// レーン色（`laneColor`）で着色する。ノードは太字。`max_width` で列数をクランプ。
+fn renderGraphCells(a: std.mem.Allocator, row: graph_mod.GraphRow, max_width: u16) []const u8 {
+    if (max_width == 0) return "";
+    var parts: std.ArrayList([]const u8) = .empty;
+    const w: usize = @min(@as(usize, max_width), row.cells.len);
+    for (row.cells[0..w], 0..) |cell, i| {
+        const lane: u16 = @intCast(i);
+        const ch: []const u8 = if (cell.is_node)
+            "●"
+        else if (cell.up and cell.down)
+            "│"
+        else if (cell.up and !cell.down)
+            "╵"
+        else if (!cell.up and cell.down)
+            "╷"
+        else if (cell.left and cell.right)
+            "─"
+        else if (cell.left and !cell.right)
+            "╴"
+        else if (cell.right and !cell.left)
+            "╶"
+        else
+            " ";
+        const style = zz.Style{ .foreground = laneColor(lane), .bold_attr = cell.is_node };
+        const styled = style.render(a, ch) catch ch;
+        parts.append(a, styled) catch {};
+    }
+    return std.mem.join(a, "", parts.items) catch "";
+}
+
+/// log ペインの描画（Task 9）。グラフセル + refs + short-hash + subject + author + UTC date を
+/// ペイン幅に応じて段階的に表示する（M-13: responsive column omission）。選択行は reverse。
+/// `log_scroll` からのウィンドウを描画し、選択が可視範囲に入るよう `log_scroll` を調整する
+/// （changes の changes_scroll と同型・唯一の writer）。`pane_w` で列の出し入れを決める。
+fn renderLog(model: *Model, ctx: *const zz.Context, height: u16, pane_w: u16) []const u8 {
     const a = ctx.allocator;
     if (model.log_commits.items.len == 0) return "(no commits)";
 
@@ -384,16 +443,55 @@ fn renderLog(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
     // log_scroll が末尾超過にならないようクランプ（行数が減ったケース）。
     if (model.log_scroll >= total) model.log_scroll = if (total == 0) 0 else total - 1;
 
+    // M-13: ペイン幅に応じたレスポンシブな列省略。狭いペインではグラフ/author/date を順に省く。
+    const show_graph = pane_w >= 30 and model.log_graph_state == .valid;
+    const show_date = pane_w >= 60;
+    const show_author = pane_w >= 45;
+
+    const graph_rows: ?[]const graph_mod.GraphRow = if (model.log_graph_state == .valid)
+        model.log_graph_state.valid.rows.items
+    else
+        null;
+
     var lines: std.ArrayList([]const u8) = .empty; // arena なので deinit 不要
     const start = model.log_scroll;
     const end = @min(total, start + limit);
     for (model.log_commits.items[start..end], start..) |c, i| {
         const selected = (i == model.log_selected);
         const short_hash = if (c.hash.len >= 7) c.hash[0..7] else c.hash;
-        const line: []const u8 = if (c.refs.len > 0)
-            (std.fmt.allocPrint(a, "{s} {s} {s}", .{ short_hash, c.subject, c.refs }) catch short_hash)
-        else
-            (std.fmt.allocPrint(a, "{s} {s}", .{ short_hash, c.subject }) catch short_hash);
+
+        var parts: std.ArrayList([]const u8) = .empty;
+        // グラフセル（グラフが有効かつペイン幅 >= 30 のとき先頭に描く）
+        if (show_graph and graph_rows != null and i < graph_rows.?.len) {
+            const graph_str = renderGraphCells(a, graph_rows.?[i], 20);
+            parts.append(a, graph_str) catch {};
+            parts.append(a, " ") catch {};
+        }
+        // refs（branch/tag 等の装飾）を hash の前に緑で描く
+        if (c.refs.len > 0) {
+            const refs_style = zz.Style{ .foreground = zz.Color.green };
+            const refs_styled = refs_style.render(a, c.refs) catch c.refs;
+            parts.append(a, refs_styled) catch {};
+            parts.append(a, " ") catch {};
+        }
+        // short-hash
+        parts.append(a, short_hash) catch {};
+        parts.append(a, " ") catch {};
+        // subject
+        parts.append(a, c.subject) catch {};
+        // author（ペイン幅 >= 45 のとき）
+        if (show_author) {
+            parts.append(a, " ") catch {};
+            parts.append(a, c.author) catch {};
+        }
+        // UTC date（ペイン幅 >= 60 のとき）
+        if (show_date) {
+            parts.append(a, " ") catch {};
+            const date_str = formatAuthorDateUTC(a, c.epoch_sec);
+            parts.append(a, date_str) catch {};
+        }
+
+        const line = std.mem.join(a, "", parts.items) catch short_hash;
         if (selected) {
             const style = zz.Style{ .reverse_attr = true };
             const styled = style.render(a, line) catch line;
@@ -574,7 +672,7 @@ fn renderLogMode(model: *Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
     const layout = computeLogLayout(ctx.width, ctx.height);
 
-    const log = fitPane(a, renderLog(model, ctx, layout.log.h), layout.log);
+    const log = fitPane(a, renderLog(model, ctx, layout.log.h, layout.log.w), layout.log);
     const detail = fitPane(a, renderDetail(model, ctx, layout.detail.h), layout.detail);
     const status = fitPane(a, renderStatus(model, ctx), layout.status);
 
@@ -903,6 +1001,15 @@ test "detailRowLayout clamps to the provided output slice" {
     var buf: [2]DetailRow = undefined; // 2 件で打ち切り
     const n = detailRowLayout(&m, &buf);
     try std.testing.expectEqual(@as(usize, 2), n);
+}
+
+test "formatAuthorDateUTC: formats epoch to YYYY-MM-DD" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 2023-11-14 22:13:20 UTC = 1700000000
+    const date = formatAuthorDateUTC(a, 1700000000);
+    try std.testing.expectEqualStrings("2023-11-14", date);
 }
 
 test {
