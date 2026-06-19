@@ -1,5 +1,7 @@
 const std = @import("std");
 const status = @import("git/status.zig");
+const log_mod = @import("git/log.zig");
+const show_mod = @import("git/show.zig");
 
 /// 最後に load_diff を発行したファイル識別子（層 1: codex B1 対策）。path のみで追跡すると
 /// partial stage で `? f` → `1 AM` 展開時の section 変化を取り逃がすため、section も持つ。
@@ -7,6 +9,9 @@ const status = @import("git/status.zig");
 pub const DiffOwner = struct { path: []u8, section: status.Section };
 
 pub const Focus = enum { changes, diff, commit };
+
+pub const ViewMode = enum { changes, log };
+pub const DetailKind = enum { files, diff };
 
 pub const FileItem = struct {
     path: []u8,
@@ -35,6 +40,25 @@ pub const Model = struct {
     git_dir: ?[]u8, // 絶対 git-dir パス。null = 解決失敗（フォールバック用）。起動時のみ設定。
     mouse_enabled: bool,
 
+    // --- TODO 2 phase 1: log/detail ビュー ---
+    view_mode: ViewMode,
+    log_commits: std.ArrayList(@import("git/log.zig").Commit),
+    log_selected: usize,
+    log_scroll: usize,
+    log_has_more: bool,
+    log_request_generation: u64,
+    log_page_requested: ?usize,
+    log_restore_hash: ?[]u8,
+    detail_kind: DetailKind,
+    detail_files: std.ArrayList(@import("git/show.zig").NameStatus),
+    detail_selected: usize,
+    detail_scroll: usize,
+    detail_owner_hash: ?[]u8,
+    detail_diff: []u8,
+    detail_diff_scroll: usize,
+    detail_diff_owner_hash: ?[]u8,
+    detail_diff_owner_path: ?[]u8,
+
     pub fn init(a: std.mem.Allocator, repo_root: []const u8) !Model {
         return .{
             .allocator = a,
@@ -56,6 +80,24 @@ pub const Model = struct {
             .error_text = try a.dupe(u8, ""),
             .git_dir = null,
             .mouse_enabled = true,
+
+            .view_mode = .changes,
+            .log_commits = .empty,
+            .log_selected = 0,
+            .log_scroll = 0,
+            .log_has_more = false,
+            .log_request_generation = 0,
+            .log_page_requested = null,
+            .log_restore_hash = null,
+            .detail_kind = .files,
+            .detail_files = .empty,
+            .detail_selected = 0,
+            .detail_scroll = 0,
+            .detail_owner_hash = null,
+            .detail_diff = try a.dupe(u8, ""),
+            .detail_diff_scroll = 0,
+            .detail_diff_owner_hash = null,
+            .detail_diff_owner_path = null,
         };
     }
 
@@ -73,6 +115,17 @@ pub const Model = struct {
         if (self.diff_owner) |o| a.free(o.path);
         a.free(self.commit_message);
         a.free(self.error_text);
+
+        // --- TODO 2 phase 1: log/detail の解放 ---
+        for (self.log_commits.items) |*c| c.deinit(a);
+        self.log_commits.deinit(a);
+        if (self.log_restore_hash) |h| a.free(h);
+        for (self.detail_files.items) |*e| e.deinit(a);
+        self.detail_files.deinit(a);
+        if (self.detail_owner_hash) |h| a.free(h);
+        a.free(self.detail_diff);
+        if (self.detail_diff_owner_hash) |h| a.free(h);
+        if (self.detail_diff_owner_path) |p| a.free(p);
     }
 
     /// files を新しいエントリ集合で置換。entries は**複製**する（借用しない）。entries 自体の所有権は
@@ -167,6 +220,116 @@ pub const Model = struct {
         self.diff_owner = null;
     }
 
+    /// 入力 entries（Msg 所有）を deep-copy して新 ArrayList を構築し、成功後に旧を解放して swap（H6/R1）。
+    pub fn replaceLogCommits(self: *Model, entries: []const log_mod.Commit) !void {
+        const a = self.allocator;
+        var next: std.ArrayList(log_mod.Commit) = .empty;
+        errdefer {
+            for (next.items) |*c| c.deinit(a);
+            next.deinit(a);
+        }
+        for (entries) |e| {
+            var cloned = try cloneCommit(a, e);
+            errdefer cloned.deinit(a);
+            try next.append(a, cloned);
+        }
+        for (self.log_commits.items) |*c| c.deinit(a);
+        self.log_commits.deinit(a);
+        self.log_commits = next;
+    }
+
+    /// 既存 log_commits.items と入力 new_entries を全て deep-copy した unified list を構築 → swap（H6/R1）。
+    pub fn appendLogCommits(self: *Model, new_entries: []const log_mod.Commit) !void {
+        const a = self.allocator;
+        var next: std.ArrayList(log_mod.Commit) = .empty;
+        errdefer {
+            for (next.items) |*c| c.deinit(a);
+            next.deinit(a);
+        }
+        for (self.log_commits.items) |c| {
+            var cloned = try cloneCommit(a, c);
+            errdefer cloned.deinit(a);
+            try next.append(a, cloned);
+        }
+        for (new_entries) |e| {
+            var cloned = try cloneCommit(a, e);
+            errdefer cloned.deinit(a);
+            try next.append(a, cloned);
+        }
+        for (self.log_commits.items) |*c| c.deinit(a);
+        self.log_commits.deinit(a);
+        self.log_commits = next;
+    }
+
+    /// detail_files への適用。NameStatus も deep-copy し append 毎に errdefer。
+    pub fn replaceDetailFiles(self: *Model, entries: []const show_mod.NameStatus) !void {
+        const a = self.allocator;
+        var next: std.ArrayList(show_mod.NameStatus) = .empty;
+        errdefer {
+            for (next.items) |*e| e.deinit(a);
+            next.deinit(a);
+        }
+        for (entries) |e| {
+            const path = try a.dupe(u8, e.path);
+            errdefer a.free(path);
+            const orig: ?[]u8 = if (e.orig_path) |op| try a.dupe(u8, op) else null;
+            errdefer if (orig) |o| a.free(o);
+            try next.append(a, .{ .status = e.status, .path = path, .orig_path = orig });
+        }
+        for (self.detail_files.items) |*e| e.deinit(a);
+        self.detail_files.deinit(a);
+        self.detail_files = next;
+    }
+
+    /// H1: detail_owner_hash のセット（旧を free して dup）。
+    pub fn setDetailOwnerHash(self: *Model, hash: []const u8) !void {
+        const a = self.allocator;
+        const new = try a.dupe(u8, hash);
+        if (self.detail_owner_hash) |old| a.free(old);
+        self.detail_owner_hash = new;
+    }
+
+    pub fn clearDetailOwner(self: *Model) void {
+        const a = self.allocator;
+        if (self.detail_owner_hash) |old| a.free(old);
+        self.detail_owner_hash = null;
+    }
+
+    /// H1: detail_diff_owner のセット（hash と path 両方）。
+    pub fn setDetailDiffOwner(self: *Model, hash: []const u8, path: []const u8) !void {
+        const a = self.allocator;
+        const new_hash = try a.dupe(u8, hash);
+        errdefer a.free(new_hash);
+        const new_path = try a.dupe(u8, path);
+        errdefer a.free(new_path);
+        if (self.detail_diff_owner_hash) |old| a.free(old);
+        if (self.detail_diff_owner_path) |old| a.free(old);
+        self.detail_diff_owner_hash = new_hash;
+        self.detail_diff_owner_path = new_path;
+    }
+
+    pub fn clearDetailDiffOwner(self: *Model) void {
+        const a = self.allocator;
+        if (self.detail_diff_owner_hash) |old| a.free(old);
+        if (self.detail_diff_owner_path) |old| a.free(old);
+        self.detail_diff_owner_hash = null;
+        self.detail_diff_owner_path = null;
+    }
+
+    /// R4: log_restore_hash のセット。
+    pub fn setLogRestoreHash(self: *Model, hash: []const u8) !void {
+        const a = self.allocator;
+        const new = try a.dupe(u8, hash);
+        if (self.log_restore_hash) |old| a.free(old);
+        self.log_restore_hash = new;
+    }
+
+    pub fn clearLogRestoreHash(self: *Model) void {
+        const a = self.allocator;
+        if (self.log_restore_hash) |old| a.free(old);
+        self.log_restore_hash = null;
+    }
+
     /// 表示順の section ランク（staged が先頭、untracked が末尾）。
     fn sectionRank(s: status.Section) u8 {
         return switch (s) {
@@ -232,6 +395,42 @@ pub fn isRenamePartialState(model: *const Model) bool {
 pub fn selectionRange(cursor: usize, anchor: ?usize) struct { lo: usize, hi: usize } {
     const a = anchor orelse cursor;
     return .{ .lo = @min(cursor, a), .hi = @max(cursor, a) };
+}
+
+/// ヘルパ: Commit の deep-copy（R1: 各フィールド毎に errdefer で順次 rollback）。
+fn cloneCommit(a: std.mem.Allocator, c: log_mod.Commit) !log_mod.Commit {
+    var out: log_mod.Commit = undefined;
+    out.hash = try a.dupe(u8, c.hash);
+    errdefer a.free(out.hash);
+    out.parents = try cloneStringSlice(a, c.parents);
+    errdefer freeStringSlice(a, out.parents);
+    out.author = try a.dupe(u8, c.author);
+    errdefer a.free(out.author);
+    out.subject = try a.dupe(u8, c.subject);
+    errdefer a.free(out.subject);
+    out.refs = try a.dupe(u8, c.refs);
+    errdefer a.free(out.refs);
+    out.epoch_sec = c.epoch_sec;
+    return out;
+}
+
+fn cloneStringSlice(a: std.mem.Allocator, src: []const []u8) ![][]u8 {
+    const out = try a.alloc([]u8, src.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |s| a.free(s);
+        a.free(out);
+    }
+    for (src, 0..) |s, i| {
+        out[i] = try a.dupe(u8, s);
+        initialized = i + 1;
+    }
+    return out;
+}
+
+fn freeStringSlice(a: std.mem.Allocator, src: [][]u8) void {
+    for (src) |s| a.free(s);
+    a.free(src);
 }
 
 test "init/deinit leaves no leaks" {
@@ -532,4 +731,120 @@ test "Bug 2: full stage of untracked follows selection to staged entry" {
     try m.replaceFiles(&e2);
     try std.testing.expectEqualStrings("f.txt", m.files.items[m.selected].path);
     try std.testing.expectEqual(status.Section.staged, m.files.items[m.selected].section);
+}
+
+test "Model.log fields initialize to defaults (ViewMode=changes, empty log_commits)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try std.testing.expectEqual(ViewMode.changes, m.view_mode);
+    try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
+    try std.testing.expectEqual(@as(usize, 0), m.log_selected);
+    try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_restore_hash);
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_owner_hash);
+    try std.testing.expectEqual(DetailKind.files, m.detail_kind);
+}
+
+test "replaceLogCommits deep-copies entries and frees old (H6/R1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const log = @import("git/log.zig");
+    const c = log.Commit{
+        .hash = try a.dupe(u8, "h1"),
+        .parents = try a.alloc([]u8, 0),
+        .author = try a.dupe(u8, "a1"),
+        .epoch_sec = 1,
+        .subject = try a.dupe(u8, "s1"),
+        .refs = try a.dupe(u8, ""),
+    };
+    defer {
+        a.free(c.hash);
+        a.free(c.parents);
+        a.free(c.author);
+        a.free(c.subject);
+        a.free(c.refs);
+    }
+    try m.replaceLogCommits(&.{c});
+    try std.testing.expectEqual(@as(usize, 1), m.log_commits.items.len);
+    try std.testing.expectEqualStrings("h1", m.log_commits.items[0].hash);
+    // Deep-copy: different memory from input
+    try std.testing.expect(c.hash.ptr != m.log_commits.items[0].hash.ptr);
+}
+
+test "appendLogCommits deep-copies new entries to existing list (H6/R1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const log = @import("git/log.zig");
+    const c1 = log.Commit{
+        .hash = try a.dupe(u8, "h1"),
+        .parents = try a.alloc([]u8, 0),
+        .author = try a.dupe(u8, "a1"),
+        .epoch_sec = 1,
+        .subject = try a.dupe(u8, "s1"),
+        .refs = try a.dupe(u8, ""),
+    };
+    try m.replaceLogCommits(&.{c1});
+    defer {
+        a.free(c1.hash);
+        a.free(c1.parents);
+        a.free(c1.author);
+        a.free(c1.subject);
+        a.free(c1.refs);
+    }
+    const c2 = log.Commit{
+        .hash = try a.dupe(u8, "h2"),
+        .parents = try a.alloc([]u8, 0),
+        .author = try a.dupe(u8, "a2"),
+        .epoch_sec = 2,
+        .subject = try a.dupe(u8, "s2"),
+        .refs = try a.dupe(u8, ""),
+    };
+    defer {
+        a.free(c2.hash);
+        a.free(c2.parents);
+        a.free(c2.author);
+        a.free(c2.subject);
+        a.free(c2.refs);
+    }
+    try m.appendLogCommits(&.{c2});
+    try std.testing.expectEqual(@as(usize, 2), m.log_commits.items.len);
+    try std.testing.expectEqualStrings("h1", m.log_commits.items[0].hash);
+    try std.testing.expectEqualStrings("h2", m.log_commits.items[1].hash);
+}
+
+test "setDetailOwnerHash / clearDetailOwner cycle without leak" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.setDetailOwnerHash("abc");
+    try std.testing.expectEqualStrings("abc", m.detail_owner_hash.?);
+    try m.setDetailOwnerHash("def"); // free old abc, set new def
+    try std.testing.expectEqualStrings("def", m.detail_owner_hash.?);
+    m.clearDetailOwner();
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_owner_hash);
+}
+
+test "setDetailDiffOwner / clearDetailDiffOwner cycle without leak" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.setDetailDiffOwner("abc", "src/f.txt");
+    try std.testing.expectEqualStrings("abc", m.detail_diff_owner_hash.?);
+    try std.testing.expectEqualStrings("src/f.txt", m.detail_diff_owner_path.?);
+    m.clearDetailDiffOwner();
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_diff_owner_hash);
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_diff_owner_path);
+}
+
+test "setLogRestoreHash / clearLogRestoreHash cycle without leak" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.setLogRestoreHash("h1");
+    try std.testing.expectEqualStrings("h1", m.log_restore_hash.?);
+    m.clearLogRestoreHash();
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_restore_hash);
 }
