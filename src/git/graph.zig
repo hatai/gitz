@@ -384,7 +384,7 @@ test "computeAll: branch (C←A, B←A, 2 lanes)" {
     // col 0: A coming from above + continuing down
     try std.testing.expect(v.rows.items[1].cells[0].up);
     try std.testing.expect(v.rows.items[1].cells[0].down);
-    // col 1: B node, up from new tip, left connection to col 0 (aggregation)
+    // col 1: B node (new tip, no up), left connection to col 0 (aggregation)
     try std.testing.expect(v.rows.items[1].cells[1].is_node);
     try std.testing.expect(v.rows.items[1].cells[1].left);
 
@@ -422,6 +422,12 @@ test "computeAll: merge (D=merge(B,C), B←A, C←A)" {
     try std.testing.expectEqual(@as(u16, 0), v.rows.items[2].node_lane);
     // B connects horizontally to A's lane
     try std.testing.expect(v.rows.items[2].cells[0].is_node);
+    // H-01 aggregation: B's parent A aggregates to lane 1 (A already in
+    // frontier after C's processing). node_lane=0 ↔ lane 1 horizontal link.
+    try std.testing.expect(v.rows.items[2].cells[0].right);
+    try std.testing.expect(v.rows.items[2].cells[1].left);
+    // lane 1 was occupied by A in before-frontier → up connection
+    try std.testing.expect(v.rows.items[2].cells[1].up);
 
     // Row 3 (A): lane 0 (compacted)
     try std.testing.expectEqual(@as(u16, 0), v.rows.items[3].node_lane);
@@ -443,6 +449,12 @@ test "computeAll: dense compaction removes interior holes (M-01)" {
     defer state.deinit(a);
     // After all processing, frontier should be empty (A is root)
     try std.testing.expectEqual(@as(usize, 0), state.valid.frontier.slots.items.len);
+    // M-01 (interior hole removal): after B's processing the frontier was
+    // [null, A] (hole at position 0 from consumed B). Compaction must move
+    // A to position 0. As a result Row 3 (A) has width 1 — if compaction
+    // only trimmed the tail, A would still sit at lane 1 and width would be 2.
+    try std.testing.expectEqual(@as(u16, 0), state.valid.rows.items[3].node_lane);
+    try std.testing.expectEqual(@as(usize, 1), state.valid.rows.items[3].width());
 }
 
 test {
