@@ -102,9 +102,10 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
             return .{ .status_loaded = try statusmod.parse(a, sres.stdout) };
         },
         // --- TODO 2 phase 1: log/detail 副作用コマンド ---
-        // spec §1.7: load_log と load_log_page はロジックを共有（cmd tag で結果 Msg を切替）。
-        .load_log => |c| return runLogInt(a, io, cwd, c, false),
-        .load_log_page => |c| return runLogInt(a, io, cwd, c, true),
+        // load_log は headState tri-state を取る（unborn/err 対応）。load_log_page は tip 固定で
+        // bad revision 検出を行うため runLogPageInt へ分離（H-06/H-07/M-12）。
+        .load_log => |c| return runLogInt(a, io, cwd, c),
+        .load_log_page => |c| return runLogPageInt(a, io, cwd, c),
         .load_commit_detail => |hash_req| {
             const argv = try cmds.showNameStatusArgv(a, hash_req);
             defer a.free(argv);
@@ -148,33 +149,24 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
     }
 }
 
-/// Run git log and return result Msg. Command tag determines log_loaded vs log_page_loaded.
+/// Run git log for load_log (initial page, skip=0) and return log_loaded Msg.
 /// R5/R6/R7/R19/R20/R21/R23: headState tri-state・全エラー経路を catch して log_page_failed へ。
-fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, is_page: bool) !Msg {
-    const cmd_tag = if (is_page) Msg.log_page_loaded else Msg.log_loaded;
+/// load_log_page は runLogPageInt へ分離済み（tip_hash 固定・bad revision 検出付き）。
+fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog) !Msg {
     // R20: headState 呼び出しを catch（spawn/OOM も log_page_failed へ）。
     const hs = cmds.headState(a, io, cwd) catch
         return mkPageFailedOrSilent(a, cmd, "git リポジトリ状態の確認に失敗");
     switch (hs) {
         .unborn => {
-            // R6: 空配列を返す・cmd tag で Msg を切替。
+            // R6: 空配列を返す（unborn HEAD は log 対象無し）。
             const entries = try a.alloc(log.Commit, 0);
             errdefer a.free(entries);
-            return @as(Msg, switch (cmd_tag) {
-                .log_loaded => .{ .log_loaded = .{
-                    .request_skip = cmd.skip,
-                    .request_max_count = cmd.max_count,
-                    .request_generation = cmd.generation,
-                    .entries = entries,
-                } },
-                .log_page_loaded => .{ .log_page_loaded = .{
-                    .request_skip = cmd.skip,
-                    .request_max_count = cmd.max_count,
-                    .request_generation = cmd.generation,
-                    .entries = entries,
-                } },
-                else => unreachable,
-            });
+            return .{ .log_loaded = .{
+                .request_skip = cmd.skip,
+                .request_max_count = cmd.max_count,
+                .request_generation = cmd.generation,
+                .entries = entries,
+            } };
         },
         .err => return mkPageFailedOrSilent(a, cmd, "git リポジトリ状態が壊れています"),
         .ok => {},
@@ -195,21 +187,12 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, is
         for (entries) |*c| c.deinit(a);
         a.free(entries);
     }
-    return @as(Msg, switch (cmd_tag) {
-        .log_loaded => .{ .log_loaded = .{
-            .request_skip = cmd.skip,
-            .request_max_count = cmd.max_count,
-            .request_generation = cmd.generation,
-            .entries = entries,
-        } },
-        .log_page_loaded => .{ .log_page_loaded = .{
-            .request_skip = cmd.skip,
-            .request_max_count = cmd.max_count,
-            .request_generation = cmd.generation,
-            .entries = entries,
-        } },
-        else => unreachable,
-    });
+    return .{ .log_loaded = .{
+        .request_skip = cmd.skip,
+        .request_max_count = cmd.max_count,
+        .request_generation = cmd.generation,
+        .entries = entries,
+    } };
 }
 
 /// R20/R21/R23b: prefix を所有 []u8 へ複製して log_page_failed を構築。OOM で silent 版へ fallback。
@@ -221,6 +204,72 @@ fn mkPageFailedOrSilent(a: std.mem.Allocator, cmd: AppCmd.LoadLog, prefix: []con
 /// R21: OOM 極限の silent 版。payload 無し・log_page_requested を確実に下ろすことだけが目的。
 fn mkPageFailedSilent(cmd: AppCmd.LoadLog) Msg {
     return .{ .log_page_failed_silent = .{ .request_skip = cmd.skip, .request_generation = cmd.generation } };
+}
+
+/// load_log_page 専用の mkPageFailedOrSilent。prefix を所有 []u8 へ複製して log_page_failed を構築。
+/// OOM で silent 版へ fallback（M-12: tip 期限切れ等のページ系失敗を reducer へ伝える）。
+fn mkPageFailedOrSilentForPage(a: std.mem.Allocator, cmd: AppCmd.LoadLogPage, prefix: []const u8) Msg {
+    const text = a.dupe(u8, prefix) catch return mkPageFailedSilentForPage(cmd);
+    return .{ .log_page_failed = .{ .request_skip = cmd.skip, .request_generation = cmd.generation, .error_text = text } };
+}
+
+/// load_log_page 専用の mkPageFailedSilent。OOM 極限の silent 版。
+fn mkPageFailedSilentForPage(cmd: AppCmd.LoadLogPage) Msg {
+    return .{ .log_page_failed_silent = .{ .request_skip = cmd.skip, .request_generation = cmd.generation } };
+}
+
+/// load_log_page 専用: tip_hash 固定で git log を実行（H-06/H-07）。
+/// M-12: exit_code 128（bad revision: tip が gc 等で消失）は git_error へ還元し reducer で全 refresh を促す。
+fn runLogPageInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLogPage) !Msg {
+    const argv = try cmds.logPageArgv(a, cmd.skip, cmd.max_count, cmd.tip_hash);
+    defer freeLogPageArgv(a, argv);
+    var res = process.run(a, io, argv, cwd) catch
+        return mkPageFailedOrSilentForPage(a, cmd, "git log 実行エラー");
+    defer res.deinit(a);
+    if (res.exit_code != 0) {
+        // M-12: bad revision 検出（tip が gc 等で消失）。exit 128 を git_error へ還元し、
+        // reducer 側で log_request_generation を bump した全 refresh を誘導する。
+        if (res.exit_code == 128) {
+            return .{ .git_error = try a.dupe(u8, "tip が期限切れです（履歴が移動しました）") };
+        }
+        const stderr_trimmed = std.mem.trim(u8, res.stderr, " \n");
+        const text = a.dupe(u8, stderr_trimmed) catch
+            return mkPageFailedSilentForPage(cmd);
+        return .{ .log_page_failed = .{
+            .request_skip = cmd.skip,
+            .request_generation = cmd.generation,
+            .error_text = text,
+        } };
+    }
+    const entries = log.parse(a, res.stdout) catch
+        return mkPageFailedOrSilentForPage(a, cmd, "git log パース失敗");
+    errdefer {
+        for (entries) |*c| c.deinit(a);
+        a.free(entries);
+    }
+    // H-07: request_tip には cmd.tip_hash を dupe して所有。reducer で log_paging_tip と照合する。
+    const tip_dup = try a.dupe(u8, cmd.tip_hash);
+    errdefer a.free(tip_dup);
+    return .{ .log_page_loaded = .{
+        .request_skip = cmd.skip,
+        .request_max_count = cmd.max_count,
+        .request_generation = cmd.generation,
+        .request_tip = tip_dup,
+        .entries = entries,
+    } };
+}
+
+/// freeLogArgv と同一の解放戦略（--skip= / --max-count= の動的生成文字列のみ free）。
+/// logPageArgv は tip_hash も末尾に置くが、tip_hash は呼び出し側（AppCmd.LoadLogPage）所有のため
+/// ここでは free しない（argv スライス自体は free する）。
+fn freeLogPageArgv(a: std.mem.Allocator, argv: []const []const u8) void {
+    for (argv) |arg| {
+        if (std.mem.startsWith(u8, arg, "--skip=") or
+            std.mem.startsWith(u8, arg, "--max-count=")) {
+            a.free(arg);
+        }
+    }
+    a.free(argv);
 }
 
 /// Free logArgv result: logArgv は静的リテラル + 動的文字列 (--skip=, --max-count=) を含む。
@@ -905,13 +954,21 @@ test "load_log_page returns log_page_loaded and respects skip" {
         try repo.git(a, io, &.{ "git", "commit", "-q", "-m", msg_str });
     }
     // skip=2, max_count=100 → 先頭2件（m4, m3）を飛ばして m2,m1,m0 の 3 件。
-    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log_page = .{ .skip = 2, .max_count = 100, .generation = 3 } });
+    // H-06: tip_hash = "HEAD" で現 tip を固定（ページング中に tip が移動しないよう）。
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log_page = .{
+        .skip = 2,
+        .max_count = 100,
+        .generation = 3,
+        .tip_hash = try a.dupe(u8, "HEAD"),
+    } });
     defer msg.deinit(a);
     try std.testing.expect(msg == .log_page_loaded);
     try std.testing.expectEqual(@as(usize, 3), msg.log_page_loaded.entries.len);
     try std.testing.expectEqualStrings("m2", msg.log_page_loaded.entries[0].subject);
     try std.testing.expectEqual(@as(usize, 2), msg.log_page_loaded.request_skip);
     try std.testing.expectEqual(@as(u64, 3), msg.log_page_loaded.request_generation);
+    // H-07: request_tip には tip_hash が dupe されて転写される。
+    try std.testing.expectEqualStrings("HEAD", msg.log_page_loaded.request_tip);
 }
 
 test "load_commit_detail returns commit_detail_loaded with name-status entries" {
