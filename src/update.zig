@@ -11,6 +11,7 @@ const Msg = msgs.Msg;
 const AppCmd = msgs.AppCmd;
 const status = @import("git/status.zig");
 const hunk = @import("diff/hunk.zig");
+const graph_mod = @import("git/graph.zig");
 
 /// Model を破壊的に更新し、必要な副作用を AppCmd で返す。
 /// 返した AppCmd は呼び出し側（解釈器/テスト）が deinit する。
@@ -249,9 +250,29 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             try clampCursor(model); // 層 2: validateAnchor（Task 5 で実装）
             return .none;
         },
-        .git_error => |text| {
+        .git_error => |err_text| {
             model.busy = false;
-            try model.setStr(&model.error_text, text);
+            // M-12: log 中の git_error（bad revision: tip 期限切れ等）は generation を bump して
+            //   全 refresh へ。tip 固定 paging の前提が崩れたため、新 tip で最初から読み直す。
+            if (model.view_mode == .log) {
+                model.log_request_generation += 1;
+                model.log_page_requested = null;
+                model.log_has_more = false;
+                model.invalidateLogGraph();
+                model.clearLogPagingTip();
+                try model.replaceLogCommits(&.{});
+                model.clearDetailOwner();
+                try model.replaceDetailFiles(&.{});
+                try model.setStr(&model.detail_diff, "");
+                model.detail_kind = .files;
+                try model.setStr(&model.error_text, err_text);
+                return .{ .load_log = .{
+                    .skip = 0,
+                    .max_count = 100,
+                    .generation = model.log_request_generation,
+                } };
+            }
+            try model.setStr(&model.error_text, err_text);
             return .none;
         },
         .committed => {
@@ -352,6 +373,9 @@ fn handleToggleViewMode(model: *Model) !AppCmd {
             model.log_request_generation += 1; // ★R3: 以前の遅延結果を無効化
             model.log_page_requested = null;
             model.log_has_more = false;
+            // phase 2: 以前のグラフ状態・paging tip を破棄（新 log セッションへ）。
+            model.invalidateLogGraph();
+            model.clearLogPagingTip();
             model.clearDetailOwner();
             model.clearDetailDiffOwner();
             try model.replaceDetailFiles(&.{});
@@ -367,6 +391,9 @@ fn handleToggleViewMode(model: *Model) !AppCmd {
             model.focus = .changes; // ★M5: 復元しない・固定
             model.log_request_generation += 1; // ★R3: 遅延 log 系結果を全て stale 化
             model.log_page_requested = null;
+            // phase 2: log 系状態を破棄（changes へ戻るため）。
+            model.invalidateLogGraph();
+            model.clearLogPagingTip();
             return .refresh_status;
         },
     }
@@ -385,10 +412,14 @@ fn handleLogCursorDown(model: *Model) !AppCmd {
     // ★R17 underflow 対策: len >= 5 を条件へ含めて len-5 の underflow を防ぐ。
     if (model.log_has_more and model.log_page_requested == null and len >= 5 and model.log_selected >= len - 5) {
         model.log_page_requested = len; // ★R11: 期待 skip を保持
+        // phase 2 H-06: tip_hash を固定（log_paging_tip 優先・未設定時は先頭 commit hash）。
+        // tip 固定により、paging 中に tip が移動しても同一 snapshot を参照し続ける。
+        const tip_dup = try model.allocator.dupe(u8, model.log_paging_tip orelse model.log_commits.items[0].hash);
         return .{ .load_log_page = .{
             .skip = len,
             .max_count = 100,
             .generation = model.log_request_generation,
+            .tip_hash = tip_dup,
         } };
     }
     // ★R18: page in-flight 中は load_commit_detail を発火しない（page 完了で自動発火）。
@@ -471,6 +502,9 @@ fn handleRequestRefreshLog(model: *Model) !AppCmd {
     model.log_request_generation += 1; // ★R3
     model.log_page_requested = null;
     model.log_has_more = false;
+    // phase 2: グラフ状態・paging tip を破棄（refresh 後に log_loaded で再構築）。
+    model.invalidateLogGraph();
+    model.clearLogPagingTip();
     // ★R4: 選択 hash を refresh 前に退避（空なら clear）。
     if (model.log_commits.items.len > 0) {
         try model.setLogRestoreHash(model.log_commits.items[model.log_selected].hash);
@@ -541,26 +575,67 @@ fn handleLogLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
         try model.replaceDetailFiles(&.{});
         return .none;
     }
+    // phase 2 H-07: tip 設定（generation と一体で管理）。OOM は安全側へ clear して継続。
+    model.setLogPagingTip(model.log_commits.items[0].hash) catch {
+        model.clearLogPagingTip();
+    };
+    // phase 2 H-05: グラフ計算。OOM で .invalid へ（commits 自体は採用済みなので表示は継続）。
+    {
+        const tip_const: ?[]const u8 = if (model.log_paging_tip) |t| t else null;
+        const gs = graph_mod.computeAll(model.allocator, model.log_commits.items, model.log_request_generation, tip_const) catch {
+            model.invalidateLogGraph();
+            return try loadCommitDetailForSelection(model);
+        };
+        model.setLogGraphState(gs);
+    }
     return try loadCommitDetailForSelection(model);
 }
 
-/// H1/H3/M3/R10/R11/R22: `log_page_loaded` arm（追加ページ結果）。
-/// - stale reject: view_mode / generation / skip==log_page_requested のいずれか不一致で破棄。
+/// H1/H3/M3/R10/R11/R22/H-07/M-11: `log_page_loaded` arm（追加ページ結果）。
+/// - stale reject: view_mode / generation / skip==log_page_requested / request_tip==log_paging_tip のいずれか不一致で破棄。
 /// - ★R22: log_page_requested を appendLogCommits の**前に** null 化（OOM でも paging 再試行可能）。
+/// - phase 2 M-11: グラフ計算（.valid→incremental / .invalid→computeAll）。OOM で .invalid へ。
 /// - R10: 非空なら load_commit_detail で選択/detail 整合性を回復。
-fn handleLogPageLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
+fn handleLogPageLoaded(model: *Model, lpl: msgs.Msg.LogPageLoaded) !AppCmd {
     // ★R3/H1/R11: stale reject（期待 skip は model.log_page_requested と照合）。
     if (!inLogMode(model)) return .none;
-    if (ll.request_generation != model.log_request_generation) return .none;
+    if (lpl.request_generation != model.log_request_generation) return .none;
     const expected_skip = model.log_page_requested orelse return .none; // 既に別経路で消化済み
-    if (ll.request_skip != expected_skip) return .none;
+    if (lpl.request_skip != expected_skip) return .none;
+    // H-07: request_tip 照合。log_paging_tip と一致しなければ（tip が移動した等）破棄。
+    if (model.log_paging_tip) |tip| {
+        if (!std.mem.eql(u8, tip, lpl.request_tip)) return .none;
+    } else {
+        // log_paging_tip 未設定は初回 log_loaded 未到達か clear 済み → 破棄。
+        return .none;
+    }
     // ★R22: appendLogCommits の前に page_requested を null 化（OOM で reducer が error return
     //   しても page_requested は既に null・次回 down で再試行可能）。
     model.log_page_requested = null;
-    try model.appendLogCommits(ll.entries);
-    model.log_has_more = ll.entries.len >= ll.request_max_count;
+    try model.appendLogCommits(lpl.entries);
+    model.log_has_more = lpl.entries.len >= lpl.request_max_count;
     // ★R10: 選択が存在すれば load_commit_detail で選択/detail 整合性を回復。
     if (model.log_commits.items.len == 0) return .none;
+    // phase 2 M-11: graph computation（.valid→incremental / .invalid→computeAll）。
+    //   computeIncremental は *GraphState を消費して .invalid へ遷移させる（所有権移行）。
+    //   失敗時は強例外保証で入力 state を触らないため、catch で invalidateLogGraph へ。
+    switch (model.log_graph_state) {
+        .valid => {
+            const new_state = graph_mod.computeIncremental(model.allocator, &model.log_graph_state, lpl.entries) catch {
+                model.invalidateLogGraph();
+                return try loadCommitDetailForSelection(model);
+            };
+            model.setLogGraphState(new_state);
+        },
+        .invalid => {
+            const tip_const: ?[]const u8 = if (model.log_paging_tip) |t| t else null;
+            const gs = graph_mod.computeAll(model.allocator, model.log_commits.items, model.log_request_generation, tip_const) catch {
+                // OOM でも .invalid のまま継続（commits は append 済み・表示は継続）。
+                return try loadCommitDetailForSelection(model);
+            };
+            model.setLogGraphState(gs);
+        },
+    }
     return try loadCommitDetailForSelection(model);
 }
 
@@ -2226,7 +2301,9 @@ test "log_page_loaded: rejects when generation mismatch (H1 stale)" {
     const entries = try a.alloc(log_mod.Commit, 0);
     defer a.free(entries);
     var msg = Msg{ .log_page_loaded = .{
-        .request_skip = 3, .request_max_count = 100, .request_generation = 1, .entries = entries,
+        .request_skip = 3, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "h0000"),
+        .entries = entries,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2243,7 +2320,9 @@ test "log_page_loaded: rejects when skip != log_page_requested (R11 stale)" {
     const entries = try a.alloc(log_mod.Commit, 0);
     defer a.free(entries);
     var msg = Msg{ .log_page_loaded = .{
-        .request_skip = 99, .request_max_count = 100, .request_generation = 1, .entries = entries,
+        .request_skip = 99, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "h0000"),
+        .entries = entries,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2259,7 +2338,9 @@ test "log_page_loaded: rejects when log_page_requested already null" {
     const entries = try a.alloc(log_mod.Commit, 0);
     defer a.free(entries);
     var msg = Msg{ .log_page_loaded = .{
-        .request_skip = 3, .request_max_count = 100, .request_generation = 1, .entries = entries,
+        .request_skip = 3, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "h0000"),
+        .entries = entries,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2273,12 +2354,16 @@ test "log_page_loaded: appends entries, clears page_requested (R22), reloads det
     defer m.deinit();
     m.log_page_requested = 3; // 期待 skip
     m.log_has_more = true;
+    // H-07: tip 照合を通過させるため log_paging_tip を設定（先頭 commit hash と一致）。
+    try m.setLogPagingTip("h0000");
     // 追加分 2 件
     const entries = try a.alloc(log_mod.Commit, 2);
     entries[0] = try mkCommit(a, "h0003", "s3");
     entries[1] = try mkCommit(a, "h0004", "s4");
     var msg = Msg{ .log_page_loaded = .{
-        .request_skip = 3, .request_max_count = 100, .request_generation = 1, .entries = entries,
+        .request_skip = 3, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "h0000"),
+        .entries = entries,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2296,10 +2381,14 @@ test "log_page_loaded: empty append is no-op for detail but still clears page_re
     var m = try seedLogModel(a, 3);
     defer m.deinit();
     m.log_page_requested = 3;
+    // H-07: tip 照合を通過させるため log_paging_tip を設定。
+    try m.setLogPagingTip("h0000");
     const entries = try a.alloc(log_mod.Commit, 0);
     defer a.free(entries);
     var msg = Msg{ .log_page_loaded = .{
-        .request_skip = 3, .request_max_count = 100, .request_generation = 1, .entries = entries,
+        .request_skip = 3, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "h0000"),
+        .entries = entries,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2616,6 +2705,9 @@ test "end-to-end: paging flow (cursor near end → page → append → detail re
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 5); // len == 5
     defer m.deinit();
+    // H-07: 実運用では log_loaded が log_paging_tip を設定する。seedLogModel は直接構築するため
+    //   ここで明示的に設定（先頭 commit hash と一致）。
+    try m.setLogPagingTip("h0000");
     // log_has_more=true なので、selected を境界まで進めると page trigger
     m.log_selected = 0;
     // selected >= len-5 == 0 を満たす（selected=0 は既に境界）→ 次の down で page
@@ -2624,11 +2716,14 @@ test "end-to-end: paging flow (cursor near end → page → append → detail re
     try std.testing.expect(c1 == .load_log_page); // page 発火
     try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested);
     // page 結果到着: log_page_loaded arm が append + detail reload
+    // H-07: log_loaded で log_paging_tip="h0000" が設定済み。request_tip を一致させる。
     const entries = try a.alloc(log_mod.Commit, 2);
     entries[0] = try mkCommit(a, "h0005", "s5");
     entries[1] = try mkCommit(a, "h0006", "s6");
     var msg = Msg{ .log_page_loaded = .{
-        .request_skip = 5, .request_max_count = 100, .request_generation = 1, .entries = entries,
+        .request_skip = 5, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "h0000"),
+        .entries = entries,
     } };
     defer msg.deinit(a);
     var c2 = try update(&m, msg);
@@ -2640,4 +2735,47 @@ test "end-to-end: paging flow (cursor near end → page → append → detail re
     var c3 = try update(&m, .log_cursor_down);
     defer c3.deinit(a);
     try std.testing.expect(c3 == .load_commit_detail);
+}
+
+// ----------------------------- phase 2: graph computation + bad revision recovery -----------------------------
+
+test "log_loaded: builds graph state on success" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    m.log_request_generation = 1;
+    const entries = try a.alloc(log_mod.Commit, 1);
+    entries[0] = try mkCommit(a, "h0001", "subj");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0,
+        .request_max_count = 100,
+        .request_generation = 1,
+        .entries = entries,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    // H-05: graph state が .valid で構築されていること。
+    try std.testing.expect(m.log_graph_state == .valid);
+    try std.testing.expectEqual(@as(usize, 1), m.log_graph_state.valid.rows.items.len);
+    // H-07: log_paging_tip が先頭 commit hash で設定されていること。
+    try std.testing.expectEqualStrings("h0001", m.log_paging_tip.?);
+}
+
+test "git_error in log mode triggers full refresh with generation bump" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_request_generation = 5;
+    var msg = Msg{ .git_error = try a.dupe(u8, "tip expired") };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    // M-12: load_log で全 refresh・generation は +1 される。
+    try std.testing.expect(cmd == .load_log);
+    try std.testing.expectEqual(@as(u64, 6), m.log_request_generation);
+    // phase 2: グラフ状態・paging tip もクリアされる。
+    try std.testing.expect(m.log_graph_state == .invalid);
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_paging_tip);
+    try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
 }
