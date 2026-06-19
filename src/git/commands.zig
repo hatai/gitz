@@ -55,6 +55,57 @@ pub fn applyPatchArgv(a: std.mem.Allocator, reverse: bool, file_path: []const u8
     return list.toOwnedSlice(a);
 }
 
+/// `git log` argv。skip=0 のとき --skip を付けない（git が警告するため）。呼出側 free。
+/// L2: `--decorate=short --no-color` 明示（環境設定に委ねない）。
+pub fn logArgv(a: std.mem.Allocator, skip: usize, max_count: usize) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(a);
+    try list.appendSlice(a, &.{
+        "git", "-c", "core.quotePath=false", "log",
+    });
+    if (skip > 0) {
+        const skip_arg = try std.fmt.allocPrint(a, "--skip={d}", .{skip});
+        errdefer a.free(skip_arg);
+        try list.append(a, skip_arg);
+    }
+    const max_arg = try std.fmt.allocPrint(a, "--max-count={d}", .{max_count});
+    errdefer a.free(max_arg);
+    try list.append(a, max_arg);
+    try list.appendSlice(a, &.{
+        "--pretty=format:%H%x00%P%x00%an%x00%at%x00%s%x00%d",
+        "-z",
+        "--decorate=short",
+        "--no-color",
+    });
+    return list.toOwnedSlice(a);
+}
+
+/// `git show --name-status` argv。H4/H5: 第一親との差・header なし・NUL 区切り。
+pub fn showNameStatusArgv(a: std.mem.Allocator, hash: []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(a);
+    try list.appendSlice(a, &.{
+        "git", "-c", "core.quotePath=false", "show",
+        "--diff-merges=first-parent", "--format=", "--name-status", "-z",
+    });
+    try list.append(a, hash);
+    return list.toOwnedSlice(a);
+}
+
+/// `git show <hash> -- <path>` argv。H4: name-status と同じ第一親基準。
+pub fn showFileDiffArgv(a: std.mem.Allocator, hash: []const u8, path: []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(a);
+    try list.appendSlice(a, &.{
+        "git", "-c", "core.quotePath=false", "show",
+        "--diff-merges=first-parent", "--format=",
+    });
+    try list.append(a, hash);
+    try list.append(a, "--");
+    try list.append(a, path);
+    return list.toOwnedSlice(a);
+}
+
 /// `["git", "rev-parse", "--absolute-git-dir"]` を生成（純粋・呼出側 free）。
 /// worktree / submodule でも実 git-dir へ解決するため apply_patch の書込先特定に使う。
 pub fn gitDirArgv(a: std.mem.Allocator) ![]const []const u8 {
@@ -93,6 +144,46 @@ pub fn hasHead(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !bool {
     var res = try process.run(a, io, &.{ "git", "rev-parse", "--verify", "HEAD" }, cwd);
     defer res.deinit(a);
     return res.exit_code == 0;
+}
+
+/// R5/R19/R23: HEAD 状態の tri-state（ok/unborn/err）。
+pub const HeadState = enum { ok, unborn, err };
+
+/// R5/R19/R23: rev-parse --verify HEAD だけでは unborn と壊れた HEAD・object 欠損・権限エラーを区別できない
+/// （どれも exit 128 を返し得る）。3 段階で厳密判定する:
+///   (1) rev-parse --verify HEAD の exit code（0=ok / 128=(2)へ / その他=err）
+///   (2) exit 128 のとき symbolic-ref --short HEAD で branch 名を取得（失敗=err）
+///   (3) branch 名で show-ref --verify --quiet refs/heads/<branch> を実行:
+///       exit 0 → ref が存在するが HEAD が exit 128 → dangling（object 無し）→ err
+///       exit 1 → ref が存在しない → unborn
+///       その他 → err
+///   ※R23b 実測: show-ref --verify <ref> は不存在時に exit 128 を返す（exit 1 ではない）。
+///     --quiet を付けると不存在時に exit 1・存在時に exit 0 になるので必ず --quiet 付きで使う。
+pub fn headState(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !HeadState {
+    var res1 = try process.run(a, io, &.{ "git", "rev-parse", "--verify", "HEAD" }, cwd);
+    defer res1.deinit(a);
+    return switch (res1.exit_code) {
+        0 => .ok,
+        128 => blk: {
+            // (2) symbolic-ref で branch 名取得
+            var res2 = try process.run(a, io, &.{ "git", "symbolic-ref", "--short", "HEAD" }, cwd);
+            defer res2.deinit(a);
+            if (res2.exit_code != 0) break :blk .err;
+            const branch = std.mem.trimEnd(u8, res2.stdout, "\n");
+            if (branch.len == 0) break :blk .err;
+            // (3) show-ref --verify --quiet で ref 実在確認
+            const ref_buf = try std.fmt.allocPrint(a, "refs/heads/{s}", .{branch});
+            defer a.free(ref_buf);
+            var res3 = try process.run(a, io, &.{ "git", "show-ref", "--verify", "--quiet", ref_buf }, cwd);
+            defer res3.deinit(a);
+            break :blk switch (res3.exit_code) {
+                0 => .err, // ref が有るのに HEAD exit 128 = dangling
+                1 => .unborn, // ref 無し = 空リポジトリ
+                else => .err,
+            };
+        },
+        else => .err,
+    };
 }
 
 /// ブランチ名（unborn HEAD でも `git symbolic-ref --short HEAD` は名前を返す）。呼び出し側が free。
@@ -214,6 +305,119 @@ test "gitDirArgv builds rev-parse --absolute-git-dir" {
     try std.testing.expectEqualStrings("git", argv[0]);
     try std.testing.expectEqualStrings("rev-parse", argv[1]);
     try std.testing.expectEqualStrings("--absolute-git-dir", argv[2]);
+}
+
+test "logArgv: skip=0 omits --skip, includes pretty format and -z" {
+    const a = std.testing.allocator;
+    const argv = try logArgv(a, 0, 100);
+    defer {
+        // logArgv allocates: max_count string always, skip string only when skip>0.
+        // 動的文字列だけ free し、argv スライス自体も free する。静的リテラルは不要。
+        // 注意: --max-count と --skip は互いに排他なので else if で二重 free / use-after-free を防ぐ。
+        for (argv) |arg| {
+            if (std.mem.startsWith(u8, arg, "--max-count=")) {
+                a.free(arg);
+            } else if (std.mem.startsWith(u8, arg, "--skip=")) {
+                a.free(arg);
+            }
+        }
+        a.free(argv);
+    }
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("-c", argv[1]);
+    try std.testing.expectEqualStrings("core.quotePath=false", argv[2]);
+    try std.testing.expectEqualStrings("log", argv[3]);
+    // skip=0 so no --skip
+    var has_skip = false;
+    for (argv) |arg| if (std.mem.startsWith(u8, arg, "--skip")) {
+        has_skip = true;
+    };
+    try std.testing.expect(!has_skip);
+    var has_pretty = false;
+    var has_z = false;
+    var has_decorate = false;
+    var has_nocolor = false;
+    var has_maxcount = false;
+    for (argv) |arg| {
+        if (std.mem.startsWith(u8, arg, "--pretty=format")) has_pretty = true;
+        if (std.mem.eql(u8, arg, "-z")) has_z = true;
+        if (std.mem.eql(u8, arg, "--decorate=short")) has_decorate = true;
+        if (std.mem.eql(u8, arg, "--no-color")) has_nocolor = true;
+        if (std.mem.startsWith(u8, arg, "--max-count=")) has_maxcount = true;
+    }
+    try std.testing.expect(has_pretty);
+    try std.testing.expect(has_z);
+    try std.testing.expect(has_decorate);
+    try std.testing.expect(has_nocolor);
+    try std.testing.expect(has_maxcount);
+}
+
+test "logArgv: skip=100 includes --skip=100" {
+    const a = std.testing.allocator;
+    const argv = try logArgv(a, 100, 100);
+    defer {
+        // 注意: else if で二重 free / use-after-free を防ぐ（--max-count と --skip は排他）。
+        for (argv) |arg| {
+            if (std.mem.startsWith(u8, arg, "--max-count=")) {
+                a.free(arg);
+            } else if (std.mem.startsWith(u8, arg, "--skip=")) {
+                a.free(arg);
+            }
+        }
+        a.free(argv);
+    }
+    var found_skip: ?[]const u8 = null;
+    for (argv) |arg| if (std.mem.startsWith(u8, arg, "--skip=")) {
+        found_skip = arg;
+    };
+    try std.testing.expect(found_skip != null);
+    try std.testing.expectEqualStrings("--skip=100", found_skip.?);
+}
+
+test "showNameStatusArgv: --diff-merges=first-parent --format= --name-status -z" {
+    const a = std.testing.allocator;
+    const argv = try showNameStatusArgv(a, "abc123");
+    defer a.free(argv);
+    var has_diffmerges = false;
+    var has_format = false;
+    var has_namestatus = false;
+    var has_z = false;
+    var has_hash = false;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--diff-merges=first-parent")) has_diffmerges = true;
+        if (std.mem.eql(u8, arg, "--format=")) has_format = true;
+        if (std.mem.eql(u8, arg, "--name-status")) has_namestatus = true;
+        if (std.mem.eql(u8, arg, "-z")) has_z = true;
+        if (std.mem.eql(u8, arg, "abc123")) has_hash = true;
+    }
+    try std.testing.expect(has_diffmerges);
+    try std.testing.expect(has_format);
+    try std.testing.expect(has_namestatus);
+    try std.testing.expect(has_z);
+    try std.testing.expect(has_hash);
+}
+
+test "showFileDiffArgv: --diff-merges=first-parent --format= <hash> -- <path>" {
+    const a = std.testing.allocator;
+    const argv = try showFileDiffArgv(a, "abc123", "src/main.zig");
+    defer a.free(argv);
+    var has_diffmerges = false;
+    var has_format = false;
+    var has_dd = false;
+    var has_hash = false;
+    var has_path = false;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--diff-merges=first-parent")) has_diffmerges = true;
+        if (std.mem.eql(u8, arg, "--format=")) has_format = true;
+        if (std.mem.eql(u8, arg, "--")) has_dd = true;
+        if (std.mem.eql(u8, arg, "abc123")) has_hash = true;
+        if (std.mem.eql(u8, arg, "src/main.zig")) has_path = true;
+    }
+    try std.testing.expect(has_diffmerges);
+    try std.testing.expect(has_format);
+    try std.testing.expect(has_dd);
+    try std.testing.expect(has_hash);
+    try std.testing.expect(has_path);
 }
 
 // 高レベル関数（実行系）はテスト未参照だと Zig のレイジー解析でボディが
