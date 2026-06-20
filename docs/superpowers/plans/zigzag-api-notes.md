@@ -263,8 +263,22 @@ pub const TextArea = struct {
 > - その他の通常キー（文字/Enter/矢印/Backspace 等）はフォーカスが commit ペインのとき
 >   `textarea.handleKey(k)` に委譲する。
 
-### `TextInput`（`src/components/text_input.zig`）
-`zz.TextInput`。単一行版。MVP では未使用想定だが存在する。
+### `TextInput`（`src/components/text_input.zig` L10-462）
+単一行入力（phase3a フィルタモーダルで使用）。内部は `std.array_list.Managed(u8)`。
+- フィールド: `value`/`cursor`/`placeholder`/`prompt`/`width: ?u16`/`char_limit: ?usize`/`echo_mode`/`focused`/`suggestions`。`EchoMode = enum { normal, password, none }`。
+- API: `init(allocator) TextInput`（非失敗・L48）/ `deinit()`（L94）/ `setValue(text) !void`（全置換）/ **`getValue() []const u8`**（★TextArea と異なり **borrowed**・allocator 不要・内部 `value.items` への借用）/ `setPlaceholder(text)` / `setPrompt(text)` / `setWidth(w)` / `setCharLimit(n)` / `setEchoMode(mode)` / `focus()` / `blur()` / `handleKey(key) void`（L181）/ `view(allocator) ![]const u8`（L380・フレーム arena 想定・cursor 位置に reverse ハイライト）。
+- `handleKey` の処理範囲（L181-237）: Ctrl+a/e/k/u/w、Alt+left/right（単語移動）、文字/paste/backspace/delete/left/right/home/end/tab（suggestion 確定）。**★`enter`/`escape` は処理しない**（`else => {}`）→ アプリ側で Enter/Esc を先に横取りして Msg 化し、それ以外を `TextInput.handleKey` へ委譲する設計（phase3a 仕様）。
+- 生成は `persistent_allocator`、毎フレーム描画は `ctx.allocator`。多バイト入力 OK。**submit シグナルは無い**（TextArea と同じくアプリ側で Enter を横取り）。
+
+### `Modal`（`src/components/modal.zig` L52-761）
+中央ポップアップ（phase3a フィルタ UI で使用）。
+- フィールド: `visible`/`focused`/`result: ?Result`/`title`/`body`/`footer`/`buttons[max_buttons]?Button`/`button_count`/`selected_button`/`width: Size`/`height: Size`/`h_position: f32=0.5`/`v_position: f32=0.5`/`padding`/`close_on_escape: bool=true`/`border_chars`/`border_fg`/`backdrop: ?Backdrop`。
+- `Result = union(enum) { button_pressed: usize, dismissed: void }`。`Button = struct { label, shortcut: ?keys.Key }`。`Size = union(enum) { fixed: u16, percent: f32, auto: void }`。`Backdrop = struct { char: []const u8 = " ", style, ... }`。
+- Presets: `info(title, body)` / `confirm(...)` / `warning(...)` / `err(...)`（L190-227）。phase3a は **`init()`**（L239・blank）を使用。
+- API: `init()` / `addButton(label, shortcut)`（L246）/ `show()`（L265）/ `hide()`（L273）/ `isVisible()`（L278）/ `getResult()` / `reset()` / `focus()` / `blur()` / `handleKey(key) void`（L308）/ `view(allocator, term_w, term_h) ![]const u8`（L370・中央 box のみ・透明 canvas）/ **`viewWithBackdrop(allocator, term_w, term_h) ![]const u8`**（L379・★全面 canvas・**solid backdrop・透過しない**）/ `renderBox(...)`（L435）。
+- `handleKey`（L308-364）: button shortcut 一致→`result.button_pressed`+`visible=false` / escape→`result.dismissed`+`visible=false`（`close_on_escape` 時）/ enter→`result.button_pressed=selected_button`+`visible=false` / tab,left,right→button 選択移動。**★`button_count==0` なら enter は no-op**（L332）。
+- **★overlay 描画の罠**: `view`/`viewWithBackdrop` は全面 canvas を返す。既存 render 文字列との単純 join（`zz.joinVertical` 等）は **overlay にならない**（backdrop が base を隠す）。modal 表示中は base view を返さず `viewWithBackdrop` を返す設計（phase3a 仕様）。
+- **button と TextInput の混在**: Modal は button を前提とした `handleKey`（Enter→button_pressed）。body に TextInput を置き Enter/Esc をアプリで制御したい場合は、**`Modal.handleKey` に渡す前にアプリ側で横取り**（button を追加しない・phase3a では Modal へキーを渡さず TextInput のみへ委譲）。
 
 ### レイアウト / 描画 API（`src/root.zig` のユーティリティ + `src/layout/*`）
 zigzag の view は「**スタイル付き文字列を組み立てて返す**」モデル（セルバッファ直書きではない）。
