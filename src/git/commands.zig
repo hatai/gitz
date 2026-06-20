@@ -3,9 +3,25 @@
 
 const std = @import("std");
 const process = @import("process.zig");
+const filter_mod = @import("../filter.zig");
+const FilterSpec = filter_mod.FilterSpec;
 
 pub const Section = @import("status.zig").Section;
 const Cwd = process.Cwd;
+
+/// 動的確保した文字列のみを追跡し、deinit で解放する。
+/// `args` は process.run へ渡す argv（toOwnedSlice なので free 対象）。
+/// `owned` は動的確保した文字列のみ（allocPrint 系）。借用文字列は含まない。
+pub const OwnedArgv = struct {
+    args: []const []const u8,
+    owned: std.ArrayList([]const u8),
+
+    pub fn deinit(self: *OwnedArgv, a: std.mem.Allocator) void {
+        for (self.owned.items) |s| a.free(s);
+        self.owned.deinit(a);
+        a.free(self.args);
+    }
+};
 
 /// stage の argv。rename のときは新旧両パスを渡す。呼び出し側が free。
 pub fn stageArgv(a: std.mem.Allocator, path: []const u8, orig_path: ?[]const u8) ![]const []const u8 {
@@ -55,60 +71,62 @@ pub fn applyPatchArgv(a: std.mem.Allocator, reverse: bool, file_path: []const u8
     return list.toOwnedSlice(a);
 }
 
-/// `git log` argv。skip=0 のとき --skip を付けない（git が警告するため）。呼出側 free。
-/// L2: `--decorate=short --no-color` 明示（環境設定に委ねない）。
-pub fn logArgv(a: std.mem.Allocator, skip: usize, max_count: usize) ![]const []const u8 {
+/// `git log` argv（初回 + paging 共用）。skip=0 のとき --skip を付けない。
+/// ★B1: `<snapshot_tip>` を revision として明示限定（rev-parse 後の HEAD 移動でも一貫性保持）。
+/// ★M8/M-N6: filter.isEmpty() でなければ `--fixed-strings --author=<literal>` を追加。
+/// 動的確保した文字列のみ owned へ追跡。借用（snapshot_tip）は free しない。
+pub fn logArgv(
+    a: std.mem.Allocator,
+    skip: usize,
+    max_count: usize,
+    snapshot_tip: []const u8,
+    filter: FilterSpec,
+) !OwnedArgv {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(a);
+    var owned: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (owned.items) |s| a.free(s);
+        owned.deinit(a);
+    }
     try list.appendSlice(a, &.{
         "git", "-c", "core.quotePath=false", "log", "--topo-order",
     });
     if (skip > 0) {
         const skip_arg = try std.fmt.allocPrint(a, "--skip={d}", .{skip});
-        errdefer a.free(skip_arg);
+        try owned.append(a, skip_arg);
         try list.append(a, skip_arg);
     }
     const max_arg = try std.fmt.allocPrint(a, "--max-count={d}", .{max_count});
-    errdefer a.free(max_arg);
+    try owned.append(a, max_arg);
     try list.append(a, max_arg);
+    if (!filter.isEmpty()) {
+        try list.append(a, "--fixed-strings");
+        const author_arg = try std.fmt.allocPrint(a, "--author={s}", .{filter.author.?});
+        try owned.append(a, author_arg);
+        try list.append(a, author_arg);
+    }
     try list.appendSlice(a, &.{
         "--pretty=format:%H%x00%P%x00%an%x00%at%x00%s%x00%d",
         "-z",
         "--decorate=short",
         "--no-color",
     });
-    return list.toOwnedSlice(a);
+    try list.append(a, snapshot_tip);
+    return .{ .args = try list.toOwnedSlice(a), .owned = owned };
 }
 
-/// `git log --topo-order --skip=N --max-count=100 <tip_hash>` argv。
-/// ★H-06/H-07: paging 間で tip hash を固定し同一 snapshot を参照する。
+/// `git log --topo-order --skip=N --max-count=100 <snapshot_tip>` argv（paging 用）。
+/// ★H-06/H-07: snapshot_tip を固定し同一 snapshot を参照する。
+/// ★M8/M-N6: filter 追加（logArgv と同様）。
 pub fn logPageArgv(
     a: std.mem.Allocator,
     skip: usize,
     max_count: usize,
-    tip_hash: []const u8,
-) ![]const []const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    errdefer list.deinit(a);
-    try list.appendSlice(a, &.{
-        "git", "-c", "core.quotePath=false", "log", "--topo-order",
-    });
-    if (skip > 0) {
-        const skip_arg = try std.fmt.allocPrint(a, "--skip={d}", .{skip});
-        errdefer a.free(skip_arg);
-        try list.append(a, skip_arg);
-    }
-    const max_arg = try std.fmt.allocPrint(a, "--max-count={d}", .{max_count});
-    errdefer a.free(max_arg);
-    try list.append(a, max_arg);
-    try list.appendSlice(a, &.{
-        "--pretty=format:%H%x00%P%x00%an%x00%at%x00%s%x00%d",
-        "-z",
-        "--decorate=short",
-        "--no-color",
-    });
-    try list.append(a, tip_hash);
-    return list.toOwnedSlice(a);
+    snapshot_tip: []const u8,
+    filter: FilterSpec,
+) !OwnedArgv {
+    return logArgv(a, skip, max_count, snapshot_tip, filter);
 }
 
 /// `git show --name-status` argv。H4/H5: 第一親との差・header なし・NUL 区切り。
@@ -175,6 +193,21 @@ pub fn hasHead(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !bool {
     var res = try process.run(a, io, &.{ "git", "rev-parse", "--verify", "HEAD" }, cwd);
     defer res.deinit(a);
     return res.exit_code == 0;
+}
+
+/// `git rev-parse --verify HEAD` の argv（借用 static・free 不要）。
+pub fn revParseHeadArgv() []const []const u8 {
+    return &.{ "git", "rev-parse", "--verify", "HEAD" };
+}
+
+/// HEAD hash を dupe して返す（呼出側 free）。exit 128（unborn 等）は null。
+/// headState が .ok のときだけ呼ぶことを前提（.unborn/.err は呼出元で処理済み）。
+pub fn revParseHead(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !?[]u8 {
+    var res = try process.run(a, io, revParseHeadArgv(), cwd);
+    defer res.deinit(a);
+    if (res.exit_code != 0) return null;
+    const trimmed = std.mem.trimEnd(u8, res.stdout, "\n");
+    return try a.dupe(u8, trimmed);
 }
 
 /// R5/R19/R23: HEAD 状態の tri-state（ok/unborn/err）。
@@ -338,29 +371,18 @@ test "gitDirArgv builds rev-parse --absolute-git-dir" {
     try std.testing.expectEqualStrings("--absolute-git-dir", argv[2]);
 }
 
-test "logArgv: skip=0 omits --skip, includes pretty format and -z" {
+test "logArgv: empty filter + snapshot_tip unchanged structure" {
     const a = std.testing.allocator;
-    const argv = try logArgv(a, 0, 100);
-    defer {
-        // logArgv allocates: max_count string always, skip string only when skip>0.
-        // 動的文字列だけ free し、argv スライス自体も free する。静的リテラルは不要。
-        // 注意: --max-count と --skip は互いに排他なので else if で二重 free / use-after-free を防ぐ。
-        for (argv) |arg| {
-            if (std.mem.startsWith(u8, arg, "--max-count=")) {
-                a.free(arg);
-            } else if (std.mem.startsWith(u8, arg, "--skip=")) {
-                a.free(arg);
-            }
-        }
-        a.free(argv);
-    }
-    try std.testing.expectEqualStrings("git", argv[0]);
-    try std.testing.expectEqualStrings("-c", argv[1]);
-    try std.testing.expectEqualStrings("core.quotePath=false", argv[2]);
-    try std.testing.expectEqualStrings("log", argv[3]);
+    var argv = try logArgv(a, 0, 100, "snap1234", FilterSpec.init());
+    defer argv.deinit(a);
+    try std.testing.expectEqualStrings("git", argv.args[0]);
+    try std.testing.expectEqualStrings("-c", argv.args[1]);
+    try std.testing.expectEqualStrings("core.quotePath=false", argv.args[2]);
+    try std.testing.expectEqualStrings("log", argv.args[3]);
+    try std.testing.expectEqualStrings("--topo-order", argv.args[4]);
     // skip=0 so no --skip
     var has_skip = false;
-    for (argv) |arg| if (std.mem.startsWith(u8, arg, "--skip")) {
+    for (argv.args) |arg| if (std.mem.startsWith(u8, arg, "--skip")) {
         has_skip = true;
     };
     try std.testing.expect(!has_skip);
@@ -369,77 +391,119 @@ test "logArgv: skip=0 omits --skip, includes pretty format and -z" {
     var has_decorate = false;
     var has_nocolor = false;
     var has_maxcount = false;
-    for (argv) |arg| {
+    var has_snapshot = false;
+    for (argv.args) |arg| {
         if (std.mem.startsWith(u8, arg, "--pretty=format")) has_pretty = true;
         if (std.mem.eql(u8, arg, "-z")) has_z = true;
         if (std.mem.eql(u8, arg, "--decorate=short")) has_decorate = true;
         if (std.mem.eql(u8, arg, "--no-color")) has_nocolor = true;
         if (std.mem.startsWith(u8, arg, "--max-count=")) has_maxcount = true;
+        if (std.mem.eql(u8, arg, "snap1234")) has_snapshot = true;
     }
     try std.testing.expect(has_pretty);
     try std.testing.expect(has_z);
     try std.testing.expect(has_decorate);
     try std.testing.expect(has_nocolor);
     try std.testing.expect(has_maxcount);
+    try std.testing.expect(has_snapshot);
+    // snapshot_tip is the last arg (revision pin)
+    try std.testing.expectEqualStrings("snap1234", argv.args[argv.args.len - 1]);
 }
 
 test "logArgv: skip=100 includes --skip=100" {
     const a = std.testing.allocator;
-    const argv = try logArgv(a, 100, 100);
-    defer {
-        // 注意: else if で二重 free / use-after-free を防ぐ（--max-count と --skip は排他）。
-        for (argv) |arg| {
-            if (std.mem.startsWith(u8, arg, "--max-count=")) {
-                a.free(arg);
-            } else if (std.mem.startsWith(u8, arg, "--skip=")) {
-                a.free(arg);
-            }
-        }
-        a.free(argv);
-    }
+    var argv = try logArgv(a, 100, 100, "snap1234", FilterSpec.init());
+    defer argv.deinit(a);
     var found_skip: ?[]const u8 = null;
-    for (argv) |arg| if (std.mem.startsWith(u8, arg, "--skip=")) {
+    for (argv.args) |arg| if (std.mem.startsWith(u8, arg, "--skip=")) {
         found_skip = arg;
     };
     try std.testing.expect(found_skip != null);
     try std.testing.expectEqualStrings("--skip=100", found_skip.?);
 }
 
-test "logArgv: includes --topo-order" {
+test "logArgv: author filter adds --fixed-strings and --author" {
     const a = std.testing.allocator;
-    const argv = try logArgv(a, 0, 100);
-    defer {
-        for (argv) |arg| {
-            if (std.mem.startsWith(u8, arg, "--max-count=") or
-                std.mem.startsWith(u8, arg, "--skip=")) a.free(arg);
-        }
-        a.free(argv);
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.setAuthor(a, "foo");
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var has_fixed = false;
+    var has_author = false;
+    for (argv.args) |arg| {
+        if (std.mem.eql(u8, arg, "--fixed-strings")) has_fixed = true;
+        if (std.mem.eql(u8, arg, "--author=foo")) has_author = true;
     }
-    var has_topo = false;
-    for (argv) |arg| {
-        if (std.mem.eql(u8, arg, "--topo-order")) has_topo = true;
-    }
-    try std.testing.expect(has_topo);
+    try std.testing.expect(has_fixed);
+    try std.testing.expect(has_author);
 }
 
-test "logPageArgv: includes --topo-order, tip_hash last" {
+test "logArgv: UTF-8 author preserved in argv" {
     const a = std.testing.allocator;
-    const argv = try logPageArgv(a, 100, 100, "abc123");
-    defer {
-        for (argv) |arg| {
-            if (std.mem.startsWith(u8, arg, "--max-count=") or
-                std.mem.startsWith(u8, arg, "--skip=")) a.free(arg);
-        }
-        a.free(argv);
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.setAuthor(a, "山田太郎");
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var found = false;
+    for (argv.args) |arg| {
+        if (std.mem.eql(u8, arg, "--author=山田太郎")) found = true;
     }
-    // tip_hash is the last arg
-    try std.testing.expectEqualStrings("abc123", argv[argv.len - 1]);
-    // --topo-order present
+    try std.testing.expect(found);
+}
+
+test "logPageArgv: skip + snapshot_tip + empty filter" {
+    const a = std.testing.allocator;
+    var argv = try logPageArgv(a, 100, 100, "abc123", FilterSpec.init());
+    defer argv.deinit(a);
+    // snapshot_tip is the last arg
+    try std.testing.expectEqualStrings("abc123", argv.args[argv.args.len - 1]);
     var has_topo = false;
-    for (argv) |arg| {
+    var has_skip = false;
+    for (argv.args) |arg| {
         if (std.mem.eql(u8, arg, "--topo-order")) has_topo = true;
+        if (std.mem.eql(u8, arg, "--skip=100")) has_skip = true;
     }
     try std.testing.expect(has_topo);
+    try std.testing.expect(has_skip);
+}
+
+test "logPageArgv: author filter adds --fixed-strings and --author" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.setAuthor(a, "bar");
+    var argv = try logPageArgv(a, 0, 100, "abc123", spec);
+    defer argv.deinit(a);
+    var has_fixed = false;
+    var has_author = false;
+    for (argv.args) |arg| {
+        if (std.mem.eql(u8, arg, "--fixed-strings")) has_fixed = true;
+        if (std.mem.eql(u8, arg, "--author=bar")) has_author = true;
+    }
+    try std.testing.expect(has_fixed);
+    try std.testing.expect(has_author);
+}
+
+test "OwnedArgv.deinit frees owned strings only (borrowed safe)" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.setAuthor(a, "foo");
+    // snapshot_tip is borrowed (literal) — not freed by deinit
+    var argv = try logArgv(a, 0, 100, "borrowed_tip", spec);
+    // deinit must free --max-count, --author strings + args slice, but NOT "borrowed_tip"
+    argv.deinit(a);
+}
+
+test "revParseHeadArgv returns git rev-parse --verify HEAD" {
+    const argv = revParseHeadArgv();
+    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqualStrings("git", argv[0]);
+    try std.testing.expectEqualStrings("rev-parse", argv[1]);
+    try std.testing.expectEqualStrings("--verify", argv[2]);
+    try std.testing.expectEqualStrings("HEAD", argv[3]);
 }
 
 test "showNameStatusArgv: --diff-merges=first-parent --format= --name-status -z" {
