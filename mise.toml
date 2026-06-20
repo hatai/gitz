@@ -1,4 +1,5 @@
 [env]
+_.path = { path = "zig-out/bin" }
 _.python.venv = { path = ".venv", create = true }
 
 [tools]
