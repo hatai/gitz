@@ -4,6 +4,8 @@ const std = @import("std");
 const status = @import("git/status.zig");
 const Section = status.Section;
 const Focus = @import("model.zig").Focus;
+const filter_mod = @import("filter.zig");
+pub const FilterSpec = filter_mod.FilterSpec;
 
 pub const Msg = union(enum) {
     key_down, // j / ↓
@@ -54,18 +56,35 @@ pub const Msg = union(enum) {
     detail_diff_loaded: DetailDiffLoaded,
     git_error: []u8,
     committed,
+    // --- TODO 2 phase 3a: filter input + typed log load failures ---
+    open_filter_modal,
+    close_filter_modal,
+    apply_filter: []u8, // 所有: main が TextInput.getValue() を dupe して送る
+    clear_filter,
+    log_load_failed: LogLoadFailed,
+    log_load_failed_silent: LogLoadFailedSilent,
 
     pub const LogLoaded = struct {
         request_skip: usize,
         request_max_count: usize,
         request_generation: u64,
+        request_tip: []u8, // 所有 — appcmd が rev-parse HEAD で解決した snapshot tip
+        is_unborn: bool, // appcmd が headState tri-state で判定
         entries: []@import("git/log.zig").Commit,
+    };
+    pub const LogLoadFailed = struct {
+        request_generation: u64,
+        request_tip: ?[]u8, // 所有 — null = snapshot_tip 解決前失敗
+        error_text: []u8, // 所有
+    };
+    pub const LogLoadFailedSilent = struct {
+        request_generation: u64,
     };
     pub const LogPageLoaded = struct {
         request_skip: usize,
         request_max_count: usize,
         request_generation: u64,
-        request_tip: []u8, // 所有 — H-07: model.log_paging_tip と一致
+        request_tip: []u8, // 所有 — model.log_snapshot_tip と一致
         entries: []@import("git/log.zig").Commit,
     };
     pub const LogPageFailed = struct {
@@ -101,6 +120,7 @@ pub const Msg = union(enum) {
             },
             .diff_loaded => |s| a.free(s),
             .log_loaded => |ll| {
+                a.free(ll.request_tip);
                 for (ll.entries) |*c| c.deinit(a);
                 a.free(ll.entries);
             },
@@ -111,6 +131,11 @@ pub const Msg = union(enum) {
             },
             .log_page_failed => |lpf| a.free(lpf.error_text),
             .log_page_failed_silent => {},
+            .log_load_failed => |llf| {
+                a.free(llf.error_text);
+                if (llf.request_tip) |t| a.free(t);
+            },
+            .log_load_failed_silent => {},
             .commit_detail_loaded => |cdl| {
                 a.free(cdl.request_hash);
                 for (cdl.entries) |*e| e.deinit(a);
@@ -122,6 +147,7 @@ pub const Msg = union(enum) {
                 a.free(ddl.text);
             },
             .git_error => |s| a.free(s),
+            .apply_filter => |text| a.free(text),
             // 借用 / 単純: 解放不要（commit_text_changed は reducer 側が複製するため借用）
             .key_down,
             .key_up,
@@ -163,6 +189,9 @@ pub const Msg = union(enum) {
             .set_focus,
             .commit_text_changed,
             .committed,
+            .open_filter_modal,
+            .close_filter_modal,
+            .clear_filter,
             => {},
         }
     }
@@ -190,12 +219,13 @@ pub const AppCmd = union(enum) {
     /// git_dir: 絶対 git-dir（worktree/submodule 対応）。null = フォールバック（cwd 相対 .git/...）。
     /// デフォルト null 必須: 既存の8箇所の `.{ .patch=..., .reverse=... }` リテラル呼出を壊さないため。
     pub const ApplyPatch = struct { patch: []u8, reverse: bool, git_dir: ?[]const u8 = null };
-    pub const LoadLog = struct { skip: usize, max_count: usize, generation: u64 };
+    pub const LoadLog = struct { skip: usize, max_count: usize, generation: u64, filter: FilterSpec };
     pub const LoadLogPage = struct {
         skip: usize,
         max_count: usize,
         generation: u64,
         tip_hash: []u8, // 所有
+        filter: FilterSpec,
     };
     pub const LoadDetailDiff = struct { hash: []u8, path: []u8 };
 
@@ -220,11 +250,14 @@ pub const AppCmd = union(enum) {
             // 単純: 解放不要
             .none,
             .refresh_status,
-            .load_log,
             .quit,
             => {},
+            .load_log => |ll| {
+                ll.filter.deinit(a);
+            },
             .load_log_page => |llp| {
                 a.free(llp.tip_hash);
+                llp.filter.deinit(a);
             },
             .load_commit_detail => |h| a.free(h),
             .load_detail_diff => |ldd| {
@@ -340,7 +373,7 @@ test "AppCmd.load_diff deinit frees path and orig_path without leak" {
 
 // --- TODO 2 phase 1: Msg/AppCmd 新バリアントの deinit 検証 ---
 
-test "Msg.log_loaded deinit frees entries without leak" {
+test "Msg.log_loaded deinit frees request_tip and entries without leak" {
     const a = std.testing.allocator;
     const log = @import("git/log.zig");
     const entries = try a.alloc(log.Commit, 1);
@@ -353,7 +386,8 @@ test "Msg.log_loaded deinit frees entries without leak" {
         .refs = try a.dupe(u8, ""),
     };
     var msg = Msg{ .log_loaded = .{
-        .request_skip = 0, .request_max_count = 100, .request_generation = 1, .entries = entries,
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap1111"), .is_unborn = false, .entries = entries,
     } };
     msg.deinit(a);
 }
@@ -417,21 +451,58 @@ test "Msg.detail_diff_loaded deinit frees hash/path/text" {
     msg.deinit(a);
 }
 
-test "AppCmd.load_log has no owned payload (deinit is no-op)" {
+test "AppCmd.load_log owns filter and frees on deinit" {
     const a = std.testing.allocator;
-    var cmd = AppCmd{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 1 } };
+    var spec = FilterSpec.init();
+    try spec.setAuthor(a, "foo");
+    var cmd = AppCmd{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 1, .filter = spec } };
     cmd.deinit(a);
 }
 
-test "AppCmd.load_log_page owns tip_hash and frees on deinit" {
+test "AppCmd.load_log_page owns tip_hash and filter, frees on deinit" {
     const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    try spec.setAuthor(a, "bar");
     var cmd = AppCmd{ .load_log_page = .{
         .skip = 0,
         .max_count = 100,
         .generation = 1,
         .tip_hash = try a.dupe(u8, "tiphash"),
+        .filter = spec,
     } };
     cmd.deinit(a);
+}
+
+test "Msg.log_load_failed deinit frees error_text and request_tip" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .log_load_failed = .{
+        .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap1234"),
+        .error_text = try a.dupe(u8, "boom"),
+    } };
+    msg.deinit(a);
+}
+
+test "Msg.log_load_failed with null request_tip deinit is safe" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .log_load_failed = .{
+        .request_generation = 1,
+        .request_tip = null,
+        .error_text = try a.dupe(u8, "boom"),
+    } };
+    msg.deinit(a);
+}
+
+test "Msg.log_load_failed_silent deinit is no-op" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .log_load_failed_silent = .{ .request_generation = 1 } };
+    msg.deinit(a);
+}
+
+test "Msg.apply_filter deinit frees owned payload" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .apply_filter = try a.dupe(u8, "山田") };
+    msg.deinit(a);
 }
 
 test "AppCmd.load_commit_detail owns hash and frees on deinit" {
