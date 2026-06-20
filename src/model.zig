@@ -3,6 +3,8 @@ const status = @import("git/status.zig");
 const log_mod = @import("git/log.zig");
 const show_mod = @import("git/show.zig");
 const graph_mod = @import("git/graph.zig");
+const filter_mod = @import("filter.zig");
+pub const FilterSpec = filter_mod.FilterSpec;
 
 /// 最後に load_diff を発行したファイル識別子（層 1: codex B1 対策）。path のみで追跡すると
 /// partial stage で `? f` → `1 AM` 展開時の section 変化を取り逃がすため、section も持つ。
@@ -13,6 +15,8 @@ pub const Focus = enum { changes, diff, commit };
 
 pub const ViewMode = enum { changes, log };
 pub const DetailKind = enum { files, diff };
+
+pub const GraphRenderPolicy = enum { auto, suppressed };
 
 pub const FileItem = struct {
     path: []u8,
@@ -60,9 +64,15 @@ pub const Model = struct {
     detail_diff_owner_hash: ?[]u8,
     detail_diff_owner_path: ?[]u8,
 
-    // --- TODO 2 phase 2: graph display + paging tip ---
+    // --- TODO 2 phase 2/3a: graph display + snapshot tip ---
     log_graph_state: graph_mod.GraphState,
-    log_paging_tip: ?[]u8,
+    log_snapshot_tip: ?[]u8,
+    graph_render_policy: GraphRenderPolicy,
+
+    // --- TODO 2 phase 3a: filter UI state ---
+    filter_state: FilterSpec,
+    filter_modal_open: bool,
+    log_load_error: []u8,
 
     pub fn init(a: std.mem.Allocator, repo_root: []const u8) !Model {
         return .{
@@ -104,9 +114,15 @@ pub const Model = struct {
             .detail_diff_owner_hash = null,
             .detail_diff_owner_path = null,
 
-            // --- TODO 2 phase 2: graph display + paging tip ---
+            // --- TODO 2 phase 2/3a: graph display + snapshot tip ---
             .log_graph_state = .invalid,
-            .log_paging_tip = null,
+            .log_snapshot_tip = null,
+            .graph_render_policy = .auto,
+
+            // --- TODO 2 phase 3a: filter UI state ---
+            .filter_state = FilterSpec.init(),
+            .filter_modal_open = false,
+            .log_load_error = try a.dupe(u8, ""),
         };
     }
 
@@ -136,9 +152,12 @@ pub const Model = struct {
         if (self.detail_diff_owner_hash) |h| a.free(h);
         if (self.detail_diff_owner_path) |p| a.free(p);
 
-        // --- TODO 2 phase 2 ---
+        // --- TODO 2 phase 2/3a ---
         self.log_graph_state.deinit(a);
-        if (self.log_paging_tip) |t| a.free(t);
+        if (self.log_snapshot_tip) |t| a.free(t);
+        // --- TODO 2 phase 3a: filter UI state ---
+        self.filter_state.deinit(a);
+        a.free(self.log_load_error);
     }
 
     /// files を新しいエントリ集合で置換。entries は**複製**する（借用しない）。entries 自体の所有権は
@@ -353,18 +372,35 @@ pub const Model = struct {
         self.log_graph_state.deinit(self.allocator);
         self.log_graph_state = .invalid;
     }
-    /// phase 2: log_paging_tip をセット（旧を free して dup）。
-    pub fn setLogPagingTip(self: *Model, hash: []const u8) !void {
+    /// phase 3a: log_snapshot_tip をセット（旧を free して dup・OOM で self 不変）。
+    pub fn setLogSnapshotTip(self: *Model, hash: []const u8) !void {
         const a = self.allocator;
         const new = try a.dupe(u8, hash);
-        if (self.log_paging_tip) |old| a.free(old);
-        self.log_paging_tip = new;
+        if (self.log_snapshot_tip) |old| a.free(old);
+        self.log_snapshot_tip = new;
     }
-    /// phase 2: log_paging_tip をクリア。
-    pub fn clearLogPagingTip(self: *Model) void {
+    /// phase 3a: log_snapshot_tip をクリア。
+    pub fn clearLogSnapshotTip(self: *Model) void {
         const a = self.allocator;
-        if (self.log_paging_tip) |old| a.free(old);
-        self.log_paging_tip = null;
+        if (self.log_snapshot_tip) |old| a.free(old);
+        self.log_snapshot_tip = null;
+    }
+
+    // --- phase 3a: filter state helpers ---
+
+    /// filter_state を新 spec へ置換（旧を deinit して swap・new_spec の所有権を移譲）。
+    pub fn setFilterState(self: *Model, new_spec: FilterSpec) void {
+        self.filter_state.deinit(self.allocator);
+        self.filter_state = new_spec;
+    }
+    /// filter_state を空へ（deinit + init）。
+    pub fn clearFilterState(self: *Model) void {
+        self.filter_state.deinit(self.allocator);
+        self.filter_state = FilterSpec.init();
+    }
+    /// log_load_error を置換（setStr と同型）。
+    pub fn setLogLoadError(self: *Model, text: []const u8) !void {
+        return self.setStr(&self.log_load_error, text);
     }
 
     /// 表示順の section ランク（staged が先頭、untracked が末尾）。
@@ -886,22 +922,61 @@ test "setLogRestoreHash / clearLogRestoreHash cycle without leak" {
     try std.testing.expectEqual(@as(?[]u8, null), m.log_restore_hash);
 }
 
-// --- TODO 2 phase 2: graph state + paging tip helpers ---
+// --- TODO 2 phase 2/3a: graph state + snapshot tip helpers ---
 
 test "Model.log_graph_state initializes to .invalid" {
     var m = try Model.init(std.testing.allocator, "/r");
     defer m.deinit();
     try std.testing.expect(m.log_graph_state == .invalid);
-    try std.testing.expectEqual(@as(?[]u8, null), m.log_paging_tip);
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_snapshot_tip);
 }
 
-test "setLogPagingTip / clearLogPagingTip cycle without leak" {
+test "setLogSnapshotTip / clearLogSnapshotTip cycle without leak" {
     var m = try Model.init(std.testing.allocator, "/r");
     defer m.deinit();
-    try m.setLogPagingTip("abc");
-    try std.testing.expectEqualStrings("abc", m.log_paging_tip.?);
-    try m.setLogPagingTip("def");
-    try std.testing.expectEqualStrings("def", m.log_paging_tip.?);
-    m.clearLogPagingTip();
-    try std.testing.expectEqual(@as(?[]u8, null), m.log_paging_tip);
+    try m.setLogSnapshotTip("abc");
+    try std.testing.expectEqualStrings("abc", m.log_snapshot_tip.?);
+    try m.setLogSnapshotTip("def");
+    try std.testing.expectEqualStrings("def", m.log_snapshot_tip.?);
+    m.clearLogSnapshotTip();
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_snapshot_tip);
+}
+
+// --- TODO 2 phase 3a: filter / graph_render_policy / log_load_error ---
+
+test "Model.filter_state initializes empty, filter_modal_open false, graph policy auto" {
+    var m = try Model.init(std.testing.allocator, "/r");
+    defer m.deinit();
+    try std.testing.expect(m.filter_state.isEmpty());
+    try std.testing.expectEqual(false, m.filter_modal_open);
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
+    try std.testing.expectEqualStrings("", m.log_load_error);
+}
+
+test "Model.setFilterState swaps and frees old (transactional)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var spec1 = FilterSpec.init();
+    try spec1.setAuthor(a, "foo");
+    m.setFilterState(spec1);
+    try std.testing.expectEqualStrings("foo", m.filter_state.author.?);
+    var spec2 = FilterSpec.init();
+    try spec2.setAuthor(a, "bar");
+    m.setFilterState(spec2);
+    try std.testing.expectEqualStrings("bar", m.filter_state.author.?);
+    m.clearFilterState();
+    try std.testing.expect(m.filter_state.isEmpty());
+}
+
+test "Model.setLogLoadError replaces and frees old" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.setLogLoadError("error 1");
+    try std.testing.expectEqualStrings("error 1", m.log_load_error);
+    try m.setLogLoadError("error 2");
+    try std.testing.expectEqualStrings("error 2", m.log_load_error);
+    try m.setLogLoadError("");
+    try std.testing.expectEqualStrings("", m.log_load_error);
 }
