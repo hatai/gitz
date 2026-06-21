@@ -151,13 +151,12 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
 }
 
 /// Run git log for load_log (initial page, skip=0) and return log_loaded Msg.
-/// R5/R6/R7/R19/R20/R21/R23: headState tri-state・全エラー経路を catch して log_page_failed へ。
-/// load_log_page は runLogPageInt へ分離済み（tip_hash 固定・bad revision 検出付き）。
-/// ★phase 3a: Task 8 で rev-parse HEAD による snapshot_tip 解決・typed LogLoadFailed へ拡張予定。
+/// phase 3a §6.1: headState tri-state → rev-parse HEAD（snapshot_tip）→ logArgv with filter。
+/// 全エラー経路を LogLoadFailed / LogLoadFailedSilent へ正規化（B4/M3/MINOR7）。
 fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog) !Msg {
-    // R20: headState 呼び出しを catch（spawn/OOM も log_page_failed へ）。
+    // R20: headState 呼び出しを catch（spawn/OOM も LogLoadFailed へ）。
     const hs = cmds.headState(a, io, cwd) catch
-        return mkPageFailedOrSilent(a, cmd, "git リポジトリ状態の確認に失敗");
+        return mkLoadFailedOrSilent(a, cmd, "git リポジトリ状態の確認に失敗", null);
     switch (hs) {
         .unborn => {
             // R6/m-N1: 空配列 + request_tip="" + is_unborn=true で返す。
@@ -172,51 +171,80 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog) !M
                 .entries = entries,
             } };
         },
-        .err => return mkPageFailedOrSilent(a, cmd, "git リポジトリ状態が壊れています"),
+        .err => return mkLoadFailedOrSilent(a, cmd, "git リポジトリ状態が壊れています", null),
         .ok => {},
     }
-    // ★phase 3a Task 8 で revParseHead による snapshot_tip 解決へ更新予定。
-    //   現状は "HEAD" を revision へ渡す（Task 6 のビルド通過のための最小版）。
-    const snapshot_tip: []const u8 = "HEAD";
-    var argv = try cmds.logArgv(a, cmd.skip, cmd.max_count, snapshot_tip, cmd.filter);
+    // ★B1: rev-parse HEAD で snapshot_tip を取得（フィルタと独立・race 回避）。
+    const snapshot_tip = cmds.revParseHead(a, io, cwd) catch
+        return mkLoadFailedOrSilent(a, cmd, "HEAD 解決失敗", null);
+    if (snapshot_tip == null) return mkLoadFailedOrSilent(a, cmd, "HEAD 解決失敗", null);
+    defer a.free(snapshot_tip.?);
+    // logArgv へ snapshot_tip を明示限定 + filter を渡す（M8/M11）。
+    var argv = try cmds.logArgv(a, cmd.skip, cmd.max_count, snapshot_tip.?, cmd.filter);
     defer argv.deinit(a);
+    // MINOR7: StreamTooLong 含む RunError を LogLoadFailed へ正規化。
     var res = process.run(a, io, argv.args, cwd) catch
-        return mkPageFailedOrSilent(a, cmd, "git log 実行エラー");
+        return mkLoadFailedOrSilent(a, cmd, "git log 実行エラー", snapshot_tip);
     defer res.deinit(a);
     if (res.exit_code != 0) {
-        const text = a.dupe(u8, res.stderr) catch return mkPageFailedSilent(cmd);
-        return .{ .log_page_failed = .{ .request_skip = cmd.skip, .request_generation = cmd.generation, .error_text = text } };
+        const stderr_trimmed = std.mem.trim(u8, res.stderr, " \n");
+        const text = a.dupe(u8, stderr_trimmed) catch return mkLoadFailedSilent(cmd);
+        return .{ .log_load_failed = .{
+            .request_generation = cmd.generation,
+            .request_tip = dupeOpt(a, snapshot_tip) catch null,
+            .error_text = text,
+        } };
     }
     const entries = log.parse(a, res.stdout) catch
-        return mkPageFailedOrSilent(a, cmd, "git log パース失敗");
+        return mkLoadFailedOrSilent(a, cmd, "git log パース失敗", snapshot_tip);
     errdefer {
         for (entries) |*c| c.deinit(a);
         a.free(entries);
     }
-    // ★phase 3a Task 8 で request_tip へ rev-parse HEAD の結果を dupe 予定。
+    // ★B1: request_tip には rev-parse HEAD の結果を dupe して所有。
     return .{ .log_loaded = .{
         .request_skip = cmd.skip,
         .request_max_count = cmd.max_count,
         .request_generation = cmd.generation,
-        .request_tip = try a.dupe(u8, ""),
+        .request_tip = try a.dupe(u8, snapshot_tip.?),
         .is_unborn = false,
         .entries = entries,
     } };
 }
 
-/// R20/R21/R23b: prefix を所有 []u8 へ複製して log_page_failed を構築。OOM で silent 版へ fallback。
-fn mkPageFailedOrSilent(a: std.mem.Allocator, cmd: AppCmd.LoadLog, prefix: []const u8) Msg {
-    const text = a.dupe(u8, prefix) catch return mkPageFailedSilent(cmd);
-    return .{ .log_page_failed = .{ .request_skip = cmd.skip, .request_generation = cmd.generation, .error_text = text } };
+/// §6.1: LogLoadFailed を構築。tip が解決済みなら request_tip へ dupe。
+/// OOM 極限で error_text dupe が失敗する場合は LogLoadFailedSilent へ fallback。
+fn mkLoadFailedOrSilent(
+    a: std.mem.Allocator,
+    cmd: AppCmd.LoadLog,
+    prefix: []const u8,
+    tip: ?[]const u8,
+) Msg {
+    const text = a.dupe(u8, prefix) catch return mkLoadFailedSilent(cmd);
+    const tip_dup = dupeOpt(a, tip) catch {
+        a.free(text);
+        return mkLoadFailedSilent(cmd);
+    };
+    return .{ .log_load_failed = .{
+        .request_generation = cmd.generation,
+        .request_tip = tip_dup,
+        .error_text = text,
+    } };
 }
 
-/// R21: OOM 極限の silent 版。payload 無し・log_page_requested を確実に下ろすことだけが目的。
-fn mkPageFailedSilent(cmd: AppCmd.LoadLog) Msg {
-    return .{ .log_page_failed_silent = .{ .request_skip = cmd.skip, .request_generation = cmd.generation } };
+/// §6.1: OOM 極限の silent 版。payload 無し・generation 照合のみ。
+fn mkLoadFailedSilent(cmd: AppCmd.LoadLog) Msg {
+    return .{ .log_load_failed_silent = .{ .request_generation = cmd.generation } };
+}
+
+/// ?[]const u8 → ?[]u8 への dupe ヘルパ（null はそのまま）。
+fn dupeOpt(a: std.mem.Allocator, val: ?[]const u8) !?[]u8 {
+    if (val) |v| return try a.dupe(u8, v);
+    return null;
 }
 
 /// load_log_page 専用の mkPageFailedOrSilent。prefix を所有 []u8 へ複製して log_page_failed を構築。
-/// OOM で silent 版へ fallback（M-12: tip 期限切れ等のページ系失敗を reducer へ伝える）。
+/// OOM で silent 版へ fallback。
 fn mkPageFailedOrSilentForPage(a: std.mem.Allocator, cmd: AppCmd.LoadLogPage, prefix: []const u8) Msg {
     const text = a.dupe(u8, prefix) catch return mkPageFailedSilentForPage(cmd);
     return .{ .log_page_failed = .{ .request_skip = cmd.skip, .request_generation = cmd.generation, .error_text = text } };
@@ -228,7 +256,8 @@ fn mkPageFailedSilentForPage(cmd: AppCmd.LoadLogPage) Msg {
 }
 
 /// load_log_page 専用: tip_hash 固定で git log を実行（H-06/H-07）。
-/// M-12: exit_code 128（bad revision: tip が gc 等で消失）は git_error へ還元し reducer で全 refresh を促す。
+/// phase 3a §6.2/M3: bad revision（exit 128）は LogPageFailed へ（git_error ではない）。
+/// MINOR7: StreamTooLong 含む RunError も LogPageFailed へ正規化。
 fn runLogPageInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLogPage) !Msg {
     var argv = try cmds.logPageArgv(a, cmd.skip, cmd.max_count, cmd.tip_hash, cmd.filter);
     defer argv.deinit(a);
@@ -236,10 +265,16 @@ fn runLogPageInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog
         return mkPageFailedOrSilentForPage(a, cmd, "git log 実行エラー");
     defer res.deinit(a);
     if (res.exit_code != 0) {
-        // M-12: bad revision 検出（tip が gc 等で消失）。exit 128 を git_error へ還元し、
-        // reducer 側で log_request_generation を bump した全 refresh を誘導する。
+        // M3: bad revision（tip が gc 等で消失）は LogPageFailed へ。
+        //   reducer 側 handleLogPageFailed で clearLogSnapshotTip + 次 LoadLog で再解決。
         if (res.exit_code == 128) {
-            return .{ .git_error = try a.dupe(u8, "tip が期限切れです（履歴が移動しました）") };
+            const text = a.dupe(u8, "tip が期限切れです（履歴が移動しました）") catch
+                return mkPageFailedSilentForPage(cmd);
+            return .{ .log_page_failed = .{
+                .request_skip = cmd.skip,
+                .request_generation = cmd.generation,
+                .error_text = text,
+            } };
         }
         const stderr_trimmed = std.mem.trim(u8, res.stderr, " \n");
         const text = a.dupe(u8, stderr_trimmed) catch
@@ -256,7 +291,7 @@ fn runLogPageInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog
         for (entries) |*c| c.deinit(a);
         a.free(entries);
     }
-    // H-07: request_tip には cmd.tip_hash を dupe して所有。reducer で log_paging_tip と照合する。
+    // H-07: request_tip には cmd.tip_hash を dupe して所有。reducer で log_snapshot_tip と照合する。
     const tip_dup = try a.dupe(u8, cmd.tip_hash);
     errdefer a.free(tip_dup);
     return .{ .log_page_loaded = .{
@@ -266,30 +301,6 @@ fn runLogPageInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog
         .request_tip = tip_dup,
         .entries = entries,
     } };
-}
-
-/// freeLogArgv と同一の解放戦略（--skip= / --max-count= の動的生成文字列のみ free）。
-/// logPageArgv は tip_hash も末尾に置くが、tip_hash は呼び出し側（AppCmd.LoadLogPage）所有のため
-/// ここでは free しない（argv スライス自体は free する）。
-fn freeLogPageArgv(a: std.mem.Allocator, argv: []const []const u8) void {
-    for (argv) |arg| {
-        if (std.mem.startsWith(u8, arg, "--skip=") or
-            std.mem.startsWith(u8, arg, "--max-count=")) {
-            a.free(arg);
-        }
-    }
-    a.free(argv);
-}
-
-/// Free logArgv result: logArgv は静的リテラル + 動的文字列 (--skip=, --max-count=) を含む。
-/// 動的文字列だけ free し、argv スライス自体も free する。
-fn freeLogArgv(a: std.mem.Allocator, argv: []const []const u8) void {
-    for (argv) |arg| {
-        if (std.mem.startsWith(u8, arg, "--skip=") or std.mem.startsWith(u8, arg, "--max-count=")) {
-            a.free(arg);
-        }
-    }
-    a.free(argv);
 }
 
 // 副作用コマンドを実行 → 失敗なら git_error、成功なら status を読み直して status_loaded を返す
@@ -930,6 +941,10 @@ test "load_log returns log_loaded with 3 commits on a populated repo" {
     try std.testing.expectEqual(@as(usize, 0), msg.log_loaded.request_skip);
     try std.testing.expectEqual(@as(usize, 100), msg.log_loaded.request_max_count);
     try std.testing.expectEqual(@as(u64, 1), msg.log_loaded.request_generation);
+    // ★B1: request_tip は rev-parse HEAD の結果（空文字ではない）。
+    try std.testing.expect(msg.log_loaded.request_tip.len > 0);
+    // ★m-N1: is_unborn=false（commit あり）。
+    try std.testing.expect(!msg.log_loaded.is_unborn);
 }
 
 test "load_log on empty (unborn) repo returns log_loaded with 0 entries" {
@@ -944,6 +959,9 @@ test "load_log on empty (unborn) repo returns log_loaded with 0 entries" {
     try std.testing.expect(msg == .log_loaded);
     try std.testing.expectEqual(@as(usize, 0), msg.log_loaded.entries.len);
     try std.testing.expectEqual(@as(u64, 7), msg.log_loaded.request_generation);
+    // ★m-N1: is_unborn=true・request_tip は空文字。
+    try std.testing.expect(msg.log_loaded.is_unborn);
+    try std.testing.expectEqualStrings("", msg.log_loaded.request_tip);
 }
 
 test "load_log_page returns log_page_loaded and respects skip" {
@@ -1037,4 +1055,139 @@ test "load_detail_diff returns detail_diff_loaded with diff text" {
     try std.testing.expectEqualStrings("a.txt", msg.detail_diff_loaded.request_path);
     // 追加行 +2 が diff 本文に含まれる。
     try std.testing.expect(std.mem.indexOf(u8, msg.detail_diff_loaded.text, "+2") != null);
+}
+
+// --- TODO 2 phase 3a Task 8: author filter + snapshot_tip + typed failures 結合テスト ---
+
+test "runLogInt: filter by author returns matching commits only" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // 異なる作者で 3 コミット作成。
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "-c", "user.name=alice", "commit", "-q", "-m", "c1" });
+    try repo.writeFile(io, "b.txt", "b\n");
+    try repo.git(a, io, &.{ "git", "add", "b.txt" });
+    try repo.git(a, io, &.{ "git", "-c", "user.name=bob", "commit", "-q", "-m", "c2" });
+    try repo.writeFile(io, "c.txt", "c\n");
+    try repo.git(a, io, &.{ "git", "add", "c.txt" });
+    try repo.git(a, io, &.{ "git", "-c", "user.name=alice", "commit", "-q", "-m", "c3" });
+    // author=alice でフィルタ → c1, c3 の 2 件。
+    var spec = FilterSpec.init();
+    try spec.setAuthor(a, "alice");
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expectEqual(@as(usize, 2), msg.log_loaded.entries.len);
+    // 両方とも author に alice を含む。
+    for (msg.log_loaded.entries) |e| {
+        try std.testing.expect(std.mem.indexOf(u8, e.author, "alice") != null);
+    }
+}
+
+test "runLogInt: empty filter result returns 0 commits with valid snapshot_tip" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    // 存在しない作者でフィルタ → 0 件・snapshot_tip は HEAD と一致。
+    var spec = FilterSpec.init();
+    try spec.setAuthor(a, "nonexistent");
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expectEqual(@as(usize, 0), msg.log_loaded.entries.len);
+    // B1: snapshot_tip は HEAD hash（空一致でも tip は解決される）。
+    try std.testing.expect(msg.log_loaded.request_tip.len > 0);
+    try std.testing.expect(!msg.log_loaded.is_unborn);
+}
+
+test "runLogInt: literal bracket works with --fixed-strings" {
+    // --fixed-strings により `[` も regex メタ文字ではなく literal として扱われる。
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "-c", "user.name=test[er", "commit", "-q", "-m", "c1" });
+    var spec = FilterSpec.init();
+    try spec.setAuthor(a, "test[er");
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expectEqual(@as(usize, 1), msg.log_loaded.entries.len);
+}
+
+test "runLogInt: UTF-8 author filter works with --fixed-strings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "-c", "user.name=山田太郎", "commit", "-q", "-m", "c1" });
+    var spec = FilterSpec.init();
+    try spec.setAuthor(a, "山田");
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expectEqual(@as(usize, 1), msg.log_loaded.entries.len);
+    try std.testing.expectEqualStrings("山田太郎", msg.log_loaded.entries[0].author);
+}
+
+test "runLogPageInt: bad revision (exit 128) → LogPageFailed not git_error (M3)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    // 存在しない hash を tip_hash へ → bad revision (exit 128)。
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log_page = .{
+        .skip = 0,
+        .max_count = 100,
+        .generation = 1,
+        .tip_hash = try a.dupe(u8, "0000000000000000000000000000000000000000"),
+        .filter = FilterSpec.init(),
+    } });
+    defer msg.deinit(a);
+    // M3: git_error ではなく LogPageFailed へ。
+    try std.testing.expect(msg == .log_page_failed);
+    try std.testing.expect(std.mem.indexOf(u8, msg.log_page_failed.error_text, "tip が期限切れ") != null);
+}
+
+test "runLogInt: request_tip matches rev-parse HEAD (B1)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    // 期待される HEAD hash を取得。
+    var hr = try process.run(a, io, &.{ "git", "rev-parse", "HEAD" }, repo.cwd());
+    defer hr.deinit(a);
+    const expected_tip = std.mem.trimEnd(u8, hr.stdout, "\n");
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = FilterSpec.init(),
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    // B1: request_tip は rev-parse HEAD の結果と一致。
+    try std.testing.expectEqualStrings(expected_tip, msg.log_loaded.request_tip);
 }
