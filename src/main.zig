@@ -98,6 +98,8 @@ const App = struct {
     cwd: Cwd, // 常に .{ .path = model.repo_root }（サブディレクトリ起動でも root 相対で一貫）
     model: Model,
     textarea: zz.TextArea,
+    filter_textinput: zz.TextInput, // phase 3a: 作者フィルタモーダルの単行入力（persistent_allocator 所有）
+    filter_modal: zz.Modal, // phase 3a: フィルタ編集モーダル（button 無し・Enter/Esc はアプリで横取り）
     queue: ResultQueue = .{},
 
     // ワーカー直列実行（1 度に 1 コマンド）。busy 中の新規副作用は pending に latest-wins で退避。
@@ -261,6 +263,17 @@ pub const RuntimeModel = struct {
         g_app.textarea = zz.TextArea.init(ctx.persistent_allocator);
         g_app.textarea.setSize(@max(ctx.width, 1), 4);
         g_app.textarea.placeholder = "コミットメッセージ";
+        // phase 3a §9.1/M7: filter TextInput と Modal を persistent_allocator で生成。
+        // TextInput.getValue は borrowed（内部 value.items への借用）・Enter 押下時に main が dupe。
+        // Modal は button 無し（Enter/Esc をアプリ側で横取り・button_count==0 で Modal.handleKey の enter は no-op）。
+        g_app.filter_textinput = zz.TextInput.init(ctx.persistent_allocator);
+        g_app.filter_textinput.setCharLimit(256); // m-N2: max_author_runes と整合
+        g_app.filter_textinput.setPlaceholder("Filter by author...");
+        g_app.filter_textinput.setPrompt("author: ");
+        g_app.filter_modal = zz.Modal.init();
+        g_app.filter_modal.title = "Filter by author";
+        g_app.filter_modal.border_fg = .cyan;
+        g_app.filter_modal.width = .{ .percent = 0.6 };
         // ~30fps でワーカー完了をポーリングする（tick が無いと drain が回らない）。
         return zz.Cmd(RuntimeModel.Msg).everyMs(33);
     }
@@ -286,7 +299,12 @@ pub const RuntimeModel = struct {
     }
 
     pub fn view(_: *const RuntimeModel, ctx: *const zz.Context) []const u8 {
-        return viewmod.render(&g_app.model, ctx);
+        const app = &g_app;
+        // phase 3a §9.3/M6: model.filter_modal_open と modal visibility を同期。
+        // true→false 遷移で TextInput へ現 filter をロード（編集継続）・false→true で hide。
+        // committed 時の textarea.setValue("")（drainQueue）と同パターン。
+        syncFilterModal(app, ctx);
+        return viewmod.render(&app.model, ctx);
     }
 
     pub fn deinit(_: *RuntimeModel) void {
@@ -303,6 +321,8 @@ pub const RuntimeModel = struct {
         }
         app.queue.deinit(app.gpa);
         app.textarea.deinit();
+        app.filter_textinput.deinit(); // phase 3a: TextInput は persistent_allocator 所有
+        // filter_modal はヒープ所有しない（title/body は借用 slice）・deinit 不要。
         app.model.deinit();
         g_app_ready = false;
     }
@@ -334,9 +354,39 @@ fn nowMs(app: *App) i64 {
     return std.Io.Timestamp.now(app.io, .awake).toMilliseconds();
 }
 
+/// phase 3a §9.3: model.filter_modal_open と filter_modal visibility を同期。
+/// `open_filter_modal` reducer が flag を立てたら、次フレームの view で TextInput へ現 filter をロード
+/// （編集継続・§19 デフォルト 6）し modal.show()。逆に flag が下りたら modal.hide()。
+/// 毎フレーム modal.body へ TextInput の描画結果を設定（viewWithBackdrop が body を描画）。
+fn syncFilterModal(app: *App, ctx: *const zz.Context) void {
+    if (app.model.filter_modal_open and !app.filter_modal.isVisible()) {
+        // false→true 遷移: 現 filter_state.author を TextInput へロード（編集継続）。
+        const cur = app.model.filter_state.author orelse "";
+        app.filter_textinput.setValue(cur) catch {};
+        app.filter_modal.show();
+    } else if (!app.model.filter_modal_open and app.filter_modal.isVisible()) {
+        // true→false 遷移: modal を隠す（close_filter_modal / apply_filter / clear_filter で reducer が flag を下ろす）。
+        app.filter_modal.hide();
+    }
+    // 毎フレーム modal.body へ TextInput の描画を反映（ctx.allocator = フレーム arena・free 不要）。
+    // body は viewWithBackdrop が render する。失敗時は空 body（描画が空になるだけでクラッシュしない）。
+    if (app.model.filter_modal_open) {
+        app.filter_modal.body = app.filter_textinput.view(ctx.allocator) catch "";
+        viewmod.g_view_modal = &app.filter_modal;
+    } else {
+        viewmod.g_view_modal = null;
+    }
+}
+
 var g_click_state: input.ClickState = .{};
 
 fn handleKey(app: *App, program: *ProgramT, k: zz.KeyEvent) void {
+    // phase 3a §9.2/M6/M-N7: filter_modal_open 時は入力を TextInput へ委譲
+    // （Enter/Esc はアプリ側で横取りし payload 付き Msg を構築・input は null で返す）。
+    if (app.model.filter_modal_open) {
+        handleModalKey(app, program, k);
+        return;
+    }
     // commit フォーカス時: 編集キー（文字/Enter/Backspace/矢印）は TextArea が正本。
     // keyToMsgForMode はそれらに null を返すので、null かつ changes モード + commit フォーカスなら
     // TextArea へ委譲する（log モードに commit フォーカスは無い・M5 正規化で .changes へ戻る）。
@@ -355,8 +405,42 @@ fn handleKey(app: *App, program: *ProgramT, k: zz.KeyEvent) void {
     }
 }
 
+/// phase 3a §7.1/§9.2/M6/M-N7: modal open 時のキー routing。
+/// Escape → `.close_filter_modal`・Enter → main が `TextInput.getValue()` を dupe して
+/// `Msg.apply_filter` payload を構築（input 関数は tag のみ返せないため Zig の tagged union 制約）。
+/// それ以外（文字/BS/矢印/Ctrl+a/e/k/u/w 等）は TextInput.handleKey へ委譲。
+/// q/r/L/tab 等 global mapping は input.keyToMsgForModeWithModal が null を返すのでここで TextInput へ回る。
+fn handleModalKey(app: *App, program: *ProgramT, k: zz.KeyEvent) void {
+    const abstract = input.fromZigzagKey(k);
+    if (abstract) |key| {
+        switch (key) {
+            .escape => {
+                step(app, program, .close_filter_modal);
+                return;
+            },
+            .enter => {
+                // M-N7: payload は main が TextInput.getValue() を dupe して構築。
+                // consumer（reducer → main step）が free する（Msg.deinit で a.free(text)）。
+                const v = app.filter_textinput.getValue();
+                const dup = app.gpa.dupe(u8, v) catch {
+                    // OOM: モーダルを維持して log_load_error で通知。
+                    app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
+                    return;
+                };
+                step(app, program, .{ .apply_filter = dup });
+                return;
+            },
+            else => {},
+        }
+    }
+    // その他のキーは TextInput.handleKey へ委譲（Ctrl+a/e/k/u/w, 文字/BS/Del/矢印 等）。
+    app.filter_textinput.handleKey(k);
+}
+
 fn handleMouse(app: *App, program: *ProgramT, m: zz.MouseEvent) void {
     if (!app.model.mouse_enabled) return;
+    // phase 3a §7.2/M6: modal open 時は背面 pane への routing をスキップ（モーダル外クリックは無視）。
+    if (app.model.filter_modal_open) return;
     const w = g_program.context.width;
     const h = g_program.context.height;
     // changes/log 両モードの scratch をスタックに確保（使わない側は参照しない）。
@@ -477,6 +561,8 @@ pub fn main(init: std.process.Init) !void {
         .cwd = cwd_root,
         .model = m,
         .textarea = undefined, // RuntimeModel.init で生成
+        .filter_textinput = undefined, // RuntimeModel.init で生成（phase 3a）
+        .filter_modal = undefined, // RuntimeModel.init で生成（phase 3a）
     };
     g_app_ready = true;
 
