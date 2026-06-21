@@ -22,6 +22,11 @@ const graph_mod = @import("git/graph.zig");
 pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
 pub const Layout = struct { changes: Rect, diff: Rect, commit: Rect, status: Rect };
 
+/// phase 3a §8.1/MINOR5/m-N5: renderLogMode が参照する modal へのポインタ。
+/// main.zig が毎フレーム render 呼出前に設定する（`g_program`/`g_app` と同パターン）。
+/// `null` のとき（main 起動前等）は modal overlay を出さず base view を返す。
+pub var g_view_modal: ?*const zz.Modal = null;
+
 /// 共通ヘルパ（L3）: status 1 行確保・top の最低高さ 1・u16 clamp。
 /// changes/log 両モードのレイアウト計算で共有する（極小端末でも underflow しない）。
 /// 戻り値 `top_h` は status 以外の領域（changes モードなら changes+commit、log モードなら log+detail）。
@@ -336,10 +341,12 @@ fn renderCommit(model: *const Model, ctx: *const zz.Context) []const u8 {
     return std.fmt.allocPrint(a, "{s}\n{s}", .{ head, body }) catch head;
 }
 
-/// Status バー: branch / busy スピナ / error_text / キーヒント。
+/// Status バー: branch / busy スピナ / error_text / フィルタインジケータ / キーヒント。
 /// スピナは `model.working`（変更系操作の実行中のみ）で出す。`model.busy`（全 in-flight ゲート）では
 /// 出さない＝自動リフレッシュ/ナビゲーションの読み取りでステータスバーが点滅しない。
 /// タスク A: diff フォーカス + anchor 非 null のとき `[SELECT]` を先頭に表示（テキストダンプでも判別）。
+/// phase 3a §8.2: log モードでフィルタ適用中は `[Filter: author="..."]` を表示。
+/// phase 3a §8.3/B4: log モードで `log_load_error` が非空なら `(error) <text>` を表示。
 fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
     const branch = if (model.branch.len == 0) "(detached)" else model.branch;
@@ -348,12 +355,27 @@ fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
         "[SELECT]  "
     else
         "";
-    const hint_base = if (model.focus == .diff)
+    // phase 3a §8.2: log モードでフィルタ適用中はインジケータを表示。
+    const filter_indicator: []const u8 = if (model.view_mode == .log and !model.filter_state.isEmpty()) blk: {
+        const author_raw = model.filter_state.author orelse "";
+        const indicator = std.fmt.allocPrint(a, "[Filter: author=\"{s}\"]  ", .{author_raw}) catch "[Filter]  ";
+        break :blk indicator;
+    } else "";
+    const hint_base = if (model.view_mode == .log)
+        "j/k move  f filter  F clear  r refresh  L changes  q quit"
+    else if (model.focus == .diff)
         "j/k line  v select  # hunk  H stage-hunk  s stage/unstage  ]/[ hunk  tab pane  r refresh  q quit"
     else
         "j/k move  space stage  c commit  r refresh  q quit";
-    const hint = std.fmt.allocPrint(a, "{s}{s}", .{ select_indicator, hint_base }) catch hint_base;
+    const hint = std.fmt.allocPrint(a, "{s}{s}{s}", .{ select_indicator, filter_indicator, hint_base }) catch hint_base;
     const base = std.fmt.allocPrint(a, " {s}{s}", .{ branch, spin }) catch " ?";
+    // phase 3a §8.3/B4: log モードで log_load_error が非空なら優先表示。
+    if (model.view_mode == .log and model.log_load_error.len > 0) {
+        const err_style = zz.Style{ .foreground = zz.Color.red, .bold_attr = true };
+        const err_text = std.fmt.allocPrint(a, "(error) {s}", .{model.log_load_error}) catch model.log_load_error;
+        const err = err_style.render(a, err_text) catch err_text;
+        return std.fmt.allocPrint(a, "{s}  {s}  {s}", .{ base, err, hint }) catch base;
+    }
     if (model.error_text.len > 0) {
         const err_style = zz.Style{ .foreground = zz.Color.red, .bold_attr = true };
         const err = err_style.render(a, model.error_text) catch model.error_text;
@@ -427,13 +449,32 @@ fn renderGraphCells(a: std.mem.Allocator, row: graph_mod.GraphRow, max_width: u1
     return std.mem.join(a, "", parts.items) catch "";
 }
 
+/// phase 3a §8.3/MINOR1/m-N1: 空結果の表示メッセージ種別を純粋に決定する。
+/// log_load_error > filter 非空 > (no commits) の順で切り分け。
+/// テスト可能な純粋関数として抽出（renderLog が zz.Context 依存のため決定ロジックだけ分離）。
+pub const LogEmptyKind = enum { error_text, no_matching, no_commits };
+
+pub fn logEmptyKind(model: *const Model) LogEmptyKind {
+    if (model.log_load_error.len > 0) return .error_text;
+    if (!model.filter_state.isEmpty()) return .no_matching;
+    return .no_commits;
+}
+
 /// log ペインの描画（Task 9）。グラフセル + refs + short-hash + subject + author + UTC date を
 /// ペイン幅に応じて段階的に表示する（M-13: responsive column omission）。選択行は reverse。
 /// `log_scroll` からのウィンドウを描画し、選択が可視範囲に入るよう `log_scroll` を調整する
 /// （changes の changes_scroll と同型・唯一の writer）。`pane_w` で列の出し入れを決める。
+/// phase 3a §1.3/B2: `graph_render_policy==.suppressed` で graph 列を表示せず、代わりにメタ行を先頭へ。
+/// phase 3a §8.3/MINOR1/m-N1: 空結果の表示を error/no matching/no commits で切り分け。
 fn renderLog(model: *Model, ctx: *const zz.Context, height: u16, pane_w: u16) []const u8 {
     const a = ctx.allocator;
-    if (model.log_commits.items.len == 0) return "(no commits)";
+    if (model.log_commits.items.len == 0) {
+        return switch (logEmptyKind(model)) {
+            .error_text => std.fmt.allocPrint(a, "(error) {s}", .{model.log_load_error}) catch "(error)",
+            .no_matching => "(no matching commits)",
+            .no_commits => "(no commits)",
+        };
+    }
 
     const limit: usize = if (height == 0) 1 else height;
     const total = model.log_commits.items.len;
@@ -444,7 +485,8 @@ fn renderLog(model: *Model, ctx: *const zz.Context, height: u16, pane_w: u16) []
     if (model.log_scroll >= total) model.log_scroll = if (total == 0) 0 else total - 1;
 
     // M-13: ペイン幅に応じたレスポンシブな列省略。狭いペインではグラフ/author/date を順に省く。
-    const show_graph = pane_w >= 30 and model.log_graph_state == .valid;
+    // phase 3a §1.3/B2: graph_render_policy==.suppressed なら graph 列を表示しない。
+    const show_graph = pane_w >= 30 and model.log_graph_state == .valid and model.graph_render_policy == .auto;
     const show_date = pane_w >= 60;
     const show_author = pane_w >= 45;
 
@@ -454,6 +496,14 @@ fn renderLog(model: *Model, ctx: *const zz.Context, height: u16, pane_w: u16) []
         null;
 
     var lines: std.ArrayList([]const u8) = .empty; // arena なので deinit 不要
+
+    // phase 3a §8.2/n-N3: フィルタ中で graph が非表示のとき、理由を行先頭へ表示。
+    if (model.graph_render_policy == .suppressed and !model.filter_state.isEmpty()) {
+        const author_raw = model.filter_state.author orelse "";
+        const meta = std.fmt.allocPrint(a, "Filter: author=\"{s}\" (graph hidden)", .{author_raw}) catch "Filter: (graph hidden)";
+        lines.append(a, meta) catch {};
+    }
+
     const start = model.log_scroll;
     const end = @min(total, start + limit);
     for (model.log_commits.items[start..end], start..) |c, i| {
@@ -668,8 +718,19 @@ fn renderChangesMode(model: *Model, ctx: *const zz.Context) []const u8 {
 /// log モードの描画（spec §3.6）。log（左 40%）| detail（右 60%）の上段 + status（下 1 行）。
 /// `computeLogLayout` の 3 矩形（log / detail / status）を `fitPane` で整形して結合する。
 /// commit ペインは持たない（log モードは読み取り専用・コミット編集は changes モードのみ）。
+/// phase 3a §8.1/MINOR5/m-N5: `filter_modal_open==true` のとき base view を返さず
+/// `modal.viewWithBackdrop` を返す（全面 canvas・背景は見えない・overlay compositor は将来課題）。
 fn renderLogMode(model: *Model, ctx: *const zz.Context) []const u8 {
     const a = ctx.allocator;
+
+    // phase 3a §8.1/MINOR5/m-N5: modal 表示中は base view を返さず viewWithBackdrop で全面置換。
+    // 背景は見えない（backdrop が solid）。g_view_modal は main が render 呼出前に設定。
+    if (model.filter_modal_open) {
+        if (g_view_modal) |modal| {
+            return modal.viewWithBackdrop(a, ctx.width, ctx.height) catch "(modal render error)";
+        }
+    }
+
     const layout = computeLogLayout(ctx.width, ctx.height);
 
     const log = fitPane(a, renderLog(model, ctx, layout.log.h, layout.log.w), layout.log);
@@ -1010,6 +1071,45 @@ test "formatAuthorDateUTC: formats epoch to YYYY-MM-DD" {
     // 2023-11-14 22:13:20 UTC = 1700000000
     const date = formatAuthorDateUTC(a, 1700000000);
     try std.testing.expectEqualStrings("2023-11-14", date);
+}
+
+// ====================== TODO 2 phase 3a: logEmptyKind / filter state tests ======================
+
+test "logEmptyKind: no commits when no error and no filter" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try std.testing.expectEqual(LogEmptyKind.no_commits, logEmptyKind(&m));
+}
+
+test "logEmptyKind: no matching commits when filter active" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var spec = @import("filter.zig").FilterSpec.init();
+    try spec.setAuthor(a, "foo");
+    m.setFilterState(spec);
+    try std.testing.expectEqual(LogEmptyKind.no_matching, logEmptyKind(&m));
+}
+
+test "logEmptyKind: error_text takes priority over filter" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var spec = @import("filter.zig").FilterSpec.init();
+    try spec.setAuthor(a, "foo");
+    m.setFilterState(spec);
+    try m.setLogLoadError("HEAD 解決失敗");
+    // error_text が最優先（フィルタ適用中でもエラー表示が上書き）
+    try std.testing.expectEqual(LogEmptyKind.error_text, logEmptyKind(&m));
+}
+
+test "logEmptyKind: no_commits when filter empty even with error cleared" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    try m.setLogLoadError("");
+    try std.testing.expectEqual(LogEmptyKind.no_commits, logEmptyKind(&m));
 }
 
 test {
