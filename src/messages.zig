@@ -252,12 +252,12 @@ pub const AppCmd = union(enum) {
             .refresh_status,
             .quit,
             => {},
-            .load_log => |ll| {
-                ll.filter.deinit(a);
+            .load_log => {
+                self.load_log.filter.deinit(a);
             },
-            .load_log_page => |llp| {
-                a.free(llp.tip_hash);
-                llp.filter.deinit(a);
+            .load_log_page => {
+                a.free(self.load_log_page.tip_hash);
+                self.load_log_page.filter.deinit(a);
             },
             .load_commit_detail => |h| a.free(h),
             .load_detail_diff => |ldd| {

@@ -10,6 +10,7 @@ const show = @import("git/show.zig");
 const msgs = @import("messages.zig");
 const Msg = msgs.Msg;
 const AppCmd = msgs.AppCmd;
+const FilterSpec = msgs.FilterSpec;
 
 const Cwd = process.Cwd;
 
@@ -152,29 +153,34 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
 /// Run git log for load_log (initial page, skip=0) and return log_loaded Msg.
 /// R5/R6/R7/R19/R20/R21/R23: headState tri-state・全エラー経路を catch して log_page_failed へ。
 /// load_log_page は runLogPageInt へ分離済み（tip_hash 固定・bad revision 検出付き）。
+/// ★phase 3a: Task 8 で rev-parse HEAD による snapshot_tip 解決・typed LogLoadFailed へ拡張予定。
 fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog) !Msg {
     // R20: headState 呼び出しを catch（spawn/OOM も log_page_failed へ）。
     const hs = cmds.headState(a, io, cwd) catch
         return mkPageFailedOrSilent(a, cmd, "git リポジトリ状態の確認に失敗");
     switch (hs) {
         .unborn => {
-            // R6: 空配列を返す（unborn HEAD は log 対象無し）。
+            // R6/m-N1: 空配列 + request_tip="" + is_unborn=true で返す。
             const entries = try a.alloc(log.Commit, 0);
             errdefer a.free(entries);
             return .{ .log_loaded = .{
                 .request_skip = cmd.skip,
                 .request_max_count = cmd.max_count,
                 .request_generation = cmd.generation,
+                .request_tip = try a.dupe(u8, ""),
+                .is_unborn = true,
                 .entries = entries,
             } };
         },
         .err => return mkPageFailedOrSilent(a, cmd, "git リポジトリ状態が壊れています"),
         .ok => {},
     }
-    // git log 実行。R7/R21: spawn/parse/OOM も catch して log_page_failed へ。
-    const argv = try cmds.logArgv(a, cmd.skip, cmd.max_count);
-    defer freeLogArgv(a, argv);
-    var res = process.run(a, io, argv, cwd) catch
+    // ★phase 3a Task 8 で revParseHead による snapshot_tip 解決へ更新予定。
+    //   現状は "HEAD" を revision へ渡す（Task 6 のビルド通過のための最小版）。
+    const snapshot_tip: []const u8 = "HEAD";
+    var argv = try cmds.logArgv(a, cmd.skip, cmd.max_count, snapshot_tip, cmd.filter);
+    defer argv.deinit(a);
+    var res = process.run(a, io, argv.args, cwd) catch
         return mkPageFailedOrSilent(a, cmd, "git log 実行エラー");
     defer res.deinit(a);
     if (res.exit_code != 0) {
@@ -187,10 +193,13 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog) !M
         for (entries) |*c| c.deinit(a);
         a.free(entries);
     }
+    // ★phase 3a Task 8 で request_tip へ rev-parse HEAD の結果を dupe 予定。
     return .{ .log_loaded = .{
         .request_skip = cmd.skip,
         .request_max_count = cmd.max_count,
         .request_generation = cmd.generation,
+        .request_tip = try a.dupe(u8, ""),
+        .is_unborn = false,
         .entries = entries,
     } };
 }
@@ -221,9 +230,9 @@ fn mkPageFailedSilentForPage(cmd: AppCmd.LoadLogPage) Msg {
 /// load_log_page 専用: tip_hash 固定で git log を実行（H-06/H-07）。
 /// M-12: exit_code 128（bad revision: tip が gc 等で消失）は git_error へ還元し reducer で全 refresh を促す。
 fn runLogPageInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLogPage) !Msg {
-    const argv = try cmds.logPageArgv(a, cmd.skip, cmd.max_count, cmd.tip_hash);
-    defer freeLogPageArgv(a, argv);
-    var res = process.run(a, io, argv, cwd) catch
+    var argv = try cmds.logPageArgv(a, cmd.skip, cmd.max_count, cmd.tip_hash, cmd.filter);
+    defer argv.deinit(a);
+    var res = process.run(a, io, argv.args, cwd) catch
         return mkPageFailedOrSilentForPage(a, cmd, "git log 実行エラー");
     defer res.deinit(a);
     if (res.exit_code != 0) {
@@ -910,7 +919,7 @@ test "load_log returns log_loaded with 3 commits on a populated repo" {
     try repo.writeFile(io, "c.txt", "c\n");
     try repo.git(a, io, &.{ "git", "add", "c.txt" });
     try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c3" });
-    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 1 } });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 1, .filter = FilterSpec.init() } });
     defer msg.deinit(a);
     try std.testing.expect(msg == .log_loaded);
     try std.testing.expectEqual(@as(usize, 3), msg.log_loaded.entries.len);
@@ -930,7 +939,7 @@ test "load_log on empty (unborn) repo returns log_loaded with 0 entries" {
     defer repo.deinit();
     // commit なし・untracked ファイルのみ（HEAD 未生成 = unborn）。
     try repo.writeFile(io, "x.txt", "x\n");
-    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 7 } });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 7, .filter = FilterSpec.init() } });
     defer msg.deinit(a);
     try std.testing.expect(msg == .log_loaded);
     try std.testing.expectEqual(@as(usize, 0), msg.log_loaded.entries.len);
@@ -960,6 +969,7 @@ test "load_log_page returns log_page_loaded and respects skip" {
         .max_count = 100,
         .generation = 3,
         .tip_hash = try a.dupe(u8, "HEAD"),
+        .filter = FilterSpec.init(),
     } });
     defer msg.deinit(a);
     try std.testing.expect(msg == .log_page_loaded);
