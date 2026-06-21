@@ -6,6 +6,7 @@ const Model = @import("model.zig").Model;
 const Focus = @import("model.zig").Focus;
 const ViewMode = @import("model.zig").ViewMode;
 const DetailKind = @import("model.zig").DetailKind;
+const GraphRenderPolicy = @import("model.zig").GraphRenderPolicy;
 const msgs = @import("messages.zig");
 const Msg = msgs.Msg;
 const AppCmd = msgs.AppCmd;
@@ -332,13 +333,13 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         .commit_detail_loaded => |cdl| return try handleCommitDetailLoaded(model, cdl),
         .detail_diff_loaded => |ddl| return try handleDetailDiffLoaded(model, ddl),
 
-        // --- TODO 2 phase 3a: filter arms（Task 7 で本実装・Task 6 はスタブ）---
-        .open_filter_modal => return .none,
-        .close_filter_modal => return .none,
-        .apply_filter => return .none,
-        .clear_filter => return .none,
-        .log_load_failed => return .none,
-        .log_load_failed_silent => return .none,
+        // --- TODO 2 phase 3a: filter arms（spec §4.3/§4.4/§4.6/§4.7/§4.9）---
+        .open_filter_modal => return try handleOpenFilterModal(model),
+        .close_filter_modal => return try handleCloseFilterModal(model),
+        .apply_filter => |text| return try handleApplyFilter(model, text),
+        .clear_filter => return try handleClearFilter(model),
+        .log_load_failed => |llf| return try handleLogLoadFailed(model, llf),
+        .log_load_failed_silent => |llfs| return try handleLogLoadFailedSilent(model, llfs.request_generation),
     }
 }
 
@@ -677,6 +678,112 @@ fn handleLogPageFailedSilent(model: *Model, request_generation: u64, request_ski
         return .none;
     }
     model.log_page_requested = null;
+    return .none;
+}
+
+// =============================================================================
+// TODO 2 phase 3a: filter / log_load_failed arms（spec §4.3/§4.4/§4.6/§4.7/§4.9）
+// =============================================================================
+
+/// §4.4: `apply_filter` arm（payload-first トランザクショナル・M4/M-N7）。
+/// payload から FilterSpec を 1 つ構築 → Model へ swap → AppCmd 用は swap 後から clone。
+/// 強例外保証: clone OOM で clearFilterState へ戻す（旧 filter_state は swap 時に失われているため復元不可）。
+fn handleApplyFilter(model: *Model, payload: []u8) !AppCmd {
+    const a = model.allocator;
+    var new_spec = FilterSpec.init();
+    errdefer new_spec.deinit(a);
+    new_spec.setAuthor(a, payload) catch |err| switch (err) {
+        error.AuthorTooLong => {
+            try model.setLogLoadError("作者名が長すぎます（256 Unicode scalar まで）");
+            return .none;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    // swap: new_spec の所有権を Model へ移譲（setFilterState 内で旧を deinit）。以降 new_spec は触らない。
+    model.setFilterState(new_spec);
+    // AppCmd 用は swap 後の model.filter_state から clone（Model と AppCmd が常に一致）。
+    var cmd_spec = model.filter_state.clone(a) catch {
+        // 強例外保証: clone 失敗時は空 filter へ戻す。
+        model.clearFilterState();
+        try model.setLogLoadError("フィルタ適用に失敗（メモリ不足）");
+        return .none;
+    };
+    errdefer cmd_spec.deinit(a);
+    // commit phase（全て非失敗操作）。
+    model.filter_modal_open = false;
+    model.log_request_generation += 1; // ★R3/M3: 旧結果を stale 化
+    model.log_page_requested = null;
+    model.log_has_more = false;
+    model.clearLogSnapshotTip(); // ★B1: 次 LoadLog で再解決
+    model.graph_render_policy = .suppressed; // ★B2
+    model.invalidateLogGraph();
+    model.clearDetailOwner();
+    try model.replaceDetailFiles(&.{});
+    try model.setStr(&model.detail_diff, "");
+    model.setLogLoadError("") catch {};
+    try model.replaceLogCommits(&.{});
+    return .{ .load_log = .{
+        .skip = 0,
+        .max_count = 100,
+        .generation = model.log_request_generation,
+        .filter = cmd_spec,
+    } };
+}
+
+/// §4.6: `clear_filter` arm。filter 解除・graph 復活・全件再取得。
+fn handleClearFilter(model: *Model) !AppCmd {
+    model.clearFilterState();
+    model.filter_modal_open = false;
+    model.log_request_generation += 1;
+    model.log_page_requested = null;
+    model.log_has_more = false;
+    model.clearLogSnapshotTip();
+    model.graph_render_policy = .auto; // ★B2: graph 復活
+    model.invalidateLogGraph();
+    model.clearDetailOwner();
+    try model.replaceDetailFiles(&.{});
+    try model.setStr(&model.detail_diff, "");
+    model.setLogLoadError("") catch {};
+    try model.replaceLogCommits(&.{});
+    return try buildLoadLogCmd(model);
+}
+
+/// §4.7: `open_filter_modal` arm。flag を立てるのみ（TextInput へは reducer 非到達・main が同期）。
+fn handleOpenFilterModal(model: *Model) !AppCmd {
+    model.filter_modal_open = true;
+    return .none;
+}
+
+/// §4.7: `close_filter_modal` arm。flag を下ろすのみ。
+fn handleCloseFilterModal(model: *Model) !AppCmd {
+    model.filter_modal_open = false;
+    return .none;
+}
+
+/// §4.3: `log_load_failed` arm（B4/M3）。初回 LoadLog 失敗の typed Msg。
+/// generation 照合で受理 → log_load_error へ保存・commits 空化。
+fn handleLogLoadFailed(model: *Model, llf: msgs.Msg.LogLoadFailed) !AppCmd {
+    if (!inLogMode(model)) return .none;
+    if (llf.request_generation != model.log_request_generation) return .none;
+    try model.setLogLoadError(llf.error_text);
+    model.log_page_requested = null;
+    try model.replaceLogCommits(&.{});
+    model.clearDetailOwner();
+    try model.replaceDetailFiles(&.{});
+    try model.setStr(&model.detail_diff, "");
+    // ★B1: snapshot_tip は request_tip があれば保存（次回 page で使える可能性）・無ければクリア。
+    if (llf.request_tip) |tip| {
+        model.setLogSnapshotTip(tip) catch model.clearLogSnapshotTip();
+    } else {
+        model.clearLogSnapshotTip();
+    }
+    return .none;
+}
+
+/// §4.3: `log_load_failed_silent` arm。OOM 極限・generation 照合のみ。
+fn handleLogLoadFailedSilent(model: *Model, request_generation: u64) !AppCmd {
+    if (!inLogMode(model)) return .none;
+    if (request_generation != model.log_request_generation) return .none;
     return .none;
 }
 
@@ -2961,4 +3068,221 @@ test "handleLogCursorDown: load_log_page clones filter + uses snapshot_tip (B1/M
     // filter が clone されて伝播。
     try std.testing.expect(!cmd.load_log_page.filter.isEmpty());
     try std.testing.expectEqualStrings("carol", cmd.load_log_page.filter.author.?);
+}
+
+// ----------------------------- phase 3a Task 7: apply_filter / clear_filter / modal / log_load_failed -----------------------------
+
+test "apply_filter: payload-first transactional success (M4/M-N7)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_request_generation = 5;
+    try m.setLogSnapshotTip("oldtip");
+    m.graph_render_policy = .auto;
+    const payload = try a.dupe(u8, "alice");
+    defer a.free(payload);
+    const msg = Msg{ .apply_filter = payload };
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    // load_log 発火・filter が payload から構築されて clone 伝播。
+    try std.testing.expect(cmd == .load_log);
+    try std.testing.expect(!cmd.load_log.filter.isEmpty());
+    try std.testing.expectEqualStrings("alice", cmd.load_log.filter.author.?);
+    // generation は +1 で stale 化。
+    try std.testing.expectEqual(@as(u64, 6), cmd.load_log.generation);
+    // Model 側も filter_state が更新されている。
+    try std.testing.expectEqualStrings("alice", m.filter_state.author.?);
+    // モーダル閉・snapshot_tip クリア・policy suppressed・commits 空。
+    try std.testing.expect(!m.filter_modal_open);
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_snapshot_tip);
+    try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
+    try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
+    try std.testing.expect(m.log_graph_state == .invalid);
+}
+
+test "apply_filter: empty payload normalizes to null filter" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 2);
+    defer m.deinit();
+    const payload = try a.dupe(u8, "");
+    defer a.free(payload);
+    const msg = Msg{ .apply_filter = payload };
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_log);
+    // 空文字 → null 正規化・isEmpty==true。
+    try std.testing.expect(cmd.load_log.filter.isEmpty());
+    try std.testing.expect(m.filter_state.isEmpty());
+}
+
+test "apply_filter: AuthorTooLong sets log_load_error, Model unchanged" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    m.log_request_generation = 5;
+    const too_long = try a.alloc(u8, 257);
+    defer a.free(too_long);
+    @memset(too_long, 'x');
+    const payload = try a.dupe(u8, too_long);
+    defer a.free(payload);
+    const msg = Msg{ .apply_filter = payload };
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    // AuthorTooLong → .none・Model 不変。
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqual(@as(u64, 5), m.log_request_generation);
+    try std.testing.expect(m.filter_state.isEmpty());
+    try std.testing.expect(m.log_load_error.len > 0);
+}
+
+test "apply_filter: UTF-8 author preserved through payload → filter" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    const payload = try a.dupe(u8, "山田太郎");
+    defer a.free(payload);
+    const msg = Msg{ .apply_filter = payload };
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_log);
+    try std.testing.expectEqualStrings("山田太郎", cmd.load_log.filter.author.?);
+    try std.testing.expectEqualStrings("山田太郎", m.filter_state.author.?);
+}
+
+test "clear_filter: resets to auto + isEmpty filter + load_log (B2/M5)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    // フィルタ適用状態をセットアップ。
+    var spec = FilterSpec.init();
+    try spec.setAuthor(a, "bob");
+    m.setFilterState(spec);
+    m.graph_render_policy = .suppressed;
+    m.log_request_generation = 10;
+    try m.setLogSnapshotTip("tip123");
+    var cmd = try update(&m, .clear_filter);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .load_log);
+    // filter は空。
+    try std.testing.expect(cmd.load_log.filter.isEmpty());
+    try std.testing.expect(m.filter_state.isEmpty());
+    // policy は .auto へ復活。
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
+    // generation +1。
+    try std.testing.expectEqual(@as(u64, 11), cmd.load_log.generation);
+    // snapshot_tip クリア。
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_snapshot_tip);
+}
+
+test "open_filter_modal / close_filter_modal: toggle flag" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    try std.testing.expect(!m.filter_modal_open);
+    var c1 = try update(&m, .open_filter_modal);
+    defer c1.deinit(a);
+    try std.testing.expect(m.filter_modal_open);
+    try std.testing.expect(c1 == .none);
+    var c2 = try update(&m, .close_filter_modal);
+    defer c2.deinit(a);
+    try std.testing.expect(!m.filter_modal_open);
+    try std.testing.expect(c2 == .none);
+}
+
+test "log_load_failed: stale reject by generation (B4/M3)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_request_generation = 10;
+    // generation 不一致 → 破棄。
+    var msg = Msg{ .log_load_failed = .{
+        .request_generation = 1,
+        .request_tip = null,
+        .error_text = try a.dupe(u8, "boom"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    // commits はそのまま・error 未設定。
+    try std.testing.expectEqual(@as(usize, 3), m.log_commits.items.len);
+    try std.testing.expectEqualStrings("", m.log_load_error);
+}
+
+test "log_load_failed: sets log_load_error + clears commits (B4/M3)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 3);
+    defer m.deinit();
+    m.log_request_generation = 7;
+    var msg = Msg{ .log_load_failed = .{
+        .request_generation = 7,
+        .request_tip = try a.dupe(u8, "snap1234"),
+        .error_text = try a.dupe(u8, "HEAD 解決失敗"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    try std.testing.expectEqualStrings("HEAD 解決失敗", m.log_load_error);
+    // commits 空化・detail クリア。
+    try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
+    try std.testing.expectEqual(@as(?[]u8, null), m.detail_owner_hash);
+    // request_tip があれば snapshot_tip へ保存。
+    try std.testing.expectEqualStrings("snap1234", m.log_snapshot_tip.?);
+}
+
+test "log_load_failed: null request_tip clears snapshot_tip" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 1);
+    defer m.deinit();
+    m.log_request_generation = 3;
+    try m.setLogSnapshotTip("oldtip");
+    var msg = Msg{ .log_load_failed = .{
+        .request_generation = 3,
+        .request_tip = null,
+        .error_text = try a.dupe(u8, "spawn 失敗"),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(cmd == .none);
+    // request_tip 無し → snapshot_tip クリア。
+    try std.testing.expectEqual(@as(?[]u8, null), m.log_snapshot_tip);
+}
+
+test "log_load_failed_silent: generation check only (OOM 極限)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 2);
+    defer m.deinit();
+    m.log_request_generation = 5;
+    // generation 一致 → .none（log_load_error は触らない）。
+    var msg1 = Msg{ .log_load_failed_silent = .{ .request_generation = 5 } };
+    defer msg1.deinit(a);
+    var c1 = try update(&m, msg1);
+    defer c1.deinit(a);
+    try std.testing.expect(c1 == .none);
+    try std.testing.expectEqualStrings("", m.log_load_error);
+    // generation 不一致 → .none。
+    var msg2 = Msg{ .log_load_failed_silent = .{ .request_generation = 99 } };
+    defer msg2.deinit(a);
+    var c2 = try update(&m, msg2);
+    defer c2.deinit(a);
+    try std.testing.expect(c2 == .none);
+}
+
+test "apply_filter then clear_filter: graph policy transitions suppressed → auto (B2)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 2);
+    defer m.deinit();
+    // apply_filter → suppressed。
+    const payload1 = try a.dupe(u8, "foo");
+    defer a.free(payload1);
+    const msg1 = Msg{ .apply_filter = payload1 };
+    var c1 = try update(&m, msg1);
+    defer c1.deinit(a);
+    try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
+    // clear_filter → auto。
+    var c2 = try update(&m, .clear_filter);
+    defer c2.deinit(a);
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
 }
