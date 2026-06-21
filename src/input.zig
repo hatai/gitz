@@ -162,6 +162,27 @@ pub fn keyToMsgForMode(mode: ViewMode, focus: Focus, detail_kind: DetailKind, ke
     };
 }
 
+/// phase 3a §7.1/M6: modal visible を前判定するエントリポイント。
+/// `filter_modal_open==true` のとき、Escape → `.close_filter_modal`・それ以外（Enter 含む）→ null。
+/// Enter の場合は main が TextInput.getValue を dupe して `Msg.apply_filter` payload を構築する
+/// （input 関数は tag のみ返す設計だと Zig の tagged union で payload 無しの apply_filter が作れないため、
+/// null で main へ委譲・M-N7 解決）。q/r/L/tab 等 global mapping も抑制（null を返す）。
+pub fn keyToMsgForModeWithModal(
+    mode: ViewMode,
+    focus: Focus,
+    detail_kind: DetailKind,
+    key: Key,
+    filter_modal_open: bool,
+) ?Msg {
+    if (filter_modal_open) {
+        return switch (key) {
+            .escape => .close_filter_modal,
+            else => null,
+        };
+    }
+    return keyToMsgForMode(mode, focus, detail_kind, key);
+}
+
 /// log ビューのキーマップ（spec §3.4）。
 /// - L/q/r/tab は focus/detail_kind に関わらずグローバル。
 /// - focus==.changes（左: log ペイン）: j/k/↓/↑ で log_cursor、Enter/Space で log_open_detail、
@@ -189,6 +210,8 @@ fn keyToMsgForLog(focus: Focus, detail_kind: DetailKind, key: Key) ?Msg {
                 'j' => .log_cursor_down,
                 'k' => .log_cursor_up,
                 ' ' => .log_open_detail, // space は fromZigzagKey で char=' ' に正規化済み
+                'f' => .open_filter_modal, // phase 3a: 作者フィルタモーダルを開く
+                'F' => .clear_filter, // phase 3a: フィルタ解除（shift-f）
                 else => null,
             },
             .down => .log_cursor_down,
@@ -1466,6 +1489,73 @@ test "fromZigzagMouseForMode: log mode delegates to fromZigzagMouseForLog" {
     try std.testing.expectEqual(@as(@FieldType(MouseEvent, "kind"), .left_click), me.kind);
     try std.testing.expectEqual(@as(?usize, 2), me.log_row);
     try std.testing.expect(me.on_log);
+}
+
+// ====================== TODO 2 phase 3a: filter modal key routing tests ======================
+
+test "keyToMsgForLog: f in left pane opens filter modal" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'f' }).? == .open_filter_modal);
+}
+
+test "keyToMsgForLog: F in left pane clears filter" {
+    try std.testing.expect(keyToMsgForMode(.log, .changes, .files, .{ .char = 'F' }).? == .clear_filter);
+}
+
+test "keyToMsgForLog: f/F only in changes focus (not diff)" {
+    // f/F are only in left pane (focus==.changes), not in right pane (focus==.diff)
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .{ .char = 'f' }) == null);
+    try std.testing.expect(keyToMsgForMode(.log, .diff, .files, .{ .char = 'F' }) == null);
+}
+
+test "keyToMsgForLog: f/F not available in changes mode" {
+    // changes モードでは f/F は未割当（log モード専用）
+    try std.testing.expect(keyToMsgForMode(.changes, .changes, .files, .{ .char = 'f' }) == null);
+    try std.testing.expect(keyToMsgForMode(.changes, .changes, .files, .{ .char = 'F' }) == null);
+}
+
+test "keyToMsgForModeWithModal: modal open Escape closes" {
+    try std.testing.expect(
+        keyToMsgForModeWithModal(.log, .changes, .files, .escape, true).? == .close_filter_modal,
+    );
+}
+
+test "keyToMsgForModeWithModal: modal open Enter returns null (main constructs payload)" {
+    // M-N7: apply_filter payload は main が TextInput.getValue を dupe して構築するため
+    // input は null を返す（Zig の tagged union で payload 無し .apply_filter は作れない）
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .enter, true) == null);
+}
+
+test "keyToMsgForModeWithModal: modal open suppresses global keys (M6)" {
+    // q/r/L/tab 等 global mapping は modal open 時は全て null（main が TextInput.handleKey へ委譲）
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'q' }, true) == null);
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'r' }, true) == null);
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'L' }, true) == null);
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .tab, true) == null);
+}
+
+test "keyToMsgForModeWithModal: modal open other chars return null" {
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'x' }, true) == null);
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'j' }, true) == null);
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'k' }, true) == null);
+}
+
+test "keyToMsgForModeWithModal: modal open in diff focus also suppresses" {
+    // diff focus でも modal open 時は全て suppress（focus に関わらず modal が最優先）
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .diff, .files, .{ .char = 'q' }, true) == null);
+    try std.testing.expect(keyToMsgForModeWithModal(.log, .diff, .diff, .escape, true).? == .close_filter_modal);
+}
+
+test "keyToMsgForModeWithModal: modal closed delegates to keyToMsgForMode" {
+    // filter_modal_open==false なら既存 keyToMsgForMode と同一
+    try std.testing.expect(
+        keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'j' }, false).? == .log_cursor_down,
+    );
+    try std.testing.expect(
+        keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'f' }, false).? == .open_filter_modal,
+    );
+    try std.testing.expect(
+        keyToMsgForModeWithModal(.changes, .changes, .files, .{ .char = 'q' }, false).? == .quit,
+    );
 }
 
 // zigzag 依存の pub 関数（fromZigzagKey/fromZigzagMouse）も型検査されるよう refAllDecls する。
