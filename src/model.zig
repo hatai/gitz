@@ -69,9 +69,10 @@ pub const Model = struct {
     log_snapshot_tip: ?[]u8,
     graph_render_policy: GraphRenderPolicy,
 
-    // --- TODO 2 phase 3a: filter UI state ---
+    // --- TODO 2 phase 3a/3b: filter UI state ---
     filter_state: FilterSpec,
     filter_modal_open: bool,
+    filter_modal_focus: u2,
     log_load_error: []u8,
 
     pub fn init(a: std.mem.Allocator, repo_root: []const u8) !Model {
@@ -119,9 +120,10 @@ pub const Model = struct {
             .log_snapshot_tip = null,
             .graph_render_policy = .auto,
 
-            // --- TODO 2 phase 3a: filter UI state ---
+            // --- TODO 2 phase 3a/3b: filter UI state ---
             .filter_state = FilterSpec.init(),
             .filter_modal_open = false,
+            .filter_modal_focus = 0,
             .log_load_error = try a.dupe(u8, ""),
         };
     }
@@ -958,15 +960,21 @@ test "Model.setFilterState swaps and frees old (transactional)" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     var spec1 = FilterSpec.init();
-    try spec1.setAuthor(a, "foo");
+    try spec1.addCondition(a, .{ .author = try a.dupe(u8, "foo") });
     m.setFilterState(spec1);
-    try std.testing.expectEqualStrings("foo", m.filter_state.author.?);
+    try std.testing.expectEqualStrings("foo", m.filter_state.getAuthor().?);
     var spec2 = FilterSpec.init();
-    try spec2.setAuthor(a, "bar");
+    try spec2.addCondition(a, .{ .author = try a.dupe(u8, "bar") });
     m.setFilterState(spec2);
-    try std.testing.expectEqualStrings("bar", m.filter_state.author.?);
+    try std.testing.expectEqualStrings("bar", m.filter_state.getAuthor().?);
     m.clearFilterState();
     try std.testing.expect(m.filter_state.isEmpty());
+}
+
+test "Model.filter_modal_focus initializes to 0" {
+    var m = try Model.init(std.testing.allocator, "/r");
+    defer m.deinit();
+    try std.testing.expectEqual(@as(u2, 0), m.filter_modal_focus);
 }
 
 test "Model.setLogLoadError replaces and frees old" {

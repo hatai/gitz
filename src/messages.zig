@@ -56,11 +56,13 @@ pub const Msg = union(enum) {
     detail_diff_loaded: DetailDiffLoaded,
     git_error: []u8,
     committed,
-    // --- TODO 2 phase 3a: filter input + typed log load failures ---
+    // --- TODO 2 phase 3a/3b: filter input + focus + typed log load failures ---
     open_filter_modal,
     close_filter_modal,
-    apply_filter: []u8, // 所有: main が TextInput.getValue() を dupe して送る
+    apply_filter: ApplyFilter,
     clear_filter,
+    filter_focus_next,
+    filter_focus_prev,
     log_load_failed: LogLoadFailed,
     log_load_failed_silent: LogLoadFailedSilent,
 
@@ -79,6 +81,19 @@ pub const Msg = union(enum) {
     };
     pub const LogLoadFailedSilent = struct {
         request_generation: u64,
+    };
+    pub const ApplyFilter = struct {
+        author: ?[]u8,
+        since: ?[]u8,
+        until: ?[]u8,
+        paths: [][]u8,
+        pub fn deinit(self: *ApplyFilter, a: std.mem.Allocator) void {
+            if (self.author) |x| a.free(x);
+            if (self.since) |x| a.free(x);
+            if (self.until) |x| a.free(x);
+            for (self.paths) |p| a.free(p);
+            a.free(self.paths);
+        }
     };
     pub const LogPageLoaded = struct {
         request_skip: usize,
@@ -147,7 +162,7 @@ pub const Msg = union(enum) {
                 a.free(ddl.text);
             },
             .git_error => |s| a.free(s),
-            .apply_filter => |text| a.free(text),
+            .apply_filter => |*af| af.deinit(a),
             // 借用 / 単純: 解放不要（commit_text_changed は reducer 側が複製するため借用）
             .key_down,
             .key_up,
@@ -192,6 +207,8 @@ pub const Msg = union(enum) {
             .open_filter_modal,
             .close_filter_modal,
             .clear_filter,
+            .filter_focus_next,
+            .filter_focus_prev,
             => {},
         }
     }
@@ -454,7 +471,7 @@ test "Msg.detail_diff_loaded deinit frees hash/path/text" {
 test "AppCmd.load_log owns filter and frees on deinit" {
     const a = std.testing.allocator;
     var spec = FilterSpec.init();
-    try spec.setAuthor(a, "foo");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "foo") });
     var cmd = AppCmd{ .load_log = .{ .skip = 0, .max_count = 100, .generation = 1, .filter = spec } };
     cmd.deinit(a);
 }
@@ -462,7 +479,7 @@ test "AppCmd.load_log owns filter and frees on deinit" {
 test "AppCmd.load_log_page owns tip_hash and filter, frees on deinit" {
     const a = std.testing.allocator;
     var spec = FilterSpec.init();
-    try spec.setAuthor(a, "bar");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "bar") });
     var cmd = AppCmd{ .load_log_page = .{
         .skip = 0,
         .max_count = 100,
@@ -499,10 +516,48 @@ test "Msg.log_load_failed_silent deinit is no-op" {
     msg.deinit(a);
 }
 
-test "Msg.apply_filter deinit frees owned payload" {
+test "Msg.apply_filter (ApplyFilter) deinit frees all fields" {
     const a = std.testing.allocator;
-    var msg = Msg{ .apply_filter = try a.dupe(u8, "山田") };
+    const paths = try a.alloc([]u8, 1);
+    paths[0] = try a.dupe(u8, "src/");
+    var msg = Msg{ .apply_filter = .{
+        .author = try a.dupe(u8, "山田"),
+        .since = try a.dupe(u8, "2026-06-01"),
+        .until = null,
+        .paths = paths,
+    } };
     msg.deinit(a);
+}
+
+test "Msg.apply_filter (ApplyFilter) deinit with nulls and empty paths" {
+    const a = std.testing.allocator;
+    const empty_paths = try a.alloc([]u8, 0);
+    var msg = Msg{ .apply_filter = .{
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = empty_paths,
+    } };
+    msg.deinit(a);
+}
+
+test "Msg.filter_focus_next/prev deinit is no-op" {
+    const a = std.testing.allocator;
+    var msg1: Msg = .filter_focus_next;
+    msg1.deinit(a);
+    var msg2: Msg = .filter_focus_prev;
+    msg2.deinit(a);
+}
+
+test "ApplyFilter.deinit method callable standalone (m4)" {
+    const a = std.testing.allocator;
+    var af = Msg.ApplyFilter{
+        .author = try a.dupe(u8, "foo"),
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    };
+    af.deinit(a);
 }
 
 test "AppCmd.load_commit_detail owns hash and frees on deinit" {

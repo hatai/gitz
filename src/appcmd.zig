@@ -1076,7 +1076,7 @@ test "runLogInt: filter by author returns matching commits only" {
     try repo.git(a, io, &.{ "git", "-c", "user.name=alice", "commit", "-q", "-m", "c3" });
     // author=alice でフィルタ → c1, c3 の 2 件。
     var spec = FilterSpec.init();
-    try spec.setAuthor(a, "alice");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "alice") });
     var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
         .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
     } });
@@ -1099,7 +1099,7 @@ test "runLogInt: empty filter result returns 0 commits with valid snapshot_tip" 
     try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
     // 存在しない作者でフィルタ → 0 件・snapshot_tip は HEAD と一致。
     var spec = FilterSpec.init();
-    try spec.setAuthor(a, "nonexistent");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "nonexistent") });
     var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
         .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
     } });
@@ -1121,7 +1121,7 @@ test "runLogInt: literal bracket works with --fixed-strings" {
     try repo.git(a, io, &.{ "git", "add", "a.txt" });
     try repo.git(a, io, &.{ "git", "-c", "user.name=test[er", "commit", "-q", "-m", "c1" });
     var spec = FilterSpec.init();
-    try spec.setAuthor(a, "test[er");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "test[er") });
     var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
         .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
     } });
@@ -1139,7 +1139,7 @@ test "runLogInt: UTF-8 author filter works with --fixed-strings" {
     try repo.git(a, io, &.{ "git", "add", "a.txt" });
     try repo.git(a, io, &.{ "git", "-c", "user.name=山田太郎", "commit", "-q", "-m", "c1" });
     var spec = FilterSpec.init();
-    try spec.setAuthor(a, "山田");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "山田") });
     var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
         .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
     } });

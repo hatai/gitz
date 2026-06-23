@@ -26,6 +26,7 @@ const update = @import("update.zig");
 const appcmd = @import("appcmd.zig");
 const input = @import("input.zig");
 const viewmod = @import("view.zig");
+const filter_mod = @import("filter.zig");
 const cmds = @import("git/commands.zig");
 const process = @import("git/process.zig");
 const autorefresh = @import("autorefresh.zig");
@@ -98,8 +99,11 @@ const App = struct {
     cwd: Cwd, // 常に .{ .path = model.repo_root }（サブディレクトリ起動でも root 相対で一貫）
     model: Model,
     textarea: zz.TextArea,
-    filter_textinput: zz.TextInput, // phase 3a: 作者フィルタモーダルの単行入力（persistent_allocator 所有）
-    filter_modal: zz.Modal, // phase 3a: フィルタ編集モーダル（button 無し・Enter/Esc はアプリで横取り）
+    filter_author_input: zz.TextInput,
+    filter_since_input: zz.TextInput,
+    filter_until_input: zz.TextInput,
+    filter_path_input: zz.TextInput,
+    filter_modal: zz.Modal,
     queue: ResultQueue = .{},
 
     // ワーカー直列実行（1 度に 1 コマンド）。busy 中の新規副作用は pending に latest-wins で退避。
@@ -266,12 +270,20 @@ pub const RuntimeModel = struct {
         // phase 3a §9.1/M7: filter TextInput と Modal を persistent_allocator で生成。
         // TextInput.getValue は borrowed（内部 value.items への借用）・Enter 押下時に main が dupe。
         // Modal は button 無し（Enter/Esc をアプリ側で横取り・button_count==0 で Modal.handleKey の enter は no-op）。
-        g_app.filter_textinput = zz.TextInput.init(ctx.persistent_allocator);
-        g_app.filter_textinput.setCharLimit(256); // m-N2: max_author_runes と整合
-        g_app.filter_textinput.setPlaceholder("Filter by author...");
-        g_app.filter_textinput.setPrompt("author: ");
+        g_app.filter_author_input = zz.TextInput.init(ctx.persistent_allocator);
+        g_app.filter_author_input.setCharLimit(256);
+        g_app.filter_author_input.setPlaceholder("name or email");
+        g_app.filter_since_input = zz.TextInput.init(ctx.persistent_allocator);
+        g_app.filter_since_input.setCharLimit(16);
+        g_app.filter_since_input.setPlaceholder("YYYY-MM-DD");
+        g_app.filter_until_input = zz.TextInput.init(ctx.persistent_allocator);
+        g_app.filter_until_input.setCharLimit(16);
+        g_app.filter_until_input.setPlaceholder("YYYY-MM-DD");
+        g_app.filter_path_input = zz.TextInput.init(ctx.persistent_allocator);
+        g_app.filter_path_input.setCharLimit(1024);
+        g_app.filter_path_input.setPlaceholder("path (space separated)");
         g_app.filter_modal = zz.Modal.init();
-        g_app.filter_modal.title = "Filter by author";
+        g_app.filter_modal.title = "Filter commits";
         g_app.filter_modal.border_fg = .cyan;
         g_app.filter_modal.width = .{ .percent = 0.6 };
         // ~30fps でワーカー完了をポーリングする（tick が無いと drain が回らない）。
@@ -321,7 +333,10 @@ pub const RuntimeModel = struct {
         }
         app.queue.deinit(app.gpa);
         app.textarea.deinit();
-        app.filter_textinput.deinit(); // phase 3a: TextInput は persistent_allocator 所有
+        app.filter_author_input.deinit();
+        app.filter_since_input.deinit();
+        app.filter_until_input.deinit();
+        app.filter_path_input.deinit();
         // filter_modal はヒープ所有しない（title/body は借用 slice）・deinit 不要。
         app.model.deinit();
         g_app_ready = false;
@@ -360,22 +375,47 @@ fn nowMs(app: *App) i64 {
 /// 毎フレーム modal.body へ TextInput の描画結果を設定（viewWithBackdrop が body を描画）。
 fn syncFilterModal(app: *App, ctx: *const zz.Context) void {
     if (app.model.filter_modal_open and !app.filter_modal.isVisible()) {
-        // false→true 遷移: 現 filter_state.author を TextInput へロード（編集継続）。
-        const cur = app.model.filter_state.author orelse "";
-        app.filter_textinput.setValue(cur) catch {};
+        const fs = app.model.filter_state;
+        app.filter_author_input.setValue(fs.getAuthor() orelse "") catch {};
+        app.filter_since_input.setValue(fs.getSince() orelse "") catch {};
+        app.filter_until_input.setValue(fs.getUntil() orelse "") catch {};
+        const paths_str_opt: ?[]u8 = filter_mod.paths_to_string(app.gpa, fs.getPaths()) catch null;
+        defer if (paths_str_opt) |ps| app.gpa.free(ps);
+        app.filter_path_input.setValue(paths_str_opt orelse "") catch {};
         app.filter_modal.show();
     } else if (!app.model.filter_modal_open and app.filter_modal.isVisible()) {
-        // true→false 遷移: modal を隠す（close_filter_modal / apply_filter / clear_filter で reducer が flag を下ろす）。
         app.filter_modal.hide();
     }
-    // 毎フレーム modal.body へ TextInput の描画を反映（ctx.allocator = フレーム arena・free 不要）。
-    // body は viewWithBackdrop が render する。失敗時は空 body（描画が空になるだけでクラッシュしない）。
     if (app.model.filter_modal_open) {
-        app.filter_modal.body = app.filter_textinput.view(ctx.allocator) catch "";
+        syncFocus(app);
+        const body = buildModalBody(app, ctx.allocator) catch "";
+        app.filter_modal.body = body;
         viewmod.g_view_modal = &app.filter_modal;
     } else {
         viewmod.g_view_modal = null;
     }
+}
+
+fn syncFocus(app: *App) void {
+    app.filter_author_input.blur();
+    app.filter_since_input.blur();
+    app.filter_until_input.blur();
+    app.filter_path_input.blur();
+    switch (app.model.filter_modal_focus) {
+        0 => app.filter_author_input.focus(),
+        1 => app.filter_since_input.focus(),
+        2 => app.filter_until_input.focus(),
+        3 => app.filter_path_input.focus(),
+    }
+}
+
+fn buildModalBody(app: *App, a: std.mem.Allocator) ![]const u8 {
+    const f = app.model.filter_modal_focus;
+    const author_view: []const u8 = if (f == 0) try app.filter_author_input.view(a) else app.filter_author_input.getValue();
+    const since_view: []const u8 = if (f == 1) try app.filter_since_input.view(a) else app.filter_since_input.getValue();
+    const until_view: []const u8 = if (f == 2) try app.filter_until_input.view(a) else app.filter_until_input.getValue();
+    const path_view: []const u8 = if (f == 3) try app.filter_path_input.view(a) else app.filter_path_input.getValue();
+    return std.fmt.allocPrint(a, "Author: {s}\nSince:  {s}\nUntil:  {s}\nPath:   {s}", .{ author_view, since_view, until_view, path_view });
 }
 
 var g_click_state: input.ClickState = .{};
@@ -413,28 +453,82 @@ fn handleKey(app: *App, program: *ProgramT, k: zz.KeyEvent) void {
 fn handleModalKey(app: *App, program: *ProgramT, k: zz.KeyEvent) void {
     const abstract = input.fromZigzagKey(k);
     if (abstract) |key| {
-        switch (key) {
-            .escape => {
-                step(app, program, .close_filter_modal);
-                return;
-            },
-            .enter => {
-                // M-N7: payload は main が TextInput.getValue() を dupe して構築。
-                // consumer（reducer → main step）が free する（Msg.deinit で a.free(text)）。
-                const v = app.filter_textinput.getValue();
-                const dup = app.gpa.dupe(u8, v) catch {
-                    // OOM: モーダルを維持して log_load_error で通知。
-                    app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
-                    return;
-                };
-                step(app, program, .{ .apply_filter = dup });
-                return;
-            },
-            else => {},
+        const m = input.keyToMsgForModeWithModal(app.model.view_mode, app.model.focus, app.model.detail_kind, key, true);
+        if (m) |msg| {
+            step(app, program, msg);
+            return;
+        }
+        if (key == .enter) {
+            applyFilterFromModal(app, program);
+            return;
         }
     }
-    // その他のキーは TextInput.handleKey へ委譲（Ctrl+a/e/k/u/w, 文字/BS/Del/矢印 等）。
-    app.filter_textinput.handleKey(k);
+    focusTextInput(app).handleKey(k);
+}
+
+fn focusTextInput(app: *App) *zz.TextInput {
+    return switch (app.model.filter_modal_focus) {
+        0 => &app.filter_author_input,
+        1 => &app.filter_since_input,
+        2 => &app.filter_until_input,
+        3 => &app.filter_path_input,
+    };
+}
+
+fn applyFilterFromModal(app: *App, program: *ProgramT) void {
+    const gpa = app.gpa;
+    var af = Msg.ApplyFilter{
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = gpa.alloc([]u8, 0) catch {
+            app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
+            return;
+        },
+    };
+
+    const author_v = app.filter_author_input.getValue();
+    if (author_v.len > 0) {
+        af.author = gpa.dupe(u8, author_v) catch {
+            af.deinit(gpa);
+            app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
+            return;
+        };
+    }
+    const since_v = app.filter_since_input.getValue();
+    if (since_v.len > 0) {
+        af.since = gpa.dupe(u8, since_v) catch {
+            af.deinit(gpa);
+            app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
+            return;
+        };
+    }
+    const until_v = app.filter_until_input.getValue();
+    if (until_v.len > 0) {
+        af.until = gpa.dupe(u8, until_v) catch {
+            af.deinit(gpa);
+            app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
+            return;
+        };
+    }
+    const path_v = app.filter_path_input.getValue();
+    if (path_v.len > 0) {
+        const new_paths = gpa.alloc([]u8, 1) catch {
+            af.deinit(gpa);
+            app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
+            return;
+        };
+        new_paths[0] = gpa.dupe(u8, path_v) catch {
+            gpa.free(new_paths);
+            af.deinit(gpa);
+            app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
+            return;
+        };
+        gpa.free(af.paths);
+        af.paths = new_paths;
+    }
+
+    step(app, program, .{ .apply_filter = af });
 }
 
 fn handleMouse(app: *App, program: *ProgramT, m: zz.MouseEvent) void {
@@ -561,8 +655,11 @@ pub fn main(init: std.process.Init) !void {
         .cwd = cwd_root,
         .model = m,
         .textarea = undefined, // RuntimeModel.init で生成
-        .filter_textinput = undefined, // RuntimeModel.init で生成（phase 3a）
-        .filter_modal = undefined, // RuntimeModel.init で生成（phase 3a）
+        .filter_author_input = undefined,
+        .filter_since_input = undefined,
+        .filter_until_input = undefined,
+        .filter_path_input = undefined,
+        .filter_modal = undefined,
     };
     g_app_ready = true;
 

@@ -29,6 +29,7 @@ pub const Key = union(enum) {
     enter,
     backspace,
     tab,
+    shift_tab,
     escape,
     ctrl_s,
     ctrl_d,
@@ -177,6 +178,8 @@ pub fn keyToMsgForModeWithModal(
     if (filter_modal_open) {
         return switch (key) {
             .escape => .close_filter_modal,
+            .tab => .filter_focus_next,
+            .shift_tab => .filter_focus_prev,
             else => null,
         };
     }
@@ -485,7 +488,7 @@ pub fn fromZigzagKey(ev: zz.KeyEvent) ?Key {
         .space => Key{ .char = ' ' }, // zz は space を独立バリアントにするため char へ正規化
         .enter => .enter,
         .backspace => .backspace,
-        .tab => .tab,
+        .tab => if (ev.modifiers.shift) .shift_tab else .tab,
         .escape => .escape,
         .down => .down,
         .up => .up,
@@ -1526,11 +1529,11 @@ test "keyToMsgForModeWithModal: modal open Enter returns null (main constructs p
 }
 
 test "keyToMsgForModeWithModal: modal open suppresses global keys (M6)" {
-    // q/r/L/tab 等 global mapping は modal open 時は全て null（main が TextInput.handleKey へ委譲）
+    // q/r/L 等 global mapping は modal open 時は全て null（main が TextInput.handleKey へ委譲）
+    // ※ tab/shift_tab は phase 3b で filter_focus_next/prev へ割り当て（下記テスト）
     try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'q' }, true) == null);
     try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'r' }, true) == null);
     try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .{ .char = 'L' }, true) == null);
-    try std.testing.expect(keyToMsgForModeWithModal(.log, .changes, .files, .tab, true) == null);
 }
 
 test "keyToMsgForModeWithModal: modal open other chars return null" {
@@ -1556,6 +1559,25 @@ test "keyToMsgForModeWithModal: modal closed delegates to keyToMsgForMode" {
     try std.testing.expect(
         keyToMsgForModeWithModal(.changes, .changes, .files, .{ .char = 'q' }, false).? == .quit,
     );
+}
+
+test "keyToMsgForModeWithModal: modal open tab → filter_focus_next (M1)" {
+    try std.testing.expect(
+        keyToMsgForModeWithModal(.log, .changes, .files, .tab, true).? == .filter_focus_next,
+    );
+}
+
+test "keyToMsgForModeWithModal: modal open shift_tab → filter_focus_prev (M1)" {
+    try std.testing.expect(
+        keyToMsgForModeWithModal(.log, .changes, .files, .shift_tab, true).? == .filter_focus_prev,
+    );
+}
+
+test "keyToMsg: shift_tab in non-modal modes is no-op (m1)" {
+    // 既存の Key switch は else => null を持つため shift_tab は暗黙 no-op
+    try std.testing.expect(keyToMsg(.changes, .shift_tab) == null);
+    try std.testing.expect(keyToMsg(.diff, .shift_tab) == null);
+    try std.testing.expect(keyToMsg(.commit, .shift_tab) == null);
 }
 
 // zigzag 依存の pub 関数（fromZigzagKey/fromZigzagMouse）も型検査されるよう refAllDecls する。

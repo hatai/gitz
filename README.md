@@ -95,7 +95,9 @@ zig build test --summary all
 - 各ペインクリック: そのペインへフォーカス
 
 > **phase 2（表示系完了）**: グラフ罫線（`│ ● ╵ ╷ ─` 等の box-drawing 文字 + 6 色ローテーション）でブランチ分岐・マージを表示。各行に author とコミット日時（UTC `YYYY-MM-DD`）を表示。狭い端末では pane 幅に応じてグラフ・author・date を段階的に省略（M-13）。色は branch identity ではなく視認補助（同一色が別ブランチに使われることがある）。
-> **phase 3（フィルタ・将来）**: ブランチ / 作者 / 日付 / パス でのフィルタ機能を追加予定。
+> **phase 3（フィルタ）**: 作者（phase 3a）・日付範囲・パス（phase 3b）でのフィルタ機能を実装済み。`f` でモーダル（Author/Since/Until/Path の4入力欄・Tab/Shift+Tab でフォーカス移動・Enter で適用）・`F` で解除。ブランチフィルタは将来。フィルタ中は graph が非表示（topology 保証不可のため・理由を行頭に表示）。
+>
+> ★**日付フィルタの timezone**: `--since`/`--until` の日付は環境 TZ（通常 JST）で解釈します。CI/SSH/cron 等で TZ が変わると同じ入力でも結果が変わる可能性があります。UTC 固定にしたい場合は `TZ=UTC git-tui` 等で起動してください。
 
 マウス操作（`--no-mouse` 未指定時）:
 

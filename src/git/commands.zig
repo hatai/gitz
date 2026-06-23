@@ -100,12 +100,7 @@ pub fn logArgv(
     const max_arg = try std.fmt.allocPrint(a, "--max-count={d}", .{max_count});
     try owned.append(a, max_arg);
     try list.append(a, max_arg);
-    if (!filter.isEmpty()) {
-        try list.append(a, "--fixed-strings");
-        const author_arg = try std.fmt.allocPrint(a, "--author={s}", .{filter.author.?});
-        try owned.append(a, author_arg);
-        try list.append(a, author_arg);
-    }
+    try appendFilterOptions(a, &list, &owned, filter);
     try list.appendSlice(a, &.{
         "--pretty=format:%H%x00%P%x00%an%x00%at%x00%s%x00%d",
         "-z",
@@ -113,7 +108,68 @@ pub fn logArgv(
         "--no-color",
     });
     try list.append(a, snapshot_tip);
+    try appendPaths(a, &list, &owned, filter);
     return .{ .args = try list.toOwnedSlice(a), .owned = owned };
+}
+
+fn appendFilterOptions(
+    a: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    owned: *std.ArrayList([]const u8),
+    filter: FilterSpec,
+) (std.mem.Allocator.Error || filter_mod.DateError)!void {
+    if (filter.isEmpty()) return;
+    if (filter.getAuthor()) |text| {
+        try list.append(a, "--fixed-strings");
+        const arg = try std.fmt.allocPrint(a, "--author={s}", .{text});
+        try owned.append(a, arg);
+        try list.append(a, arg);
+    }
+    if (filter.getSince()) |text| {
+        const ds = try filter_mod.parseDate(text);
+        const git_str = try filter_mod.formatGitDate(a, ds, false);
+        owned.append(a, git_str) catch {
+            a.free(git_str);
+            return error.OutOfMemory;
+        };
+        const arg = std.fmt.allocPrint(a, "--since={s}", .{git_str}) catch return error.OutOfMemory;
+        owned.append(a, arg) catch {
+            a.free(arg);
+            return error.OutOfMemory;
+        };
+        try list.append(a, arg);
+    }
+    if (filter.getUntil()) |text| {
+        const ds = try filter_mod.parseDate(text);
+        const is_date_only = (ds.hour == null);
+        const git_str = try filter_mod.formatGitDate(a, ds, is_date_only);
+        owned.append(a, git_str) catch {
+            a.free(git_str);
+            return error.OutOfMemory;
+        };
+        const arg = std.fmt.allocPrint(a, "--until={s}", .{git_str}) catch return error.OutOfMemory;
+        owned.append(a, arg) catch {
+            a.free(arg);
+            return error.OutOfMemory;
+        };
+        try list.append(a, arg);
+    }
+}
+
+fn appendPaths(
+    a: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    owned: *std.ArrayList([]const u8),
+    filter: FilterSpec,
+) std.mem.Allocator.Error!void {
+    const paths = filter.getPaths();
+    if (paths.len == 0) return;
+    try list.append(a, "--");
+    for (paths) |p| {
+        const dup = try a.dupe(u8, p);
+        try owned.append(a, dup);
+        try list.append(a, dup);
+    }
 }
 
 /// `git log --topo-order --skip=N --max-count=100 <snapshot_tip>` argv（paging 用）。
@@ -426,7 +482,7 @@ test "logArgv: author filter adds --fixed-strings and --author" {
     const a = std.testing.allocator;
     var spec = FilterSpec.init();
     defer spec.deinit(a);
-    try spec.setAuthor(a, "foo");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "foo") });
     var argv = try logArgv(a, 0, 100, "snap1234", spec);
     defer argv.deinit(a);
     var has_fixed = false;
@@ -443,7 +499,7 @@ test "logArgv: UTF-8 author preserved in argv" {
     const a = std.testing.allocator;
     var spec = FilterSpec.init();
     defer spec.deinit(a);
-    try spec.setAuthor(a, "山田太郎");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "山田太郎") });
     var argv = try logArgv(a, 0, 100, "snap1234", spec);
     defer argv.deinit(a);
     var found = false;
@@ -473,7 +529,7 @@ test "logPageArgv: author filter adds --fixed-strings and --author" {
     const a = std.testing.allocator;
     var spec = FilterSpec.init();
     defer spec.deinit(a);
-    try spec.setAuthor(a, "bar");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "bar") });
     var argv = try logPageArgv(a, 0, 100, "abc123", spec);
     defer argv.deinit(a);
     var has_fixed = false;
@@ -490,7 +546,7 @@ test "OwnedArgv.deinit frees owned strings only (borrowed safe)" {
     const a = std.testing.allocator;
     var spec = FilterSpec.init();
     defer spec.deinit(a);
-    try spec.setAuthor(a, "foo");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "foo") });
     // snapshot_tip is borrowed (literal) — not freed by deinit
     var argv = try logArgv(a, 0, 100, "borrowed_tip", spec);
     // deinit must free --max-count, --author strings + args slice, but NOT "borrowed_tip"
@@ -555,6 +611,120 @@ test "showFileDiffArgv: --diff-merges=first-parent --format= <hash> -- <path>" {
 // 高レベル関数（実行系）はテスト未参照だと Zig のレイジー解析でボディが
 // 解析されない。refAllDecls で全 decl を参照し、process.run/Cwd/RunResult への
 // 型整合をコンパイル時に検証する。
+test "logArgv: since-only filter adds --since" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .since = try a.dupe(u8, "2026-06-01") });
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var has_since = false;
+    var has_fixed = false;
+    for (argv.args) |arg| {
+        if (std.mem.eql(u8, arg, "--since=2026-06-01 00:00:00")) has_since = true;
+        if (std.mem.eql(u8, arg, "--fixed-strings")) has_fixed = true;
+    }
+    try std.testing.expect(has_since);
+    try std.testing.expect(!has_fixed);
+}
+
+test "logArgv: until date-only adds +1day --until" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .until = try a.dupe(u8, "2026-06-01") });
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var has_until = false;
+    for (argv.args) |arg| {
+        if (std.mem.eql(u8, arg, "--until=2026-06-02 00:00:00")) has_until = true;
+    }
+    try std.testing.expect(has_until);
+}
+
+test "logArgv: until HH:MM unchanged" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .until = try a.dupe(u8, "2026-06-01 12:00") });
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var has_until = false;
+    for (argv.args) |arg| {
+        if (std.mem.eql(u8, arg, "--until=2026-06-01 12:00:00")) has_until = true;
+    }
+    try std.testing.expect(has_until);
+}
+
+test "logArgv: paths-only appends -- after snapshot_tip" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    const paths = try a.alloc([]u8, 2);
+    paths[0] = try a.dupe(u8, "src/");
+    paths[1] = try a.dupe(u8, "test/");
+    try spec.addCondition(a, .{ .paths = paths });
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var snapshot_idx: ?usize = null;
+    var dd_idx: ?usize = null;
+    for (argv.args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "snap1234")) snapshot_idx = i;
+        if (std.mem.eql(u8, arg, "--")) dd_idx = i;
+    }
+    try std.testing.expect(snapshot_idx != null);
+    try std.testing.expect(dd_idx != null);
+    try std.testing.expect(snapshot_idx.? < dd_idx.?);
+    try std.testing.expectEqualStrings("src/", argv.args[dd_idx.? + 1]);
+    try std.testing.expectEqualStrings("test/", argv.args[dd_idx.? + 2]);
+}
+
+test "logArgv: all variants sorted by variant order" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .until = try a.dupe(u8, "2026-06-01") });
+    const paths = try a.alloc([]u8, 1);
+    paths[0] = try a.dupe(u8, "src/");
+    try spec.addCondition(a, .{ .paths = paths });
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "foo") });
+    try spec.addCondition(a, .{ .since = try a.dupe(u8, "2026-06-01") });
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var author_idx: ?usize = null;
+    var since_idx: ?usize = null;
+    var until_idx: ?usize = null;
+    var dd_idx: ?usize = null;
+    for (argv.args, 0..) |arg, i| {
+        if (std.mem.startsWith(u8, arg, "--author=")) author_idx = i;
+        if (std.mem.startsWith(u8, arg, "--since=")) since_idx = i;
+        if (std.mem.startsWith(u8, arg, "--until=")) until_idx = i;
+        if (std.mem.eql(u8, arg, "--")) dd_idx = i;
+    }
+    try std.testing.expect(author_idx != null);
+    try std.testing.expect(since_idx != null);
+    try std.testing.expect(until_idx != null);
+    try std.testing.expect(dd_idx != null);
+    try std.testing.expect(author_idx.? < since_idx.?);
+    try std.testing.expect(since_idx.? < until_idx.?);
+    try std.testing.expect(until_idx.? < dd_idx.?);
+}
+
+test "logArgv: --fixed-strings only when author present" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .since = try a.dupe(u8, "2026-06-01") });
+    try spec.addCondition(a, .{ .until = try a.dupe(u8, "2026-06-30") });
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var has_fixed = false;
+    for (argv.args) |arg| {
+        if (std.mem.eql(u8, arg, "--fixed-strings")) has_fixed = true;
+    }
+    try std.testing.expect(!has_fixed);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

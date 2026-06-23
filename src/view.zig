@@ -18,6 +18,7 @@ const Model = @import("model.zig").Model;
 const Focus = @import("model.zig").Focus;
 const Section = @import("git/status.zig").Section;
 const graph_mod = @import("git/graph.zig");
+const FilterSpec = @import("filter.zig").FilterSpec;
 
 pub const Rect = struct { x: u16, y: u16, w: u16, h: u16 };
 pub const Layout = struct { changes: Rect, diff: Rect, commit: Rect, status: Rect };
@@ -26,6 +27,39 @@ pub const Layout = struct { changes: Rect, diff: Rect, commit: Rect, status: Rec
 /// main.zig が毎フレーム render 呼出前に設定する（`g_program`/`g_app` と同パターン）。
 /// `null` のとき（main 起動前等）は modal overlay を出さず base view を返す。
 pub var g_view_modal: ?*const zz.Modal = null;
+
+/// phase 3b §8.2: FilterSpec の conditions を walk して理由文字列を構築。
+/// `Filter: author="..." since=... until=... paths=...` 形式。arena 確保・free 不要。
+fn filterReasonText(a: std.mem.Allocator, filter: FilterSpec) []const u8 {
+    if (filter.isEmpty()) return "";
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(a);
+    buf.appendSlice(a, "Filter:") catch return "Filter:";
+    if (filter.getAuthor()) |text| {
+        const part = std.fmt.allocPrint(a, " author=\"{s}\"", .{text}) catch return "Filter:";
+        defer a.free(part);
+        buf.appendSlice(a, part) catch return "Filter:";
+    }
+    if (filter.getSince()) |text| {
+        const part = std.fmt.allocPrint(a, " since={s}", .{text}) catch return "Filter:";
+        defer a.free(part);
+        buf.appendSlice(a, part) catch return "Filter:";
+    }
+    if (filter.getUntil()) |text| {
+        const part = std.fmt.allocPrint(a, " until={s}", .{text}) catch return "Filter:";
+        defer a.free(part);
+        buf.appendSlice(a, part) catch return "Filter:";
+    }
+    const paths = filter.getPaths();
+    if (paths.len > 0) {
+        buf.appendSlice(a, " paths=") catch return "Filter:";
+        for (paths, 0..) |p, idx| {
+            if (idx > 0) buf.appendSlice(a, ",") catch return "Filter:";
+            buf.appendSlice(a, p) catch return "Filter:";
+        }
+    }
+    return buf.toOwnedSlice(a) catch "Filter:";
+}
 
 /// 共通ヘルパ（L3）: status 1 行確保・top の最低高さ 1・u16 clamp。
 /// changes/log 両モードのレイアウト計算で共有する（極小端末でも underflow しない）。
@@ -357,8 +391,8 @@ fn renderStatus(model: *const Model, ctx: *const zz.Context) []const u8 {
         "";
     // phase 3a §8.2: log モードでフィルタ適用中はインジケータを表示。
     const filter_indicator: []const u8 = if (model.view_mode == .log and !model.filter_state.isEmpty()) blk: {
-        const author_raw = model.filter_state.author orelse "";
-        const indicator = std.fmt.allocPrint(a, "[Filter: author=\"{s}\"]  ", .{author_raw}) catch "[Filter]  ";
+        const reason = filterReasonText(a, model.filter_state);
+        const indicator = std.fmt.allocPrint(a, "[{s}]  ", .{reason}) catch "[Filter]  ";
         break :blk indicator;
     } else "";
     const hint_base = if (model.view_mode == .log)
@@ -499,8 +533,8 @@ fn renderLog(model: *Model, ctx: *const zz.Context, height: u16, pane_w: u16) []
 
     // phase 3a §8.2/n-N3: フィルタ中で graph が非表示のとき、理由を行先頭へ表示。
     if (model.graph_render_policy == .suppressed and !model.filter_state.isEmpty()) {
-        const author_raw = model.filter_state.author orelse "";
-        const meta = std.fmt.allocPrint(a, "Filter: author=\"{s}\" (graph hidden)", .{author_raw}) catch "Filter: (graph hidden)";
+        const reason = filterReasonText(a, model.filter_state);
+        const meta = std.fmt.allocPrint(a, "{s} (graph hidden)", .{reason}) catch "Filter: (graph hidden)";
         lines.append(a, meta) catch {};
     }
 
@@ -1087,7 +1121,7 @@ test "logEmptyKind: no matching commits when filter active" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     var spec = @import("filter.zig").FilterSpec.init();
-    try spec.setAuthor(a, "foo");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "foo") });
     m.setFilterState(spec);
     try std.testing.expectEqual(LogEmptyKind.no_matching, logEmptyKind(&m));
 }
@@ -1097,7 +1131,7 @@ test "logEmptyKind: error_text takes priority over filter" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     var spec = @import("filter.zig").FilterSpec.init();
-    try spec.setAuthor(a, "foo");
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "foo") });
     m.setFilterState(spec);
     try m.setLogLoadError("HEAD 解決失敗");
     // error_text が最優先（フィルタ適用中でもエラー表示が上書き）
@@ -1110,6 +1144,42 @@ test "logEmptyKind: no_commits when filter empty even with error cleared" {
     defer m.deinit();
     try m.setLogLoadError("");
     try std.testing.expectEqual(LogEmptyKind.no_commits, logEmptyKind(&m));
+}
+
+test "filterReasonText: author only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var spec = FilterSpec.init();
+    defer spec.deinit(std.testing.allocator);
+    try spec.addCondition(std.testing.allocator, .{ .author = try std.testing.allocator.dupe(u8, "foo") });
+    const out = filterReasonText(a, spec);
+    try std.testing.expectEqualStrings("Filter: author=\"foo\"", out);
+}
+
+test "filterReasonText: empty returns empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var spec = FilterSpec.init();
+    defer spec.deinit(std.testing.allocator);
+    const out = filterReasonText(a, spec);
+    try std.testing.expectEqualStrings("", out);
+}
+
+test "filterReasonText: all variants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var spec = FilterSpec.init();
+    defer spec.deinit(std.testing.allocator);
+    try spec.addCondition(std.testing.allocator, .{ .author = try std.testing.allocator.dupe(u8, "foo") });
+    try spec.addCondition(std.testing.allocator, .{ .since = try std.testing.allocator.dupe(u8, "2026-06-01") });
+    const paths = try std.testing.allocator.alloc([]u8, 1);
+    paths[0] = try std.testing.allocator.dupe(u8, "src/");
+    try spec.addCondition(std.testing.allocator, .{ .paths = paths });
+    const out = filterReasonText(a, spec);
+    try std.testing.expectEqualStrings("Filter: author=\"foo\" since=2026-06-01 paths=src/", out);
 }
 
 test {
