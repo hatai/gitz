@@ -105,8 +105,8 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
         // --- TODO 2 phase 1: log/detail 副作用コマンド ---
         // load_log は headState tri-state を取る（unborn/err 対応）。load_log_page は tip 固定で
         // bad revision 検出を行うため runLogPageInt へ分離（H-06/H-07/M-12）。
-        .load_log => |c| return runLogInt(a, io, cwd, c),
-        .load_log_page => |c| return runLogPageInt(a, io, cwd, c),
+        .load_log => |c| return runLogInt(a, io, cwd, c, process.default_stream_limit),
+        .load_log_page => |c| return runLogPageInt(a, io, cwd, c, process.default_stream_limit),
         .load_commit_detail => |hash_req| {
             const argv = try cmds.showNameStatusArgv(a, hash_req);
             defer a.free(argv);
@@ -153,7 +153,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
 /// Run git log for load_log (initial page, skip=0) and return log_loaded Msg.
 /// phase 3a §6.1: headState tri-state → rev-parse HEAD（snapshot_tip）→ logArgv with filter。
 /// 全エラー経路を LogLoadFailed / LogLoadFailedSilent へ正規化（B4/M3/MINOR7）。
-fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog) !Msg {
+fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, log_limit: std.Io.Limit) !Msg {
     // R20: headState 呼び出しを catch（spawn/OOM も LogLoadFailed へ）。
     const hs = cmds.headState(a, io, cwd) catch
         return mkLoadFailedOrSilent(a, cmd, "git リポジトリ状態の確認に失敗", null);
@@ -183,7 +183,7 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog) !M
     var argv = try cmds.logArgv(a, cmd.skip, cmd.max_count, snapshot_tip.?, cmd.filter);
     defer argv.deinit(a);
     // MINOR7: StreamTooLong 含む RunError を LogLoadFailed へ正規化。
-    var res = process.run(a, io, argv.args, cwd) catch
+    var res = process.runWithLimit(a, io, argv.args, cwd, log_limit) catch
         return mkLoadFailedOrSilent(a, cmd, "git log 実行エラー", snapshot_tip);
     defer res.deinit(a);
     if (res.exit_code != 0) {
@@ -258,10 +258,10 @@ fn mkPageFailedSilentForPage(cmd: AppCmd.LoadLogPage) Msg {
 /// load_log_page 専用: tip_hash 固定で git log を実行（H-06/H-07）。
 /// phase 3a §6.2/M3: bad revision（exit 128）は LogPageFailed へ（git_error ではない）。
 /// MINOR7: StreamTooLong 含む RunError も LogPageFailed へ正規化。
-fn runLogPageInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLogPage) !Msg {
+fn runLogPageInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLogPage, log_limit: std.Io.Limit) !Msg {
     var argv = try cmds.logPageArgv(a, cmd.skip, cmd.max_count, cmd.tip_hash, cmd.filter);
     defer argv.deinit(a);
-    var res = process.run(a, io, argv.args, cwd) catch
+    var res = process.runWithLimit(a, io, argv.args, cwd, log_limit) catch
         return mkPageFailedOrSilentForPage(a, cmd, "git log 実行エラー");
     defer res.deinit(a);
     if (res.exit_code != 0) {
@@ -1190,4 +1190,48 @@ test "runLogInt: request_tip matches rev-parse HEAD (B1)" {
     try std.testing.expect(msg == .log_loaded);
     // B1: request_tip は rev-parse HEAD の結果と一致。
     try std.testing.expectEqualStrings(expected_tip, msg.log_loaded.request_tip);
+}
+
+test "runLogInt: tiny stdout_limit normalizes StreamTooLong to log_load_failed" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // 1 コミット必須: head 解決を通過して git log 実行（注入 limit 使用）へ到達させるため。
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    // 直接呼びは runOwned の auto-deinit を経由しないので payload を明示解放。
+    // LoadLog.filter は空（FilterSpec.init = 確保ゼロ）だが規約遵守で union+defer。
+    var cmd = AppCmd{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = FilterSpec.init(),
+    } };
+    defer cmd.deinit(a);
+    // 40 文字 hash を含む git log 出力 >> 16 byte → StreamTooLong → 正規化。
+    var msg = try runLogInt(a, io, repo.cwd(), cmd.load_log, .limited(16));
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_load_failed);
+    try std.testing.expect(std.mem.indexOf(u8, msg.log_load_failed.error_text, "git log 実行エラー") != null);
+}
+
+test "runLogPageInt: tiny stdout_limit normalizes StreamTooLong to log_page_failed" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    // runLogPageInt は head 解決せず tip_hash で直接 log 実行 → 有効な tip が必要
+    // （無効 tip だと stdout 空 → StreamTooLong 不発・exit 128 経路になる）。
+    const tip = (try cmds.revParseHead(a, io, repo.cwd())).?;
+    // tip は cmd.tip_hash が所有（cmd.deinit で free）。
+    var cmd = AppCmd{ .load_log_page = .{
+        .skip = 0, .max_count = 100, .generation = 1, .tip_hash = tip, .filter = FilterSpec.init(),
+    } };
+    defer cmd.deinit(a);
+    var msg = try runLogPageInt(a, io, repo.cwd(), cmd.load_log_page, .limited(16));
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_page_failed);
+    try std.testing.expect(std.mem.indexOf(u8, msg.log_page_failed.error_text, "git log 実行エラー") != null);
 }
