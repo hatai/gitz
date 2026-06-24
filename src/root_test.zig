@@ -21,4 +21,5 @@ test {
     _ = @import("git/show.zig"); // TODO 2 phase 1: show name-status パーサ
     _ = @import("git/graph.zig"); // TODO 2 phase 2: グラフレーン割当
     _ = @import("filter.zig"); // TODO 2 phase 3a: ログフィルタ
+    _ = @import("main.zig"); // TODO 2 phase 3b #4: busy lifecycle runtime 層
 }
