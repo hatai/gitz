@@ -845,3 +845,23 @@ test "pending is latest-wins while worker in-flight" {
     dispatchSideEffect(app, .refresh_status); // 上書き（load_diff はここで deinit）
     try std.testing.expect(app.pending.? == .refresh_status);
 }
+
+test "spawnSync drains staged results into the queue in order" {
+    const a = std.testing.allocator;
+    const app = try makeTestApp();
+    defer freeTestApp(app);
+    try stage(app, .{ .git_error = try a.dupe(u8, "err-A") });
+    try stage(app, .{ .git_error = try a.dupe(u8, "err-B") });
+
+    dispatchSideEffect(app, .refresh_status); // spawnSync: staged を順序保持で push
+    try std.testing.expect(app.model.busy);
+    try std.testing.expect(app.worker != null);
+
+    var local: std.ArrayList(Msg) = .empty;
+    defer local.deinit(a);
+    app.queue.drain(app.io, a, &local);
+    try std.testing.expectEqual(@as(usize, 2), local.items.len);
+    try std.testing.expectEqualStrings("err-A", local.items[0].git_error);
+    try std.testing.expectEqualStrings("err-B", local.items[1].git_error);
+    for (local.items) |*m| m.deinit(a);
+}
