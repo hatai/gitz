@@ -92,6 +92,11 @@ const ResultQueue = struct {
     }
 };
 
+/// 在飛 worker のハンドル。`thread` は本番 spawn のみ非 null。
+/// テスト executor（spawnSync）は `.{ .thread = null }` で在飛状態を偽装し、
+/// reapWorker は `if (w.thread) |t| t.join()` で本番のみ join する。
+const WorkerHandle = struct { thread: ?std.Thread = null };
+
 /// 起動時に main() が確定し、以後 zigzag コールバックが参照する共有アプリ状態。
 const App = struct {
     gpa: std.mem.Allocator,
@@ -107,8 +112,12 @@ const App = struct {
     queue: ResultQueue = .{},
 
     // ワーカー直列実行（1 度に 1 コマンド）。busy 中の新規副作用は pending に latest-wins で退避。
-    worker: ?std.Thread = null,
+    worker: ?WorkerHandle = null,
     pending: ?AppCmd = null,
+    // 副作用の起動 executor。本番は spawnAsync（実スレッド）。テストは spawnSync（同期・staged 結果）。
+    spawn_fn: *const fn(*App, AppCmd) void,
+    // テスト専用: spawnSync が push する結果 Msg の staging（本番では常に空）。
+    test_staged: std.ArrayList(Msg) = .empty,
 
     /// 自動リフレッシュの前回 dispatch 時刻（ms）。tick で間引くために使う。
     last_auto_refresh_ms: i64 = 0,
@@ -157,7 +166,7 @@ fn isMutating(cmd: AppCmd) bool {
 }
 
 /// 副作用 AppCmd をワーカーへ委譲する。busy 中なら pending に退避（latest-wins）。
-/// `cmd` の所有権を受け取る（委譲できなければここで deinit する）。
+/// `cmd` の所有権を受け取る（委譲できなければ executor 側で deinit する）。
 fn dispatchSideEffect(app: *App, cmd: AppCmd) void {
     if (app.worker != null) {
         // 既存ワーカー稼働中。前の pending は捨てて最新で上書き（rapid j/k の load_diff を間引く）。
@@ -167,17 +176,41 @@ fn dispatchSideEffect(app: *App, cmd: AppCmd) void {
     }
     app.model.busy = true; // reducer の二重実行ゲート。全 in-flight で立てる（表示はしない）。
     app.model.working = isMutating(cmd); // スピナ表示用。変更系のときだけ true（読み取りでは点滅させない）。
-    app.worker = std.Thread.spawn(.{}, workerThread, .{ app, cmd }) catch {
-        // spawn 失敗時はメインスレッドで同期実行（degraded だがクラッシュしない）。
-        // worker は null のままなので reapWorker は join せず、worker_done も触らない（＝
-        // 次回の正規ワーカーが stale done で誤 join される事故を避ける）。busy は結果 Msg を
-        // reducer が処理する際に下りる（status_loaded/diff_loaded/committed/git_error 全てが
-        // busy=false にする）ので、ここでは触らない。
-        app.worker = null;
-        app.model.working = false; // 同期実行に落ちたのでスピナは即解除（busy は reducer 結果で下りる）。
-        workerRun(app, cmd);
+    app.spawn_fn(app, cmd);
+}
+
+/// 本番 executor: 実スレッドで workerThread を起動。spawn 失敗時は同期フォールバック
+/// （workerRun 後に busy/working を下ろす・markWorkerDone 無し＝review Issue 2 維持）。
+/// busy は reducer ではなく runtime のみが触る（M-N9 完全修正）。
+fn spawnAsync(app: *App, cmd: AppCmd) void {
+    const handle = std.Thread.spawn(.{}, workerThread, .{ app, cmd }) catch {
+        runSyncFallback(app, cmd);
         return;
     };
+    app.worker = .{ .thread = handle };
+}
+
+/// spawn 失敗時の同期フォールバック本体（テスト可能へ切り出し・M-N9）。
+/// workerRun 完了後に busy/working を下ろす（reducer に頼らない）。markWorkerDone しない
+/// （review Issue 2: 同期経路で done を立てると次回正規 worker が stale done で即 join される）。
+fn runSyncFallback(app: *App, cmd: AppCmd) void {
+    app.worker = null;
+    app.model.busy = false;
+    app.model.working = false;
+    workerRun(app, cmd);
+}
+
+/// テスト executor: 実スレッド/appcmd.run を使わず、staged 結果を同期的に push する。
+/// M-N9 競合を決定的に再現するための seam（実 thread スケジューリングに依存しない）。
+fn spawnSync(app: *App, cmd: AppCmd) void {
+    var c = cmd;
+    c.deinit(app.gpa); // 実行しないので所有権を解放
+    while (app.test_staged.items.len > 0) {
+        const m = app.test_staged.orderedRemove(0); // 順序保持・所有権は queue へ移譲
+        app.queue.push(app.io, app.gpa, m);
+    }
+    app.queue.markWorkerDone(app.io);
+    app.worker = .{ .thread = null };
 }
 
 /// AppCmd を解釈してランタイムへ適用する。
@@ -227,15 +260,14 @@ fn reapWorker(app: *App) void {
         // とのインターリーブで完了を取りこぼし、worker が恒久的に non-null になる事故を防ぐ
         //（review Issue 2）。worker は markWorkerDone 直後に return するため join は即時返る。
         // takeWorkerDone は取得即クリアなので、結果が既に drain 済みでも完了を取りこぼさない。
-        if (app.queue.takeWorkerDone(app.io)) {
-            w.join();
-            app.worker = null;
-            app.model.busy = false;
-            app.model.working = false; // スピナ解除（pending があれば下の dispatch が再設定する）。
-            if (app.pending) |next| {
-                app.pending = null;
-                dispatchSideEffect(app, next);
-            }
+        if (!app.queue.takeWorkerDone(app.io)) return;
+        if (w.thread) |t| t.join(); // 本番のみ（テスト executor は thread=null で join 不要）
+        app.worker = null;
+        app.model.busy = false;
+        app.model.working = false; // スピナ解除（pending があれば下の dispatch が再設定する）。
+        if (app.pending) |next| {
+            app.pending = null;
+            dispatchSideEffect(app, next);
         }
     }
 }
@@ -324,7 +356,7 @@ pub const RuntimeModel = struct {
         const app = &g_app;
         // 稼働中ワーカーを join（メインが終わる前に必ず合流。leak/競合防止）。
         if (app.worker) |w| {
-            w.join();
+            if (w.thread) |t| t.join();
             app.worker = null;
         }
         if (app.pending) |*p| {
@@ -332,6 +364,7 @@ pub const RuntimeModel = struct {
             app.pending = null;
         }
         app.queue.deinit(app.gpa);
+        app.test_staged.deinit(app.gpa);
         app.textarea.deinit();
         app.filter_author_input.deinit();
         app.filter_since_input.deinit();
@@ -609,6 +642,8 @@ fn seedInitialStatus(app: *App) void {
         },
         .none, .quit, .apply_patch => {},
     }
+    // busy は runtime 所有（M-N9）。ここは start() 前の同期実行で in-flight worker が
+    // 存在しないため reducer ではなくここで下ろす（reducer は busy を触らない不変）。
     app.model.busy = false;
 }
 
@@ -660,6 +695,7 @@ pub fn main(init: std.process.Init) !void {
         .filter_until_input = undefined,
         .filter_path_input = undefined,
         .filter_modal = undefined,
+        .spawn_fn = spawnAsync, // 本番 executor（テストは spawnSync へ上書き）
     };
     g_app_ready = true;
 
@@ -714,3 +750,153 @@ pub fn main(init: std.process.Init) !void {
 // zigzag 依存の pub 関数（RuntimeModel.view/update/init, handle*）も `zig build` で
 // 型検査されるよう、main から実際の呼び出しパスで参照済み。テストでは refAllDecls しない
 // （Program はテスト用 io を要し、ワーカー spawn は非決定的なため）。
+
+// =============================================================================
+// TODO 2 phase 3b #4: busy lifecycle runtime テスト（spec §6.2）
+// 実 thread を使わず spawnSync で決定的に検証する。
+// =============================================================================
+
+/// テスト用の最小 App を構築する。spawn_fn=spawnSync・空 test_staged。
+fn makeTestApp() !*App {
+    const a = std.testing.allocator;
+    const m = try Model.init(a, "/r");
+    g_app = .{
+        .gpa = a,
+        .io = std.testing.io,
+        .cwd = .{ .path = m.repo_root },
+        .model = m,
+        .textarea = zz.TextArea.init(a),
+        .filter_author_input = zz.TextInput.init(a),
+        .filter_since_input = zz.TextInput.init(a),
+        .filter_until_input = zz.TextInput.init(a),
+        .filter_path_input = zz.TextInput.init(a),
+        .filter_modal = zz.Modal.init(),
+        .spawn_fn = spawnSync,
+    };
+    g_app_ready = true;
+    return &g_app;
+}
+
+/// makeTestApp の後始末。zz 系も含め全解放する。
+fn freeTestApp(app: *App) void {
+    app.model.deinit();
+    app.queue.deinit(app.gpa);
+    app.textarea.deinit();
+    app.filter_author_input.deinit();
+    app.filter_since_input.deinit();
+    app.filter_until_input.deinit();
+    app.filter_path_input.deinit();
+    app.test_staged.deinit(app.gpa);
+    g_app_ready = false;
+}
+
+/// staged 結果を test_staged へ追加するヘルパー（dupe して所有）。
+fn stage(app: *App, msg: Msg) !void {
+    try app.test_staged.append(app.gpa, msg);
+}
+
+test "dispatchSideEffect sets busy and in-flight worker" {
+    const app = try makeTestApp();
+    defer freeTestApp(app);
+    try std.testing.expect(!app.model.busy);
+    dispatchSideEffect(app, .refresh_status);
+    try std.testing.expect(app.model.busy);
+    try std.testing.expect(app.worker != null);
+}
+
+test "reapWorker clears busy and worker after done" {
+    const app = try makeTestApp();
+    defer freeTestApp(app);
+    dispatchSideEffect(app, .refresh_status); // spawnSync: 結果無し・done=true
+    try std.testing.expect(app.worker != null);
+    reapWorker(app); // takeWorkerDone=true・join 無し(thread=null)・busy=false
+    try std.testing.expect(!app.model.busy);
+    try std.testing.expect(app.worker == null);
+}
+
+test "sync fallback clears busy/working and runs worker" {
+    const a = std.testing.allocator;
+    const app = try makeTestApp();
+    defer freeTestApp(app);
+    app.model.busy = true; // dispatchSideEffect が立てた状態を模倣
+    app.model.working = true;
+
+    runSyncFallback(app, .refresh_status); // spawn 失敗相当・workerRun が結果を push
+    try std.testing.expect(!app.model.busy);
+    try std.testing.expect(!app.model.working);
+    try std.testing.expect(app.worker == null);
+    // workerRun が push した結果（git_error・appcmd.run 失敗）を片付ける
+    var local: std.ArrayList(Msg) = .empty;
+    defer local.deinit(a);
+    app.queue.drain(app.io, a, &local);
+    for (local.items) |*m| m.deinit(a);
+}
+
+test "pending is latest-wins while worker in-flight" {
+    const a = std.testing.allocator;
+    const app = try makeTestApp();
+    defer {
+        if (app.pending) |*p| p.deinit(app.gpa);
+        freeTestApp(app);
+    }
+    dispatchSideEffect(app, .refresh_status); // worker 在飛
+    const ld: AppCmd = .{ .load_diff = .{ .path = try a.dupe(u8, "f"), .orig_path = null, .section = .staged } };
+    dispatchSideEffect(app, ld); // pending へ（上書き時に解放される）
+    try std.testing.expect(app.pending != null);
+    try std.testing.expect(app.pending.? == .load_diff);
+    dispatchSideEffect(app, .refresh_status); // 上書き（load_diff はここで deinit）
+    try std.testing.expect(app.pending.? == .refresh_status);
+}
+
+test "spawnSync drains staged results into the queue in order" {
+    const a = std.testing.allocator;
+    const app = try makeTestApp();
+    defer freeTestApp(app);
+    try stage(app, .{ .git_error = try a.dupe(u8, "err-A") });
+    try stage(app, .{ .git_error = try a.dupe(u8, "err-B") });
+
+    dispatchSideEffect(app, .refresh_status); // spawnSync: staged を順序保持で push
+    try std.testing.expect(app.model.busy);
+    try std.testing.expect(app.worker != null);
+
+    var local: std.ArrayList(Msg) = .empty;
+    defer local.deinit(a);
+    app.queue.drain(app.io, a, &local);
+    try std.testing.expectEqual(@as(usize, 2), local.items.len);
+    try std.testing.expectEqualStrings("err-A", local.items[0].git_error);
+    try std.testing.expectEqualStrings("err-B", local.items[1].git_error);
+    for (local.items) |*m| m.deinit(a);
+}
+
+// M-N9 競合回帰: 旧 worker の stale git_error が drain されても、新 worker の busy が
+// 早落としされないことを決定的に検証する（spec §6.2）。
+test "M-N9 race: stale drained git_error does not clear new worker busy" {
+    const a = std.testing.allocator;
+    const app = try makeTestApp();
+    defer freeTestApp(app);
+
+    // worker A の結果として stale git_error を stage
+    try stage(app, .{ .git_error = try a.dupe(u8, "fatal: stale A") });
+    dispatchSideEffect(app, .refresh_status); // A 在飛・busy=true・queue=[git_error_A]・done=true
+
+    // worker B の結果を stage した上で、A 在飛中に新副作用 → pending=B
+    try stage(app, .{ .git_error = try a.dupe(u8, "fatal: fresh B") });
+    dispatchSideEffect(app, .refresh_status); // worker!=null → pending=B（busy 変わらず true）
+
+    reapWorker(app); // A 回収 → busy=false → pending B dispatch → spawnSync で B 結果 push・busy=true
+    try std.testing.expect(app.model.busy); // B 仍在飛
+    try std.testing.expect(app.worker != null);
+
+    // drainQueue 相当: キュー結果を reducer へ流す（program 不要・update を直接呼ぶ）
+    var local: std.ArrayList(Msg) = .empty;
+    defer local.deinit(a);
+    app.queue.drain(app.io, a, &local);
+    for (local.items) |m| {
+        var c = update.update(&app.model, m) catch unreachable;
+        c.deinit(a);
+        try std.testing.expect(app.model.busy); // ← 修正前はここで false（バグ）
+    }
+    for (local.items) |*m| m.deinit(a);
+
+    try std.testing.expect(app.model.busy); // 最終的に B の busy は生存
+}
