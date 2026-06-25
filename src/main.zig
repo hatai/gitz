@@ -642,6 +642,8 @@ fn seedInitialStatus(app: *App) void {
         },
         .none, .quit, .apply_patch => {},
     }
+    // busy は runtime 所有（M-N9）。ここは start() 前の同期実行で in-flight worker が
+    // 存在しないため reducer ではなくここで下ろす（reducer は busy を触らない不変）。
     app.model.busy = false;
 }
 
