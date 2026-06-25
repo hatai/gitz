@@ -865,3 +865,36 @@ test "spawnSync drains staged results into the queue in order" {
     try std.testing.expectEqualStrings("err-B", local.items[1].git_error);
     for (local.items) |*m| m.deinit(a);
 }
+
+// M-N9 競合回帰: 旧 worker の stale git_error が drain されても、新 worker の busy が
+// 早落としされないことを決定的に検証する（spec §6.2）。
+test "M-N9 race: stale drained git_error does not clear new worker busy" {
+    const a = std.testing.allocator;
+    const app = try makeTestApp();
+    defer freeTestApp(app);
+
+    // worker A の結果として stale git_error を stage
+    try stage(app, .{ .git_error = try a.dupe(u8, "fatal: stale A") });
+    dispatchSideEffect(app, .refresh_status); // A 在飛・busy=true・queue=[git_error_A]・done=true
+
+    // worker B の結果を stage した上で、A 在飛中に新副作用 → pending=B
+    try stage(app, .{ .git_error = try a.dupe(u8, "fatal: fresh B") });
+    dispatchSideEffect(app, .refresh_status); // worker!=null → pending=B（busy 変わらず true）
+
+    reapWorker(app); // A 回収 → busy=false → pending B dispatch → spawnSync で B 結果 push・busy=true
+    try std.testing.expect(app.model.busy); // B 仍在飛
+    try std.testing.expect(app.worker != null);
+
+    // drainQueue 相当: キュー結果を reducer へ流す（program 不要・update を直接呼ぶ）
+    var local: std.ArrayList(Msg) = .empty;
+    defer local.deinit(a);
+    app.queue.drain(app.io, a, &local);
+    for (local.items) |m| {
+        var c = update.update(&app.model, m) catch unreachable;
+        c.deinit(a);
+        try std.testing.expect(app.model.busy); // ← 修正前はここで false（バグ）
+    }
+    for (local.items) |*m| m.deinit(a);
+
+    try std.testing.expect(app.model.busy); // 最終的に B の busy は生存
+}

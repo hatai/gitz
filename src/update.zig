@@ -237,12 +237,10 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
         .quit => return .quit,
         // 解釈器からの結果
         .status_loaded => |entries| {
-            model.busy = false;
             try model.replaceFiles(entries);
             return loadDiffCmd(model);
         },
         .diff_loaded => |text| {
-            model.busy = false;
             try model.setStr(&model.diff_text, text);
             // ★層 1: ファイル同一性ゲート（codex B1）。clampCursor は diff_text しか見えず
             //   「どのファイルの diff か」を知らないため、ここで selected ファイルが
@@ -254,7 +252,6 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             return .none;
         },
         .git_error => |err_text| {
-            model.busy = false;
             // phase 3a §4.8/M3: log 中の git_error は無条件 .none（busy を触らない・安全側）。
             //   bad revision recovery は LogPageFailed arm 側で処理。detail 系 stale 結果は
             //   detail_owner_hash 照合で別途弾かれる（M-N9 最小対処）。
@@ -266,7 +263,6 @@ pub fn update(model: *Model, msg: Msg) !AppCmd {
             return .none;
         },
         .committed => {
-            model.busy = false;
             try model.setStr(&model.commit_message, "");
             return .refresh_status;
         },
@@ -1162,7 +1158,7 @@ test "scroll_diff_down on empty diff_text is no-op (no underflow)" {
     try std.testing.expectEqual(@as(usize, 0), m.diff_scroll);
 }
 
-test "git_error preserves file list and only sets error_text/busy" {
+test "git_error preserves file list and only sets error_text" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
@@ -1174,8 +1170,40 @@ test "git_error preserves file list and only sets error_text/busy" {
     var cmd = try update(&m, msg);
     defer cmd.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), m.files.items.len); // ファイル一覧は保持
-    try std.testing.expect(!m.busy);
+    try std.testing.expect(m.busy); // reducer は busy を触らない（runtime 所有）
     try std.testing.expectEqualStrings("fatal: boom", m.error_text);
+}
+
+test "reducer leaves busy untouched on status_loaded" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.busy = true;
+    var cmd = try update(&m, .{ .status_loaded = &.{} });
+    defer cmd.deinit(a);
+    try std.testing.expect(m.busy); // reducer は busy を下ろさない
+}
+
+test "reducer leaves busy untouched on diff_loaded" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.busy = true;
+    var msg = Msg{ .diff_loaded = try a.dupe(u8, "diff --git a/x b/x\n") };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(m.busy);
+}
+
+test "reducer leaves busy untouched on committed" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.busy = true;
+    var cmd = try update(&m, .committed);
+    defer cmd.deinit(a); // .refresh_status
+    try std.testing.expect(m.busy);
 }
 
 // 2 ハンクを持つ unstaged diff を model に直接セットするヘルパ。
