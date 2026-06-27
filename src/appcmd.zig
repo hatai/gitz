@@ -169,6 +169,7 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, lo
                 .request_tip = try a.dupe(u8, ""),
                 .is_unborn = true,
                 .entries = entries,
+                .substrate = null,
             } };
         },
         .err => return mkLoadFailedOrSilent(a, cmd, "git リポジトリ状態が壊れています", null),
@@ -209,6 +210,7 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, lo
         .request_tip = try a.dupe(u8, snapshot_tip.?),
         .is_unborn = false,
         .entries = entries,
+        .substrate = null,
     } };
 }
 

@@ -2411,7 +2411,7 @@ test "log_loaded: rejects when not in log mode (R3 stale)" {
     defer a.free(entries);
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, ""), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2429,7 +2429,7 @@ test "log_loaded: rejects when generation mismatch (H1 stale)" {
     defer a.free(entries);
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, ""), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2445,7 +2445,7 @@ test "log_loaded: rejects when skip != 0 (H3 stale)" {
     defer a.free(entries);
     var msg = Msg{ .log_loaded = .{
         .request_skip = 50, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, ""), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2464,7 +2464,7 @@ test "log_loaded: fresh apply with restore hash restores selection (R4)" {
     entries[2] = try mkCommit(a, "h0002", "s2");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2488,7 +2488,7 @@ test "log_loaded: has_more is false when entries < max_count (M3)" {
     entries[2] = try mkCommit(a, "h0002", "s2");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2507,7 +2507,7 @@ test "log_loaded: has_more is true when entries >= max_count (M3)" {
     entries[2] = try mkCommit(a, "h0002", "s2");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 3, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2524,7 +2524,7 @@ test "log_loaded: empty result clears detail state (R2)" {
     defer a.free(entries);
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2931,7 +2931,7 @@ test "end-to-end: toggle_view_mode then log_loaded then log_cursor_down coordina
     entries[1] = try mkCommit(a, "h0001", "s1");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = gen,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var c2 = try update(&m, msg);
@@ -2998,6 +2998,7 @@ test "log_loaded: builds graph state on success" {
         .request_tip = try a.dupe(u8, "h0001"),
         .is_unborn = false,
         .entries = entries,
+        .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -3040,7 +3041,7 @@ test "handleLogLoaded: stores snapshot_tip from request_tip (B1)" {
     entries[0] = try mkCommit(a, "h0001", "s1");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "deadbeef"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "deadbeef"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -3060,7 +3061,7 @@ test "handleLogLoaded: graph suppressed skips computeAll (B2)" {
     entries[1] = try mkCommit(a, "h0002", "s2");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -3079,7 +3080,7 @@ test "handleLogLoaded: clears log_load_error on success (M-N8)" {
     entries[0] = try mkCommit(a, "h0001", "s1");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);

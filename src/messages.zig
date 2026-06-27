@@ -6,6 +6,7 @@ const Section = status.Section;
 const Focus = @import("model.zig").Focus;
 const filter_mod = @import("filter.zig");
 pub const FilterSpec = filter_mod.FilterSpec;
+const topology = @import("git/topology.zig");
 
 pub const Msg = union(enum) {
     key_down, // j / ↓
@@ -73,6 +74,7 @@ pub const Msg = union(enum) {
         request_tip: []u8, // 所有 — appcmd が rev-parse HEAD で解決した snapshot tip
         is_unborn: bool, // appcmd が headState tri-state で判定
         entries: []@import("git/log.zig").Commit,
+        substrate: ?topology.TopologySubstrate, // ★phase 3b #2: filter 活性で非null・投影用 substrate
     };
     pub const LogLoadFailed = struct {
         request_generation: u64,
@@ -138,6 +140,10 @@ pub const Msg = union(enum) {
                 a.free(ll.request_tip);
                 for (ll.entries) |*c| c.deinit(a);
                 a.free(ll.entries);
+                if (ll.substrate) |s| {
+                    var ms = s; // ll は by-value copy・deinit は *self を取るため mutable 局所 copy（ポインタは同一・1 回だけ解放）
+                    ms.deinit(a);
+                }
             },
             .log_page_loaded => |lpl| {
                 a.free(lpl.request_tip);
@@ -405,8 +411,22 @@ test "Msg.log_loaded deinit frees request_tip and entries without leak" {
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
         .request_tip = try a.dupe(u8, "snap1111"), .is_unborn = false, .entries = entries,
+        .substrate = null,
     } };
     msg.deinit(a);
+}
+
+test "Msg.log_loaded deinit frees substrate without leak (phase 3b #2)" {
+    const a = std.testing.allocator;
+    const sub = try topology.parse(a, "C B\nB A\nA\n");
+    const log = @import("git/log.zig");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false,
+        .entries = try a.alloc(log.Commit, 0),
+        .substrate = sub,
+    } };
+    msg.deinit(a); // entries 空 + substrate 解放・リーク無し
 }
 
 test "Msg.log_page_loaded deinit frees request_tip and entries" {
