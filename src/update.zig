@@ -656,6 +656,37 @@ fn handleLogPageLoaded(model: *Model, lpl: msgs.Msg.LogPageLoaded) !AppCmd {
     model.log_has_more = lpl.entries.len >= lpl.request_max_count;
     // ★R10: 選択が存在すれば load_commit_detail で選択/detail 整合性を回復。
     if (model.log_commits.items.len == 0) return .none;
+    // ★phase 3b #2: filter 活性 + substrate 有なら投影 graph（paging 増分）。
+    if (!model.filter_state.isEmpty() and model.topology_substrate != null) {
+        const sub = model.topology_substrate.?;
+        switch (model.log_graph_state) {
+            .valid => {
+                const derived = graph_project.project(model.allocator, sub, lpl.entries) catch {
+                    model.invalidateLogGraph();
+                    return try loadCommitDetailForSelection(model);
+                };
+                defer graph_project.freeDerived(model.allocator, derived);
+                const new_state = graph_mod.computeIncremental(model.allocator, &model.log_graph_state, derived) catch {
+                    model.invalidateLogGraph();
+                    return try loadCommitDetailForSelection(model);
+                };
+                model.setLogGraphState(new_state);
+            },
+            .invalid => {
+                // graph が無効化されていたら全 loaded commits で再投影 computeAll。
+                const derived_all = graph_project.project(model.allocator, sub, model.log_commits.items) catch {
+                    return try loadCommitDetailForSelection(model);
+                };
+                defer graph_project.freeDerived(model.allocator, derived_all);
+                const tip_const: ?[]const u8 = if (model.log_snapshot_tip) |t| t else null;
+                const gs = graph_mod.computeAll(model.allocator, derived_all, model.log_request_generation, tip_const) catch {
+                    return try loadCommitDetailForSelection(model);
+                };
+                model.setLogGraphState(gs);
+            },
+        }
+        return try loadCommitDetailForSelection(model);
+    }
     // ★B2: graph_render_policy==.suppressed なら graph 計算をスキップ。
     if (model.graph_render_policy == .suppressed) {
         return try loadCommitDetailForSelection(model);
@@ -3131,6 +3162,42 @@ test "handleLogLoaded: filter + substrate -> projected graph valid (phase 3b #2)
     // D の投影親は最近親可視祖先 A（gap C,B を飛ばす）。A は root。
     // processCommit: D(down to A), A(root)。
     try std.testing.expectEqual(@as(usize, 1), m.log_graph_state.valid.rows.items[0].cells.len);
+}
+
+test "handleLogPageLoaded: filter+substrate -> incremental projection (phase 3b #2)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    m.log_request_generation = 1;
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    try m.setLogSnapshotTip("snap");
+    // 初回 loaded: visible = {E, C}（substrate: E←D←C←B←A）。
+    const sub = try topology_mod.parse(a, "E D\nD C\nC B\nB A\nA\n");
+    var e1 = try a.alloc(log_mod.Commit, 2);
+    e1[0] = try mkCommit(a, "E", "e");
+    e1[1] = try mkCommit(a, "C", "c");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 2, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = e1, .substrate = sub,
+    } };
+    defer msg.deinit(a);
+    var c1 = try update(&m, msg);
+    defer c1.deinit(a);
+    try std.testing.expect(m.log_graph_state == .valid);
+    const rows_before = m.log_graph_state.valid.rows.items.len;
+    // paging: visible = {A} 追加 → 投影 incremental。
+    m.log_page_requested = 2;
+    var e2 = try a.alloc(log_mod.Commit, 1);
+    e2[0] = try mkCommit(a, "A", "a");
+    var lpl_msg = Msg{ .log_page_loaded = .{
+        .request_skip = 2, .request_max_count = 2, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap"), .entries = e2,
+    } };
+    defer lpl_msg.deinit(a);
+    var c2 = try update(&m, lpl_msg);
+    defer c2.deinit(a);
+    try std.testing.expect(m.log_graph_state == .valid);
+    try std.testing.expectEqual(rows_before + 1, m.log_graph_state.valid.rows.items.len); // 増分
 }
 
 test "handleLogLoaded: clears log_load_error on success (M-N8)" {
