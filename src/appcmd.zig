@@ -172,7 +172,8 @@ fn fetchSubstrate(
 /// Run git log for load_log (initial page, skip=0) and return log_loaded Msg.
 /// phase 3a §6.1: headState tri-state → rev-parse HEAD（snapshot_tip）→ logArgv with filter。
 /// 全エラー経路を LogLoadFailed / LogLoadFailedSilent へ正規化（B4/M3/MINOR7）。
-fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, log_limit: std.Io.Limit) !Msg {    // R20: headState 呼び出しを catch（spawn/OOM も LogLoadFailed へ）。
+fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, log_limit: std.Io.Limit) !Msg {
+    // R20: headState 呼び出しを catch（spawn/OOM も LogLoadFailed へ）。
     const hs = cmds.headState(a, io, cwd) catch
         return mkLoadFailedOrSilent(a, cmd, "git リポジトリ状態の確認に失敗", null);
     switch (hs) {
