@@ -15,6 +15,8 @@ const filter_mod = @import("filter.zig");
 const status = @import("git/status.zig");
 const hunk = @import("diff/hunk.zig");
 const graph_mod = @import("git/graph.zig");
+const graph_project = @import("git/graph_project.zig");
+const topology_mod = @import("git/topology.zig");
 
 /// Model を破壊的に更新し、必要な副作用を AppCmd で返す。
 /// 返した AppCmd は呼び出し側（解釈器/テスト）が deinit する。
@@ -585,15 +587,47 @@ fn handleLogLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
         try model.replaceDetailFiles(&.{});
         return .none;
     }
-    // ★B2: graph_render_policy==.suppressed なら graph 計算をスキップ（log_graph_state は触らない）。
-    if (model.graph_render_policy != .suppressed) {
+    // ★phase 3b #2: filter 活性なら nearest-visible-parent 投影 graph、無 filter なら従来 computeAll。
+    if (model.filter_state.isEmpty()) {
+        // 無 filter: policy=.auto で従来 computeAll。
         const tip_const: ?[]const u8 = if (model.log_snapshot_tip) |t| t else null;
         const gs = graph_mod.computeAll(model.allocator, model.log_commits.items, model.log_request_generation, tip_const) catch {
             model.invalidateLogGraph();
             return try loadCommitDetailForSelection(model);
         };
         model.setLogGraphState(gs);
+        return try loadCommitDetailForSelection(model);
     }
+    // filter 活性:
+    if (ll.substrate) |sub| {
+        // substrate を Model へ deep-copy（Msg は by-value で reducer へ渡るため copy 必須・元は Msg.deinit が解放）。
+        const cloned = sub.clone(model.allocator) catch {
+            model.clearTopologySubstrate();
+            model.graph_render_policy = .suppressed;
+            return try loadCommitDetailForSelection(model);
+        };
+        model.setTopologySubstrate(cloned);
+    } else {
+        // substrate 取得失敗（StreamTooLong/exit≠0/parse 失敗）→ 従来の suppress へ劣化。
+        model.clearTopologySubstrate();
+        model.graph_render_policy = .suppressed;
+        return try loadCommitDetailForSelection(model);
+    }
+    // 投影 derived を構築 → 既存 computeAll へ入力（graph.zig 不変）。
+    const derived = graph_project.project(model.allocator, model.topology_substrate.?, model.log_commits.items) catch {
+        model.invalidateLogGraph();
+        model.graph_render_policy = .suppressed;
+        return try loadCommitDetailForSelection(model);
+    };
+    defer graph_project.freeDerived(model.allocator, derived);
+    const tip_const: ?[]const u8 = if (model.log_snapshot_tip) |t| t else null;
+    const gs = graph_mod.computeAll(model.allocator, derived, model.log_request_generation, tip_const) catch {
+        model.invalidateLogGraph();
+        model.graph_render_policy = .suppressed;
+        return try loadCommitDetailForSelection(model);
+    };
+    model.setLogGraphState(gs);
+    model.graph_render_policy = .auto;
     return try loadCommitDetailForSelection(model);
 }
 
@@ -788,7 +822,7 @@ fn handleApplyFilter(model: *Model, af: Msg.ApplyFilter) !AppCmd {
     model.log_page_requested = null;
     model.log_has_more = false;
     model.clearLogSnapshotTip();
-    model.graph_render_policy = .suppressed;
+    model.graph_render_policy = .auto; // ★phase 3b #2: graph 欲しい（substrate 無なら handleLogLoaded で suppressed へ）
     model.invalidateLogGraph();
     model.clearDetailOwner();
     try model.replaceDetailFiles(&.{});
@@ -3050,12 +3084,12 @@ test "handleLogLoaded: stores snapshot_tip from request_tip (B1)" {
     try std.testing.expectEqualStrings("deadbeef", m.log_snapshot_tip.?);
 }
 
-test "handleLogLoaded: graph suppressed skips computeAll (B2)" {
+test "handleLogLoaded: filter active + no substrate -> suppressed (phase 3b #2)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 0);
     defer m.deinit();
     m.log_request_generation = 1;
-    m.graph_render_policy = .suppressed;
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
     const entries = try a.alloc(log_mod.Commit, 2);
     entries[0] = try mkCommit(a, "h0001", "s1");
     entries[1] = try mkCommit(a, "h0002", "s2");
@@ -3066,8 +3100,37 @@ test "handleLogLoaded: graph suppressed skips computeAll (B2)" {
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
     defer cmd.deinit(a);
-    // B2: policy==.suppressed なら graph 計算スキップ・log_graph_state は .invalid のまま。
+    // substrate 無（取得失敗等）→ suppress へ劣化・graph 計算スキップ・log_graph_state は .invalid。
+    try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
     try std.testing.expect(m.log_graph_state == .invalid);
+}
+
+test "handleLogLoaded: filter + substrate -> projected graph valid (phase 3b #2)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    m.log_request_generation = 1;
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    // substrate: D←C←B←A（全4）。visible = {D, A}（C, B は非可視）。
+    const sub = try topology_mod.parse(a, "D C\nC B\nB A\nA\n");
+    const entries = try a.alloc(log_mod.Commit, 2);
+    entries[0] = try mkCommit(a, "D", "d");
+    entries[1] = try mkCommit(a, "A", "a");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries, .substrate = sub,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    // 投影 graph 構築: rows==commits(2)・policy=.auto・substrate 保存。
+    try std.testing.expect(m.log_graph_state == .valid);
+    try std.testing.expectEqual(@as(usize, 2), m.log_graph_state.valid.rows.items.len);
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
+    try std.testing.expect(m.topology_substrate != null);
+    // D の投影親は最近親可視祖先 A（gap C,B を飛ばす）。A は root。
+    // processCommit: D(down to A), A(root)。
+    try std.testing.expectEqual(@as(usize, 1), m.log_graph_state.valid.rows.items[0].cells.len);
 }
 
 test "handleLogLoaded: clears log_load_error on success (M-N8)" {
@@ -3215,10 +3278,10 @@ test "apply_filter: payload-first transactional success (M4/M-N7)" {
     try std.testing.expectEqual(@as(u64, 6), cmd.load_log.generation);
     // Model 側も filter_state が更新されている。
     try std.testing.expectEqualStrings("alice", m.filter_state.getAuthor().?);
-    // モーダル閉・snapshot_tip クリア・policy suppressed・commits 空。
+    // モーダル閉・snapshot_tip クリア・policy auto（substrate 無なら後段 handleLogLoaded で suppressed）・commits 空。
     try std.testing.expect(!m.filter_modal_open);
     try std.testing.expectEqual(@as(?[]u8, null), m.log_snapshot_tip);
-    try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
     try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
     try std.testing.expect(m.log_graph_state == .invalid);
 }
@@ -3405,11 +3468,11 @@ test "log_load_failed_silent: generation check only (OOM 極限)" {
     try std.testing.expect(c2 == .none);
 }
 
-test "apply_filter then clear_filter: graph policy transitions suppressed → auto (B2)" {
+test "apply_filter then clear_filter: policy auto throughout (phase 3b #2 — suppress set in handleLogLoaded)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 2);
     defer m.deinit();
-    // apply_filter → suppressed。
+    // apply_filter → .auto（suppress は substrate 失敗時に handleLogLoaded が設定）。
     var msg1 = Msg{ .apply_filter = .{
         .author = try a.dupe(u8, "foo"),
         .since = null,
@@ -3419,11 +3482,12 @@ test "apply_filter then clear_filter: graph policy transitions suppressed → au
     defer msg1.deinit(a);
     var c1 = try update(&m, msg1);
     defer c1.deinit(a);
-    try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
-    // clear_filter → auto。
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
+    // clear_filter → .auto・substrate 解放。
     var c2 = try update(&m, .clear_filter);
     defer c2.deinit(a);
     try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
+    try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
 }
 
 test "apply_filter: since only validates and stores" {
