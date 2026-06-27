@@ -93,6 +93,8 @@ fn projectedParents(
 /// X から第一親チェーンを辿り、最近親の可視祖先 hash を返す（無ければ null）。
 /// メモ化: 各 commit hash -> ?可視祖先hash。X が substrate 無（shallow 等）なら null。
 /// memo はポインタ渡し（put が *self を要求し、値渡しではメモ化がコピーに逃げるため）。
+/// 反復実装（第一親チェーンを while で下降）・O(1) スタック（深い線形履歴でもスタック溢れしない）。
+/// 2 パス: (1) チェーン末端まで下降して結果を決定、(2) 同チェーンを再下降して各ノードへ結果をメモ化。
 fn nearestVisibleAncestor(
     substrate: topology.TopologySubstrate,
     visible_set: std.StringHashMap(void),
@@ -100,14 +102,40 @@ fn nearestVisibleAncestor(
     hash: []const u8,
 ) ?[]const u8 {
     if (memo.get(hash)) |cached| return cached;
-    const result: ?[]const u8 = blk: {
-        if (visible_set.contains(hash)) break :blk hash;
-        const idx = substrate.hash_index.get(hash) orelse break :blk null;
+    // (1) 末端まで下降して結果を決定（visible / 実 root / substrate 外 = null）。
+    var result: ?[]const u8 = null;
+    var cur: []const u8 = hash;
+    while (true) {
+        if (memo.get(cur)) |cached| {
+            result = cached;
+            break;
+        }
+        if (visible_set.contains(cur)) {
+            result = cur;
+            break;
+        }
+        const idx = substrate.hash_index.get(cur) orelse {
+            result = null;
+            break;
+        };
         const ps = substrate.entries[idx].parents;
-        if (ps.len == 0) break :blk null; // 実 root 到達・可視祖先無し
-        break :blk nearestVisibleAncestor(substrate, visible_set, memo, ps[0]); // 第一親へ再帰
-    };
-    memo.put(hash, result) catch {}; // OOM は再計算を許容（安全側・非致命）
+        if (ps.len == 0) {
+            result = null; // 実 root 到達・可視祖先無し
+            break;
+        }
+        cur = ps[0]; // 第一親へ下降
+    }
+    // (2) 同第一親チェーンを再下降し、各非末端ノードへ結果をメモ化（全員同一結果を共有）。
+    cur = hash;
+    while (true) {
+        if (memo.get(cur)) |_| break; // 既にメモ化済みの末端に到達 → 完了
+        memo.put(cur, result) catch {}; // OOM は再計算を許容（安全側・非致命）
+        if (visible_set.contains(cur)) break; // 可視末端（result == cur）
+        const idx = substrate.hash_index.get(cur) orelse break; // substrate 外末端
+        const ps = substrate.entries[idx].parents;
+        if (ps.len == 0) break; // 実 root 末端
+        cur = ps[0];
+    }
     return result;
 }
 
