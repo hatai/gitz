@@ -95,7 +95,9 @@ zig build test --summary all
 - 各ペインクリック: そのペインへフォーカス
 
 > **phase 2（表示系完了）**: グラフ罫線（`│ ● ╵ ╷ ─` 等の box-drawing 文字 + 6 色ローテーション）でブランチ分岐・マージを表示。各行に author とコミット日時（UTC `YYYY-MM-DD`）を表示。狭い端末では pane 幅に応じてグラフ・author・date を段階的に省略（M-13）。色は branch identity ではなく視認補助（同一色が別ブランチに使われることがある）。
-> **phase 3（フィルタ）**: 作者（phase 3a）・日付範囲・パス（phase 3b）でのフィルタ機能を実装済み。`f` でモーダル（Author/Since/Until/Path の4入力欄・Tab/Shift+Tab でフォーカス移動・Enter で適用）・`F` で解除。ブランチフィルタは将来。フィルタ中は graph が非表示（topology 保証不可のため・理由を行頭に表示）。
+> **phase 3（フィルタ）**: 作者（phase 3a）・日付範囲・パス・ブランチ（phase 3b）でのフィルタ機能を実装済み。`f` でモーダル（Branch/Author/Since/Until/Path の5入力欄・Tab/Shift+Tab でフォーカス移動・Enter で適用）・`F` で解除。
+> - **Branch 欄**: 任意の git revspec（branch 名・tag・`origin/main`・hash・`HEAD~5` 等）を受け付け、該当 revision の到達可能履歴に絞り込みます。先頭 `-` は不可（git option injection 防止）。不明な branch/revspec はエラー表示。他フィルタ（author/date/path）と組み合わせ可能。
+> - **graph 維持**: フィルタ中も graph を維持（全履歴 topology substrate を取得し、可視 commit 間の最近親可視祖先へ parent を投影して描画・substrate 取得失敗時のみ非表示へ安全劣化）。
 >
 > ★**日付フィルタの timezone**: `--since`/`--until` の日付は環境 TZ（通常 JST）で解釈します。CI/SSH/cron 等で TZ が変わると同じ入力でも結果が変わる可能性があります。UTC 固定にしたい場合は `TZ=UTC git-tui` 等で起動してください。
 

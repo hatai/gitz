@@ -104,6 +104,7 @@ const App = struct {
     cwd: Cwd, // 常に .{ .path = model.repo_root }（サブディレクトリ起動でも root 相対で一貫）
     model: Model,
     textarea: zz.TextArea,
+    filter_branch_input: zz.TextInput,
     filter_author_input: zz.TextInput,
     filter_since_input: zz.TextInput,
     filter_until_input: zz.TextInput,
@@ -302,6 +303,9 @@ pub const RuntimeModel = struct {
         // phase 3a §9.1/M7: filter TextInput と Modal を persistent_allocator で生成。
         // TextInput.getValue は borrowed（内部 value.items への借用）・Enter 押下時に main が dupe。
         // Modal は button 無し（Enter/Esc をアプリ側で横取り・button_count==0 で Modal.handleKey の enter は no-op）。
+        g_app.filter_branch_input = zz.TextInput.init(ctx.persistent_allocator);
+        g_app.filter_branch_input.setCharLimit(256);
+        g_app.filter_branch_input.setPlaceholder("branch or rev");
         g_app.filter_author_input = zz.TextInput.init(ctx.persistent_allocator);
         g_app.filter_author_input.setCharLimit(256);
         g_app.filter_author_input.setPlaceholder("name or email");
@@ -366,6 +370,7 @@ pub const RuntimeModel = struct {
         app.queue.deinit(app.gpa);
         app.test_staged.deinit(app.gpa);
         app.textarea.deinit();
+        app.filter_branch_input.deinit();
         app.filter_author_input.deinit();
         app.filter_since_input.deinit();
         app.filter_until_input.deinit();
@@ -409,6 +414,7 @@ fn nowMs(app: *App) i64 {
 fn syncFilterModal(app: *App, ctx: *const zz.Context) void {
     if (app.model.filter_modal_open and !app.filter_modal.isVisible()) {
         const fs = app.model.filter_state;
+        app.filter_branch_input.setValue(fs.getBranch() orelse "") catch {};
         app.filter_author_input.setValue(fs.getAuthor() orelse "") catch {};
         app.filter_since_input.setValue(fs.getSince() orelse "") catch {};
         app.filter_until_input.setValue(fs.getUntil() orelse "") catch {};
@@ -430,25 +436,29 @@ fn syncFilterModal(app: *App, ctx: *const zz.Context) void {
 }
 
 fn syncFocus(app: *App) void {
+    app.filter_branch_input.blur();
     app.filter_author_input.blur();
     app.filter_since_input.blur();
     app.filter_until_input.blur();
     app.filter_path_input.blur();
     switch (app.model.filter_modal_focus) {
-        0 => app.filter_author_input.focus(),
-        1 => app.filter_since_input.focus(),
-        2 => app.filter_until_input.focus(),
-        3 => app.filter_path_input.focus(),
+        0 => app.filter_branch_input.focus(),
+        1 => app.filter_author_input.focus(),
+        2 => app.filter_since_input.focus(),
+        3 => app.filter_until_input.focus(),
+        4 => app.filter_path_input.focus(),
+        else => unreachable, // filter_field_count=5・focus は常に 0..4
     }
 }
 
 fn buildModalBody(app: *App, a: std.mem.Allocator) ![]const u8 {
     const f = app.model.filter_modal_focus;
-    const author_view: []const u8 = if (f == 0) try app.filter_author_input.view(a) else app.filter_author_input.getValue();
-    const since_view: []const u8 = if (f == 1) try app.filter_since_input.view(a) else app.filter_since_input.getValue();
-    const until_view: []const u8 = if (f == 2) try app.filter_until_input.view(a) else app.filter_until_input.getValue();
-    const path_view: []const u8 = if (f == 3) try app.filter_path_input.view(a) else app.filter_path_input.getValue();
-    return std.fmt.allocPrint(a, "Author: {s}\nSince:  {s}\nUntil:  {s}\nPath:   {s}", .{ author_view, since_view, until_view, path_view });
+    const branch_view: []const u8 = if (f == 0) try app.filter_branch_input.view(a) else app.filter_branch_input.getValue();
+    const author_view: []const u8 = if (f == 1) try app.filter_author_input.view(a) else app.filter_author_input.getValue();
+    const since_view: []const u8 = if (f == 2) try app.filter_since_input.view(a) else app.filter_since_input.getValue();
+    const until_view: []const u8 = if (f == 3) try app.filter_until_input.view(a) else app.filter_until_input.getValue();
+    const path_view: []const u8 = if (f == 4) try app.filter_path_input.view(a) else app.filter_path_input.getValue();
+    return std.fmt.allocPrint(a, "Branch: {s}\nAuthor: {s}\nSince:  {s}\nUntil:  {s}\nPath:   {s}", .{ branch_view, author_view, since_view, until_view, path_view });
 }
 
 var g_click_state: input.ClickState = .{};
@@ -501,10 +511,12 @@ fn handleModalKey(app: *App, program: *ProgramT, k: zz.KeyEvent) void {
 
 fn focusTextInput(app: *App) *zz.TextInput {
     return switch (app.model.filter_modal_focus) {
-        0 => &app.filter_author_input,
-        1 => &app.filter_since_input,
-        2 => &app.filter_until_input,
-        3 => &app.filter_path_input,
+        0 => &app.filter_branch_input,
+        1 => &app.filter_author_input,
+        2 => &app.filter_since_input,
+        3 => &app.filter_until_input,
+        4 => &app.filter_path_input,
+        else => unreachable, // filter_field_count=5・focus は常に 0..4
     };
 }
 
@@ -520,6 +532,14 @@ fn applyFilterFromModal(app: *App, program: *ProgramT) void {
         },
     };
 
+    const branch_v = app.filter_branch_input.getValue();
+    if (branch_v.len > 0) {
+        af.branch = gpa.dupe(u8, branch_v) catch {
+            af.deinit(gpa);
+            app.model.setLogLoadError("フィルタ適用に失敗（メモリ不足）") catch {};
+            return;
+        };
+    }
     const author_v = app.filter_author_input.getValue();
     if (author_v.len > 0) {
         af.author = gpa.dupe(u8, author_v) catch {
@@ -690,6 +710,7 @@ pub fn main(init: std.process.Init) !void {
         .cwd = cwd_root,
         .model = m,
         .textarea = undefined, // RuntimeModel.init で生成
+        .filter_branch_input = undefined,
         .filter_author_input = undefined,
         .filter_since_input = undefined,
         .filter_until_input = undefined,
@@ -766,6 +787,7 @@ fn makeTestApp() !*App {
         .cwd = .{ .path = m.repo_root },
         .model = m,
         .textarea = zz.TextArea.init(a),
+        .filter_branch_input = zz.TextInput.init(a),
         .filter_author_input = zz.TextInput.init(a),
         .filter_since_input = zz.TextInput.init(a),
         .filter_until_input = zz.TextInput.init(a),
@@ -782,6 +804,7 @@ fn freeTestApp(app: *App) void {
     app.model.deinit();
     app.queue.deinit(app.gpa);
     app.textarea.deinit();
+    app.filter_branch_input.deinit();
     app.filter_author_input.deinit();
     app.filter_since_input.deinit();
     app.filter_until_input.deinit();
