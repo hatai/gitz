@@ -583,6 +583,8 @@ fn handleLogLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
     model.setLogLoadError("") catch {};
     // R2 空 guard。
     if (model.log_commits.items.len == 0) {
+        // ★phase 3b #2 (M2): 空結果なら古い substrate を破棄（描画対象が無く投影不要・stale 回避）。
+        if (!model.filter_state.isEmpty()) model.clearTopologySubstrate();
         model.clearDetailOwner();
         try model.replaceDetailFiles(&.{});
         return .none;
@@ -656,35 +658,23 @@ fn handleLogPageLoaded(model: *Model, lpl: msgs.Msg.LogPageLoaded) !AppCmd {
     model.log_has_more = lpl.entries.len >= lpl.request_max_count;
     // ★R10: 選択が存在すれば load_commit_detail で選択/detail 整合性を回復。
     if (model.log_commits.items.len == 0) return .none;
-    // ★phase 3b #2: filter 活性 + substrate 有なら投影 graph（paging 増分）。
+    // ★phase 3b #2: filter 活性 + substrate 有なら投影 graph。
+    //   投影は「最近親可視祖先」へ依存し、可視祖先が未ロードページにある場合があるため、
+    //   paging 毎に**全 loaded commits** を再投影して computeAll で再構築する（自己補正）。
+    //   computeIncremental は既存 row を再処理しないため、部分 visible_set だと cross-page の辺が
+    //   永続的に切断する（C1）。computeAll は visible_set 増大で正しく再接続する。
     if (!model.filter_state.isEmpty() and model.topology_substrate != null) {
         const sub = model.topology_substrate.?;
-        switch (model.log_graph_state) {
-            .valid => {
-                const derived = graph_project.project(model.allocator, sub, lpl.entries) catch {
-                    model.invalidateLogGraph();
-                    return try loadCommitDetailForSelection(model);
-                };
-                defer graph_project.freeDerived(model.allocator, derived);
-                const new_state = graph_mod.computeIncremental(model.allocator, &model.log_graph_state, derived) catch {
-                    model.invalidateLogGraph();
-                    return try loadCommitDetailForSelection(model);
-                };
-                model.setLogGraphState(new_state);
-            },
-            .invalid => {
-                // graph が無効化されていたら全 loaded commits で再投影 computeAll。
-                const derived_all = graph_project.project(model.allocator, sub, model.log_commits.items) catch {
-                    return try loadCommitDetailForSelection(model);
-                };
-                defer graph_project.freeDerived(model.allocator, derived_all);
-                const tip_const: ?[]const u8 = if (model.log_snapshot_tip) |t| t else null;
-                const gs = graph_mod.computeAll(model.allocator, derived_all, model.log_request_generation, tip_const) catch {
-                    return try loadCommitDetailForSelection(model);
-                };
-                model.setLogGraphState(gs);
-            },
-        }
+        const derived_all = graph_project.project(model.allocator, sub, model.log_commits.items) catch {
+            return try loadCommitDetailForSelection(model);
+        };
+        defer graph_project.freeDerived(model.allocator, derived_all);
+        const tip_const: ?[]const u8 = if (model.log_snapshot_tip) |t| t else null;
+        const gs = graph_mod.computeAll(model.allocator, derived_all, model.log_request_generation, tip_const) catch {
+            return try loadCommitDetailForSelection(model);
+        };
+        model.setLogGraphState(gs);
+        model.graph_render_policy = .auto; // ★M3: 再構築成功時は suppress を解除（OOM で一時 suppress 後の復帰）
         return try loadCommitDetailForSelection(model);
     }
     // ★B2: graph_render_policy==.suppressed なら graph 計算をスキップ。
@@ -3165,14 +3155,14 @@ test "handleLogLoaded: filter + substrate -> projected graph valid (phase 3b #2)
     try std.testing.expectEqual(@as(usize, 1), m.log_graph_state.valid.rows.items[0].cells.len);
 }
 
-test "handleLogPageLoaded: filter+substrate -> incremental projection (phase 3b #2)" {
+test "handleLogPageLoaded: filter+substrate -> re-project-all reconnects cross-page edge (phase 3b #2, C1)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 0);
     defer m.deinit();
     m.log_request_generation = 1;
     try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
     try m.setLogSnapshotTip("snap");
-    // 初回 loaded: visible = {E, C}（substrate: E←D←C←B←A）。
+    // 初回 loaded: visible = {E, C}（substrate: E←D←C←B←A）。page1 では C は一時的に root（A 未ロード）。
     const sub = try topology_mod.parse(a, "E D\nD C\nC B\nB A\nA\n");
     var e1 = try a.alloc(log_mod.Commit, 2);
     e1[0] = try mkCommit(a, "E", "e");
@@ -3185,8 +3175,10 @@ test "handleLogPageLoaded: filter+substrate -> incremental projection (phase 3b 
     var c1 = try update(&m, msg);
     defer c1.deinit(a);
     try std.testing.expect(m.log_graph_state == .valid);
-    const rows_before = m.log_graph_state.valid.rows.items.len;
-    // paging: visible = {A} 追加 → 投影 incremental。
+    // page1: rows=[E, C]。C(row1) は A 未ロードのため一時 root → down 無し。
+    try std.testing.expectEqual(@as(usize, 2), m.log_graph_state.valid.rows.items.len);
+    try std.testing.expect(!m.log_graph_state.valid.rows.items[1].cells[0].down); // C: 一時 root
+    // paging: visible = {A} 追加 → 全再投影 computeAll で C→A の cross-page 辺が再接続（C1 回帰ガード）。
     m.log_page_requested = 2;
     var e2 = try a.alloc(log_mod.Commit, 1);
     e2[0] = try mkCommit(a, "A", "a");
@@ -3198,7 +3190,11 @@ test "handleLogPageLoaded: filter+substrate -> incremental projection (phase 3b 
     var c2 = try update(&m, lpl_msg);
     defer c2.deinit(a);
     try std.testing.expect(m.log_graph_state == .valid);
-    try std.testing.expectEqual(rows_before + 1, m.log_graph_state.valid.rows.items.len); // 増分
+    try std.testing.expectEqual(@as(usize, 3), m.log_graph_state.valid.rows.items.len); // E, C, A
+    // C(row1) は A(row2) へ接続（down 辺あり）。バグだと C が永続 root で down 無し。
+    try std.testing.expect(m.log_graph_state.valid.rows.items[1].cells[0].down);
+    // A(row2) は真の root（down 無し）。
+    try std.testing.expect(!m.log_graph_state.valid.rows.items[2].cells[0].down);
 }
 
 test "handleLogLoaded: clears log_load_error on success (M-N8)" {

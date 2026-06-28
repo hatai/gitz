@@ -168,6 +168,17 @@ fn parseAndFree(a: std.mem.Allocator) !void {
     sub.deinit(a);
 }
 
+test "clone: no invalid free / leak on allocation failure (phase 3b #2 M1)" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneAndFree, .{});
+}
+
+fn cloneAndFree(a: std.mem.Allocator) !void {
+    var sub = try parse(a, "D B C\nC A\nB A\nA\n");
+    defer sub.deinit(a);
+    var c = try sub.clone(a);
+    c.deinit(a);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
