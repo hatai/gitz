@@ -763,6 +763,24 @@ fn handleApplyFilter(model: *Model, af: Msg.ApplyFilter) !AppCmd {
             }
         }
     }
+    if (af.branch) |text| {
+        if (text.len > 0) {
+            // ★codex MAJOR: argv builder（revParseVerifyArgv の --end-of-options）が真の安全境界だが、
+            //   ここで弾いて「分かりやすい日本語エラー」を先に出す（defense in depth・UX 層）。
+            if (text[0] == '-') {
+                try model.setLogLoadError("ブランチ/リビジョン名が不正です（先頭に - は使えません）");
+                return .none;
+            }
+            const count = std.unicode.utf8CountCodepoints(text) catch {
+                try model.setLogLoadError("ブランチ/リビジョン名が長すぎます（256 Unicode scalar まで）");
+                return .none;
+            };
+            if (count > filter_mod.max_branch_runes) {
+                try model.setLogLoadError("ブランチ/リビジョン名が長すぎます（256 Unicode scalar まで）");
+                return .none;
+            }
+        }
+    }
     if (af.since) |text| {
         if (text.len > 0) {
             _ = filter_mod.parseDate(text) catch {
@@ -808,6 +826,11 @@ fn handleApplyFilter(model: *Model, af: Msg.ApplyFilter) !AppCmd {
     if (af.author) |text| {
         if (text.len > 0) {
             try new_spec.addCondition(a, .{ .author = try a.dupe(u8, text) });
+        }
+    }
+    if (af.branch) |text| {
+        if (text.len > 0) {
+            try new_spec.addCondition(a, .{ .branch = try a.dupe(u8, text) });
         }
     }
     if (af.since) |text| {
@@ -3689,6 +3712,87 @@ test "open_filter_modal: resets focus to 0 (§4.4)" {
     defer cmd.deinit(a);
     try std.testing.expect(m.filter_modal_open);
     try std.testing.expectEqual(@as(u3, 0), m.filter_modal_focus);
+}
+
+test "apply_filter: branch only validates and stores (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, "dev"),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expectEqualStrings("dev", m.filter_state.getBranch().?);
+    try std.testing.expect(cmd == .load_log);
+}
+
+test "apply_filter: branch leading dash rejected (phase 3b #1 §3.4)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.filter_modal_open = true; // 実運用では open_filter_modal で true 済みの状態で apply
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, "-all"),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(m.filter_state.isEmpty());
+    try std.testing.expect(cmd == .none);
+    try std.testing.expect(m.filter_modal_open); // モーダル維持
+    try std.testing.expect(std.mem.indexOf(u8, m.log_load_error, "先頭に - は使えません") != null);
+}
+
+test "apply_filter: branch too long rejected (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.filter_modal_open = true;
+    const long = try a.alloc(u8, 257);
+    defer a.free(long);
+    @memset(long, 'x');
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, long),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(m.filter_state.isEmpty());
+    try std.testing.expect(cmd == .none);
+    try std.testing.expect(std.mem.indexOf(u8, m.log_load_error, "長すぎます") != null);
+}
+
+test "apply_filter: branch empty normalizes to no branch condition (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, ""),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expectEqual(@as(?[]const u8, null), m.filter_state.getBranch());
+    try std.testing.expect(m.filter_state.isEmpty());
+    try std.testing.expect(cmd == .load_log); // 空 filter → 全件 reload (HEAD)
 }
 
 test "apply_filter: addCondition OOM no payload leak (M3)" {
