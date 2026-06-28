@@ -871,6 +871,7 @@ fn handleApplyFilter(model: *Model, af: Msg.ApplyFilter) !AppCmd {
 /// §4.6: `clear_filter` arm。filter 解除・graph 復活・全件再取得。
 fn handleClearFilter(model: *Model) !AppCmd {
     model.clearFilterState();
+    model.clearTopologySubstrate(); // ★phase 3b #2: substrate 解放
     model.filter_modal_open = false;
     model.log_request_generation += 1;
     model.log_page_requested = null;
@@ -3555,6 +3556,21 @@ test "apply_filter then clear_filter: policy auto throughout (phase 3b #2 — su
     defer c2.deinit(a);
     try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
     try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
+}
+
+test "handleClearFilter: clears topology_substrate (phase 3b #2)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // substrate を設定してから clear_filter で解放されること。
+    const sub = try topology_mod.parse(a, "C B\nB A\nA\n");
+    m.setTopologySubstrate(sub);
+    try std.testing.expect(m.topology_substrate != null);
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    var cmd = try update(&m, .clear_filter);
+    defer cmd.deinit(a);
+    try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
+    try std.testing.expect(m.filter_state.isEmpty());
 }
 
 test "apply_filter: since only validates and stores" {
