@@ -7,6 +7,7 @@ const process = @import("git/process.zig");
 const statusmod = @import("git/status.zig");
 const log = @import("git/log.zig");
 const show = @import("git/show.zig");
+const topology = @import("git/topology.zig");
 const msgs = @import("messages.zig");
 const Msg = msgs.Msg;
 const AppCmd = msgs.AppCmd;
@@ -150,6 +151,24 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
     }
 }
 
+/// phase 3b #2: `git rev-list --topo-order --parents <snapshot_tip>` を取得して substrate をパース。
+/// 全ての失敗（OOM/StreamTooLong/exit≠0/parse 失敗）は null へ（graph のみ suppress へ劣化・filtered log は別途成功）。
+/// 戻り値は所有（成功時のみ）。infallible（常に ?値を返す）。
+fn fetchSubstrate(
+    a: std.mem.Allocator,
+    io: std.Io,
+    cwd: Cwd,
+    snapshot_tip: []const u8,
+    log_limit: std.Io.Limit,
+) ?topology.TopologySubstrate {
+    var argv = cmds.revListParentsArgv(a, snapshot_tip) catch return null;
+    defer argv.deinit(a);
+    var res = process.runWithLimit(a, io, argv.args, cwd, log_limit) catch return null;
+    defer res.deinit(a);
+    if (res.exit_code != 0) return null;
+    return topology.parse(a, res.stdout) catch null;
+}
+
 /// Run git log for load_log (initial page, skip=0) and return log_loaded Msg.
 /// phase 3a §6.1: headState tri-state → rev-parse HEAD（snapshot_tip）→ logArgv with filter。
 /// 全エラー経路を LogLoadFailed / LogLoadFailedSilent へ正規化（B4/M3/MINOR7）。
@@ -169,6 +188,7 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, lo
                 .request_tip = try a.dupe(u8, ""),
                 .is_unborn = true,
                 .entries = entries,
+                .substrate = null,
             } };
         },
         .err => return mkLoadFailedOrSilent(a, cmd, "git リポジトリ状態が壊れています", null),
@@ -202,13 +222,22 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, lo
         a.free(entries);
     }
     // ★B1: request_tip には rev-parse HEAD の結果を dupe して所有。
+    const tip_dup = try a.dupe(u8, snapshot_tip.?);
+    errdefer a.free(tip_dup);
+    // ★phase 3b #2: filter 活性のとき substrate を取得（失敗は null・graph suppress へ劣化）。
+    //   ここより後は infallible（return のみ）なので substrate/tip_dup は struct へ move される。
+    const substrate: ?topology.TopologySubstrate = if (!cmd.filter.isEmpty())
+        fetchSubstrate(a, io, cwd, snapshot_tip.?, log_limit)
+    else
+        null;
     return .{ .log_loaded = .{
         .request_skip = cmd.skip,
         .request_max_count = cmd.max_count,
         .request_generation = cmd.generation,
-        .request_tip = try a.dupe(u8, snapshot_tip.?),
+        .request_tip = tip_dup,
         .is_unborn = false,
         .entries = entries,
+        .substrate = substrate,
     } };
 }
 
@@ -945,6 +974,49 @@ test "load_log returns log_loaded with 3 commits on a populated repo" {
     try std.testing.expect(msg.log_loaded.request_tip.len > 0);
     // ★m-N1: is_unborn=false（commit あり）。
     try std.testing.expect(!msg.log_loaded.is_unborn);
+}
+
+test "load_log with author filter returns LogLoaded with substrate (phase 3b #2)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // 3 commits（各1ファイル）。
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    try repo.writeFile(io, "b.txt", "b\n");
+    try repo.git(a, io, &.{ "git", "add", "b.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c2" });
+    try repo.writeFile(io, "c.txt", "c\n");
+    try repo.git(a, io, &.{ "git", "add", "c.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c3" });
+    var spec = FilterSpec.init();
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    // filter 活性 -> substrate 非null・全3 commit 含む。
+    try std.testing.expect(msg.log_loaded.substrate != null);
+    try std.testing.expectEqual(@as(usize, 3), msg.log_loaded.substrate.?.entries.len);
+}
+
+test "load_log with empty filter returns LogLoaded with null substrate (phase 3b #2)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = FilterSpec.init(),
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expect(msg.log_loaded.substrate == null);
 }
 
 test "load_log on empty (unborn) repo returns log_loaded with 0 entries" {

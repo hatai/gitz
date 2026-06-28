@@ -4,6 +4,7 @@ const log_mod = @import("git/log.zig");
 const show_mod = @import("git/show.zig");
 const graph_mod = @import("git/graph.zig");
 const filter_mod = @import("filter.zig");
+const topology_mod = @import("git/topology.zig");
 pub const FilterSpec = filter_mod.FilterSpec;
 
 /// 最後に load_diff を発行したファイル識別子（層 1: codex B1 対策）。path のみで追跡すると
@@ -68,6 +69,7 @@ pub const Model = struct {
     log_graph_state: graph_mod.GraphState,
     log_snapshot_tip: ?[]u8,
     graph_render_policy: GraphRenderPolicy,
+    topology_substrate: ?topology_mod.TopologySubstrate, // ★phase 3b #2: filter 中 graph 投影用
 
     // --- TODO 2 phase 3a/3b: filter UI state ---
     filter_state: FilterSpec,
@@ -119,6 +121,7 @@ pub const Model = struct {
             .log_graph_state = .invalid,
             .log_snapshot_tip = null,
             .graph_render_policy = .auto,
+            .topology_substrate = null,
 
             // --- TODO 2 phase 3a/3b: filter UI state ---
             .filter_state = FilterSpec.init(),
@@ -157,6 +160,7 @@ pub const Model = struct {
         // --- TODO 2 phase 2/3a ---
         self.log_graph_state.deinit(a);
         if (self.log_snapshot_tip) |t| a.free(t);
+        if (self.topology_substrate) |*s| s.deinit(a); // ★phase 3b #2
         // --- TODO 2 phase 3a: filter UI state ---
         self.filter_state.deinit(a);
         a.free(self.log_load_error);
@@ -386,6 +390,17 @@ pub const Model = struct {
         const a = self.allocator;
         if (self.log_snapshot_tip) |old| a.free(old);
         self.log_snapshot_tip = null;
+    }
+
+    /// phase 3b #2: topology_substrate を置換（旧を deinit して swap・所有権移譲）。
+    pub fn setTopologySubstrate(self: *Model, sub: topology_mod.TopologySubstrate) void {
+        if (self.topology_substrate) |*s| s.deinit(self.allocator);
+        self.topology_substrate = sub;
+    }
+    /// phase 3b #2: topology_substrate をクリア。
+    pub fn clearTopologySubstrate(self: *Model) void {
+        if (self.topology_substrate) |*s| s.deinit(self.allocator);
+        self.topology_substrate = null;
     }
 
     // --- phase 3a: filter state helpers ---
@@ -942,6 +957,27 @@ test "setLogSnapshotTip / clearLogSnapshotTip cycle without leak" {
     try std.testing.expectEqualStrings("def", m.log_snapshot_tip.?);
     m.clearLogSnapshotTip();
     try std.testing.expectEqual(@as(?[]u8, null), m.log_snapshot_tip);
+}
+
+test "Model.topology_substrate initializes null (phase 3b #2)" {
+    var m = try Model.init(std.testing.allocator, "/r");
+    defer m.deinit();
+    try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
+}
+
+test "Model.setTopologySubstrate / clearTopologySubstrate cycle without leak (phase 3b #2)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const sub1 = try topology_mod.parse(a, "C B\nB A\nA\n");
+    m.setTopologySubstrate(sub1); // move
+    try std.testing.expect(m.topology_substrate != null);
+    try std.testing.expectEqual(@as(usize, 3), m.topology_substrate.?.entries.len);
+    const sub2 = try topology_mod.parse(a, "D C\nC\n");
+    m.setTopologySubstrate(sub2); // 旧 sub1 解放 + 新 sub2 swap
+    try std.testing.expectEqual(@as(usize, 2), m.topology_substrate.?.entries.len);
+    m.clearTopologySubstrate();
+    try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
 }
 
 // --- TODO 2 phase 3a: filter / graph_render_policy / log_load_error ---

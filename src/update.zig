@@ -15,6 +15,8 @@ const filter_mod = @import("filter.zig");
 const status = @import("git/status.zig");
 const hunk = @import("diff/hunk.zig");
 const graph_mod = @import("git/graph.zig");
+const graph_project = @import("git/graph_project.zig");
+const topology_mod = @import("git/topology.zig");
 
 /// Model を破壊的に更新し、必要な副作用を AppCmd で返す。
 /// 返した AppCmd は呼び出し側（解釈器/テスト）が deinit する。
@@ -581,19 +583,53 @@ fn handleLogLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
     model.setLogLoadError("") catch {};
     // R2 空 guard。
     if (model.log_commits.items.len == 0) {
+        // ★phase 3b #2 (M2): 空結果なら古い substrate を破棄（描画対象が無く投影不要・stale 回避）。
+        if (!model.filter_state.isEmpty()) model.clearTopologySubstrate();
         model.clearDetailOwner();
         try model.replaceDetailFiles(&.{});
         return .none;
     }
-    // ★B2: graph_render_policy==.suppressed なら graph 計算をスキップ（log_graph_state は触らない）。
-    if (model.graph_render_policy != .suppressed) {
+    // ★phase 3b #2: filter 活性なら nearest-visible-parent 投影 graph、無 filter なら従来 computeAll。
+    if (model.filter_state.isEmpty()) {
+        // 無 filter: policy=.auto で従来 computeAll。
         const tip_const: ?[]const u8 = if (model.log_snapshot_tip) |t| t else null;
         const gs = graph_mod.computeAll(model.allocator, model.log_commits.items, model.log_request_generation, tip_const) catch {
             model.invalidateLogGraph();
             return try loadCommitDetailForSelection(model);
         };
         model.setLogGraphState(gs);
+        return try loadCommitDetailForSelection(model);
     }
+    // filter 活性:
+    if (ll.substrate) |sub| {
+        // substrate を Model へ deep-copy（Msg は by-value で reducer へ渡るため copy 必須・元は Msg.deinit が解放）。
+        const cloned = sub.clone(model.allocator) catch {
+            model.clearTopologySubstrate();
+            model.graph_render_policy = .suppressed;
+            return try loadCommitDetailForSelection(model);
+        };
+        model.setTopologySubstrate(cloned);
+    } else {
+        // substrate 取得失敗（StreamTooLong/exit≠0/parse 失敗）→ 従来の suppress へ劣化。
+        model.clearTopologySubstrate();
+        model.graph_render_policy = .suppressed;
+        return try loadCommitDetailForSelection(model);
+    }
+    // 投影 derived を構築 → 既存 computeAll へ入力（graph.zig 不変）。
+    const derived = graph_project.project(model.allocator, model.topology_substrate.?, model.log_commits.items) catch {
+        model.invalidateLogGraph();
+        model.graph_render_policy = .suppressed;
+        return try loadCommitDetailForSelection(model);
+    };
+    defer graph_project.freeDerived(model.allocator, derived);
+    const tip_const: ?[]const u8 = if (model.log_snapshot_tip) |t| t else null;
+    const gs = graph_mod.computeAll(model.allocator, derived, model.log_request_generation, tip_const) catch {
+        model.invalidateLogGraph();
+        model.graph_render_policy = .suppressed;
+        return try loadCommitDetailForSelection(model);
+    };
+    model.setLogGraphState(gs);
+    model.graph_render_policy = .auto;
     return try loadCommitDetailForSelection(model);
 }
 
@@ -622,6 +658,25 @@ fn handleLogPageLoaded(model: *Model, lpl: msgs.Msg.LogPageLoaded) !AppCmd {
     model.log_has_more = lpl.entries.len >= lpl.request_max_count;
     // ★R10: 選択が存在すれば load_commit_detail で選択/detail 整合性を回復。
     if (model.log_commits.items.len == 0) return .none;
+    // ★phase 3b #2: filter 活性 + substrate 有なら投影 graph。
+    //   投影は「最近親可視祖先」へ依存し、可視祖先が未ロードページにある場合があるため、
+    //   paging 毎に**全 loaded commits** を再投影して computeAll で再構築する（自己補正）。
+    //   computeIncremental は既存 row を再処理しないため、部分 visible_set だと cross-page の辺が
+    //   永続的に切断する（C1）。computeAll は visible_set 増大で正しく再接続する。
+    if (!model.filter_state.isEmpty() and model.topology_substrate != null) {
+        const sub = model.topology_substrate.?;
+        const derived_all = graph_project.project(model.allocator, sub, model.log_commits.items) catch {
+            return try loadCommitDetailForSelection(model);
+        };
+        defer graph_project.freeDerived(model.allocator, derived_all);
+        const tip_const: ?[]const u8 = if (model.log_snapshot_tip) |t| t else null;
+        const gs = graph_mod.computeAll(model.allocator, derived_all, model.log_request_generation, tip_const) catch {
+            return try loadCommitDetailForSelection(model);
+        };
+        model.setLogGraphState(gs);
+        model.graph_render_policy = .auto; // ★M3: 再構築成功時は suppress を解除（OOM で一時 suppress 後の復帰）
+        return try loadCommitDetailForSelection(model);
+    }
     // ★B2: graph_render_policy==.suppressed なら graph 計算をスキップ。
     if (model.graph_render_policy == .suppressed) {
         return try loadCommitDetailForSelection(model);
@@ -788,7 +843,7 @@ fn handleApplyFilter(model: *Model, af: Msg.ApplyFilter) !AppCmd {
     model.log_page_requested = null;
     model.log_has_more = false;
     model.clearLogSnapshotTip();
-    model.graph_render_policy = .suppressed;
+    model.graph_render_policy = .auto; // ★phase 3b #2: graph 欲しい（substrate 無なら handleLogLoaded で suppressed へ）
     model.invalidateLogGraph();
     model.clearDetailOwner();
     try model.replaceDetailFiles(&.{});
@@ -806,6 +861,7 @@ fn handleApplyFilter(model: *Model, af: Msg.ApplyFilter) !AppCmd {
 /// §4.6: `clear_filter` arm。filter 解除・graph 復活・全件再取得。
 fn handleClearFilter(model: *Model) !AppCmd {
     model.clearFilterState();
+    model.clearTopologySubstrate(); // ★phase 3b #2: substrate 解放
     model.filter_modal_open = false;
     model.log_request_generation += 1;
     model.log_page_requested = null;
@@ -2411,7 +2467,7 @@ test "log_loaded: rejects when not in log mode (R3 stale)" {
     defer a.free(entries);
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, ""), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2429,7 +2485,7 @@ test "log_loaded: rejects when generation mismatch (H1 stale)" {
     defer a.free(entries);
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, ""), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2445,7 +2501,7 @@ test "log_loaded: rejects when skip != 0 (H3 stale)" {
     defer a.free(entries);
     var msg = Msg{ .log_loaded = .{
         .request_skip = 50, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, ""), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2464,7 +2520,7 @@ test "log_loaded: fresh apply with restore hash restores selection (R4)" {
     entries[2] = try mkCommit(a, "h0002", "s2");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2488,7 +2544,7 @@ test "log_loaded: has_more is false when entries < max_count (M3)" {
     entries[2] = try mkCommit(a, "h0002", "s2");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2507,7 +2563,7 @@ test "log_loaded: has_more is true when entries >= max_count (M3)" {
     entries[2] = try mkCommit(a, "h0002", "s2");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 3, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2524,7 +2580,7 @@ test "log_loaded: empty result clears detail state (R2)" {
     defer a.free(entries);
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -2931,7 +2987,7 @@ test "end-to-end: toggle_view_mode then log_loaded then log_cursor_down coordina
     entries[1] = try mkCommit(a, "h0001", "s1");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = gen,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var c2 = try update(&m, msg);
@@ -2998,6 +3054,7 @@ test "log_loaded: builds graph state on success" {
         .request_tip = try a.dupe(u8, "h0001"),
         .is_unborn = false,
         .entries = entries,
+        .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -3040,7 +3097,7 @@ test "handleLogLoaded: stores snapshot_tip from request_tip (B1)" {
     entries[0] = try mkCommit(a, "h0001", "s1");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "deadbeef"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "deadbeef"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -3049,24 +3106,95 @@ test "handleLogLoaded: stores snapshot_tip from request_tip (B1)" {
     try std.testing.expectEqualStrings("deadbeef", m.log_snapshot_tip.?);
 }
 
-test "handleLogLoaded: graph suppressed skips computeAll (B2)" {
+test "handleLogLoaded: filter active + no substrate -> suppressed (phase 3b #2)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 0);
     defer m.deinit();
     m.log_request_generation = 1;
-    m.graph_render_policy = .suppressed;
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
     const entries = try a.alloc(log_mod.Commit, 2);
     entries[0] = try mkCommit(a, "h0001", "s1");
     entries[1] = try mkCommit(a, "h0002", "s2");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
     defer cmd.deinit(a);
-    // B2: policy==.suppressed なら graph 計算スキップ・log_graph_state は .invalid のまま。
+    // substrate 無（取得失敗等）→ suppress へ劣化・graph 計算スキップ・log_graph_state は .invalid。
+    try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
     try std.testing.expect(m.log_graph_state == .invalid);
+}
+
+test "handleLogLoaded: filter + substrate -> projected graph valid (phase 3b #2)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    m.log_request_generation = 1;
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    // substrate: D←C←B←A（全4）。visible = {D, A}（C, B は非可視）。
+    const sub = try topology_mod.parse(a, "D C\nC B\nB A\nA\n");
+    const entries = try a.alloc(log_mod.Commit, 2);
+    entries[0] = try mkCommit(a, "D", "d");
+    entries[1] = try mkCommit(a, "A", "a");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries, .substrate = sub,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    // 投影 graph 構築: rows==commits(2)・policy=.auto・substrate 保存。
+    try std.testing.expect(m.log_graph_state == .valid);
+    try std.testing.expectEqual(@as(usize, 2), m.log_graph_state.valid.rows.items.len);
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
+    try std.testing.expect(m.topology_substrate != null);
+    // D の投影親は最近親可視祖先 A（gap C,B を飛ばす）。A は root。
+    // processCommit: D(down to A), A(root)。
+    try std.testing.expectEqual(@as(usize, 1), m.log_graph_state.valid.rows.items[0].cells.len);
+}
+
+test "handleLogPageLoaded: filter+substrate -> re-project-all reconnects cross-page edge (phase 3b #2, C1)" {
+    const a = std.testing.allocator;
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    m.log_request_generation = 1;
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    try m.setLogSnapshotTip("snap");
+    // 初回 loaded: visible = {E, C}（substrate: E←D←C←B←A）。page1 では C は一時的に root（A 未ロード）。
+    const sub = try topology_mod.parse(a, "E D\nD C\nC B\nB A\nA\n");
+    var e1 = try a.alloc(log_mod.Commit, 2);
+    e1[0] = try mkCommit(a, "E", "e");
+    e1[1] = try mkCommit(a, "C", "c");
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 2, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = e1, .substrate = sub,
+    } };
+    defer msg.deinit(a);
+    var c1 = try update(&m, msg);
+    defer c1.deinit(a);
+    try std.testing.expect(m.log_graph_state == .valid);
+    // page1: rows=[E, C]。C(row1) は A 未ロードのため一時 root → down 無し。
+    try std.testing.expectEqual(@as(usize, 2), m.log_graph_state.valid.rows.items.len);
+    try std.testing.expect(!m.log_graph_state.valid.rows.items[1].cells[0].down); // C: 一時 root
+    // paging: visible = {A} 追加 → 全再投影 computeAll で C→A の cross-page 辺が再接続（C1 回帰ガード）。
+    m.log_page_requested = 2;
+    var e2 = try a.alloc(log_mod.Commit, 1);
+    e2[0] = try mkCommit(a, "A", "a");
+    var lpl_msg = Msg{ .log_page_loaded = .{
+        .request_skip = 2, .request_max_count = 2, .request_generation = 1,
+        .request_tip = try a.dupe(u8, "snap"), .entries = e2,
+    } };
+    defer lpl_msg.deinit(a);
+    var c2 = try update(&m, lpl_msg);
+    defer c2.deinit(a);
+    try std.testing.expect(m.log_graph_state == .valid);
+    try std.testing.expectEqual(@as(usize, 3), m.log_graph_state.valid.rows.items.len); // E, C, A
+    // C(row1) は A(row2) へ接続（down 辺あり）。バグだと C が永続 root で down 無し。
+    try std.testing.expect(m.log_graph_state.valid.rows.items[1].cells[0].down);
+    // A(row2) は真の root（down 無し）。
+    try std.testing.expect(!m.log_graph_state.valid.rows.items[2].cells[0].down);
 }
 
 test "handleLogLoaded: clears log_load_error on success (M-N8)" {
@@ -3079,7 +3207,7 @@ test "handleLogLoaded: clears log_load_error on success (M-N8)" {
     entries[0] = try mkCommit(a, "h0001", "s1");
     var msg = Msg{ .log_loaded = .{
         .request_skip = 0, .request_max_count = 100, .request_generation = 1,
-        .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries,
+        .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
     var cmd = try update(&m, msg);
@@ -3214,10 +3342,10 @@ test "apply_filter: payload-first transactional success (M4/M-N7)" {
     try std.testing.expectEqual(@as(u64, 6), cmd.load_log.generation);
     // Model 側も filter_state が更新されている。
     try std.testing.expectEqualStrings("alice", m.filter_state.getAuthor().?);
-    // モーダル閉・snapshot_tip クリア・policy suppressed・commits 空。
+    // モーダル閉・snapshot_tip クリア・policy auto（substrate 無なら後段 handleLogLoaded で suppressed）・commits 空。
     try std.testing.expect(!m.filter_modal_open);
     try std.testing.expectEqual(@as(?[]u8, null), m.log_snapshot_tip);
-    try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
     try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
     try std.testing.expect(m.log_graph_state == .invalid);
 }
@@ -3404,11 +3532,11 @@ test "log_load_failed_silent: generation check only (OOM 極限)" {
     try std.testing.expect(c2 == .none);
 }
 
-test "apply_filter then clear_filter: graph policy transitions suppressed → auto (B2)" {
+test "apply_filter then clear_filter: policy auto throughout (phase 3b #2 — suppress set in handleLogLoaded)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 2);
     defer m.deinit();
-    // apply_filter → suppressed。
+    // apply_filter → .auto（suppress は substrate 失敗時に handleLogLoaded が設定）。
     var msg1 = Msg{ .apply_filter = .{
         .author = try a.dupe(u8, "foo"),
         .since = null,
@@ -3418,11 +3546,27 @@ test "apply_filter then clear_filter: graph policy transitions suppressed → au
     defer msg1.deinit(a);
     var c1 = try update(&m, msg1);
     defer c1.deinit(a);
-    try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
-    // clear_filter → auto。
+    try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
+    // clear_filter → .auto・substrate 解放。
     var c2 = try update(&m, .clear_filter);
     defer c2.deinit(a);
     try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
+    try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
+}
+
+test "handleClearFilter: clears topology_substrate (phase 3b #2)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // substrate を設定してから clear_filter で解放されること。
+    const sub = try topology_mod.parse(a, "C B\nB A\nA\n");
+    m.setTopologySubstrate(sub);
+    try std.testing.expect(m.topology_substrate != null);
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    var cmd = try update(&m, .clear_filter);
+    defer cmd.deinit(a);
+    try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
+    try std.testing.expect(m.filter_state.isEmpty());
 }
 
 test "apply_filter: since only validates and stores" {

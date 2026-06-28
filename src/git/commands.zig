@@ -256,6 +256,16 @@ pub fn revParseHeadArgv() []const []const u8 {
     return &.{ "git", "rev-parse", "--verify", "HEAD" };
 }
 
+/// `git rev-list --topo-order --parents <snapshot_tip>` argv（phase 3b #2 graph 投影用 substrate）。
+/// 全履歴の hash + 実 parents を取得（フィルタ無し）。snapshot_tip は借用（logArgv と同型・owned に入れない）。
+pub fn revListParentsArgv(a: std.mem.Allocator, snapshot_tip: []const u8) !OwnedArgv {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(a);
+    try list.appendSlice(a, &.{ "git", "rev-list", "--topo-order", "--parents" });
+    try list.append(a, snapshot_tip); // 借用
+    return .{ .args = try list.toOwnedSlice(a), .owned = .empty };
+}
+
 /// HEAD hash を dupe して返す（呼出側 free）。exit 128（unborn 等）は null。
 /// headState が .ok のときだけ呼ぶことを前提（.unborn/.err は呼出元で処理済み）。
 pub fn revParseHead(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !?[]u8 {
@@ -560,6 +570,19 @@ test "revParseHeadArgv returns git rev-parse --verify HEAD" {
     try std.testing.expectEqualStrings("rev-parse", argv[1]);
     try std.testing.expectEqualStrings("--verify", argv[2]);
     try std.testing.expectEqualStrings("HEAD", argv[3]);
+}
+
+test "revListParentsArgv: git rev-list --topo-order --parents <snapshot_tip> (phase 3b #2)" {
+    const a = std.testing.allocator;
+    var argv = try revListParentsArgv(a, "snap9999");
+    defer argv.deinit(a);
+    try std.testing.expectEqual(@as(usize, 5), argv.args.len);
+    try std.testing.expectEqualStrings("git", argv.args[0]);
+    try std.testing.expectEqualStrings("rev-list", argv.args[1]);
+    try std.testing.expectEqualStrings("--topo-order", argv.args[2]);
+    try std.testing.expectEqualStrings("--parents", argv.args[3]);
+    try std.testing.expectEqualStrings("snap9999", argv.args[4]); // 末尾・借用
+    try std.testing.expectEqual(@as(usize, 0), argv.owned.items.len); // owned 空（snapshot_tip 借用）
 }
 
 test "showNameStatusArgv: --diff-merges=first-parent --format= --name-status -z" {
