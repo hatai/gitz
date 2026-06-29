@@ -35,6 +35,11 @@ fn filterReasonText(a: std.mem.Allocator, filter: FilterSpec) []const u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(a);
     buf.appendSlice(a, "Filter:") catch return "Filter:";
+    if (filter.getBranch()) |text| {
+        const part = std.fmt.allocPrint(a, " branch=\"{s}\"", .{text}) catch return "Filter:";
+        defer a.free(part);
+        buf.appendSlice(a, part) catch return "Filter:";
+    }
     if (filter.getAuthor()) |text| {
         const part = std.fmt.allocPrint(a, " author=\"{s}\"", .{text}) catch return "Filter:";
         defer a.free(part);
@@ -1146,6 +1151,17 @@ test "logEmptyKind: no_commits when filter empty even with error cleared" {
     try std.testing.expectEqual(LogEmptyKind.no_commits, logEmptyKind(&m));
 }
 
+test "filterReasonText: branch only (phase 3b #1)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var spec = FilterSpec.init();
+    defer spec.deinit(std.testing.allocator);
+    try spec.addCondition(std.testing.allocator, .{ .branch = try std.testing.allocator.dupe(u8, "dev") });
+    const out = filterReasonText(a, spec);
+    try std.testing.expectEqualStrings("Filter: branch=\"dev\"", out);
+}
+
 test "filterReasonText: author only" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1167,19 +1183,21 @@ test "filterReasonText: empty returns empty" {
     try std.testing.expectEqualStrings("", out);
 }
 
-test "filterReasonText: all variants" {
+test "filterReasonText: all variants (phase 3b #1)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var spec = FilterSpec.init();
     defer spec.deinit(std.testing.allocator);
+    try spec.addCondition(std.testing.allocator, .{ .branch = try std.testing.allocator.dupe(u8, "dev") });
     try spec.addCondition(std.testing.allocator, .{ .author = try std.testing.allocator.dupe(u8, "foo") });
     try spec.addCondition(std.testing.allocator, .{ .since = try std.testing.allocator.dupe(u8, "2026-06-01") });
+    try spec.addCondition(std.testing.allocator, .{ .until = try std.testing.allocator.dupe(u8, "2026-06-30") });
     const paths = try std.testing.allocator.alloc([]u8, 1);
     paths[0] = try std.testing.allocator.dupe(u8, "src/");
     try spec.addCondition(std.testing.allocator, .{ .paths = paths });
     const out = filterReasonText(a, spec);
-    try std.testing.expectEqualStrings("Filter: author=\"foo\" since=2026-06-01 paths=src/", out);
+    try std.testing.expectEqualStrings("Filter: branch=\"dev\" author=\"foo\" since=2026-06-01 until=2026-06-30 paths=src/", out);
 }
 
 test {

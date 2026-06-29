@@ -194,8 +194,15 @@ fn runLogInt(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd.LoadLog, lo
         .err => return mkLoadFailedOrSilent(a, cmd, "git リポジトリ状態が壊れています", null),
         .ok => {},
     }
-    // ★B1: rev-parse HEAD で snapshot_tip を取得（フィルタと独立・race 回避）。
-    const snapshot_tip = cmds.revParseHead(a, io, cwd) catch
+    // ★B1/phase 3b #1: branch 有りなら rev-parse --verify <branch>^{commit}、無ければ HEAD。
+    //   branch 解決失敗（RunError/exit≠0）は既存 LogLoadFailed ファミリへ正規化。
+    const branch = cmd.filter.getBranch();
+    const snapshot_tip: ?[]u8 = if (branch) |b| blk: {
+        const resolved = cmds.revParseVerify(a, io, cwd, b) catch
+            return mkLoadFailedOrSilent(a, cmd, "ブランチ/リビジョンの解決に失敗", null);
+        if (resolved == null) return branchLoadFailed(a, cmd, b); // 不明/非 commit
+        break :blk resolved;
+    } else cmds.revParseHead(a, io, cwd) catch
         return mkLoadFailedOrSilent(a, cmd, "HEAD 解決失敗", null);
     if (snapshot_tip == null) return mkLoadFailedOrSilent(a, cmd, "HEAD 解決失敗", null);
     defer a.free(snapshot_tip.?);
@@ -264,6 +271,18 @@ fn mkLoadFailedOrSilent(
 /// §6.1: OOM 極限の silent 版。payload 無し・generation 照合のみ。
 fn mkLoadFailedSilent(cmd: AppCmd.LoadLog) Msg {
     return .{ .log_load_failed_silent = .{ .request_generation = cmd.generation } };
+}
+
+/// phase 3b #1: branch 解決失敗（exit≠0: 不明 branch/revspec・blob/tree・peel 失敗）→ branch 名入りの LogLoadFailed。
+/// メッセージ dupe の OOM は mkLoadFailedSilent へ fallback（既存 mkLoadFailedOrSilent と同型・強例外保証）。
+fn branchLoadFailed(a: std.mem.Allocator, cmd: AppCmd.LoadLog, branch: []const u8) Msg {
+    const text = std.fmt.allocPrint(a, "ブランチ/リビジョン '{s}' が見つかりません", .{branch}) catch
+        return mkLoadFailedSilent(cmd);
+    return .{ .log_load_failed = .{
+        .request_generation = cmd.generation,
+        .request_tip = null,
+        .error_text = text,
+    } };
 }
 
 /// ?[]const u8 → ?[]u8 への dupe ヘルパ（null はそのまま）。
@@ -1001,6 +1020,124 @@ test "load_log with author filter returns LogLoaded with substrate (phase 3b #2)
     // filter 活性 -> substrate 非null・全3 commit 含む。
     try std.testing.expect(msg.log_loaded.substrate != null);
     try std.testing.expectEqual(@as(usize, 3), msg.log_loaded.substrate.?.entries.len);
+}
+
+test "load_log with branch filter returns branch tip's log + substrate (phase 3b #1)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    try repo.writeFile(io, "b.txt", "b\n");
+    try repo.git(a, io, &.{ "git", "add", "b.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c2" });
+    try repo.git(a, io, &.{ "git", "branch", "dev" }); // dev -> c2
+    try repo.writeFile(io, "c.txt", "c\n");
+    try repo.git(a, io, &.{ "git", "add", "c.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c3" }); // default 進む (HEAD=c3)
+    var spec = FilterSpec.init();
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "dev") });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    // dev tip = c2 → c3 は到達不能 → c1, c2 のみ（HEAD なら c1,c2,c3）。
+    try std.testing.expectEqual(@as(usize, 2), msg.log_loaded.entries.len);
+    try std.testing.expectEqualStrings("c2", msg.log_loaded.entries[0].subject);
+    try std.testing.expectEqualStrings("c1", msg.log_loaded.entries[1].subject);
+    try std.testing.expect(msg.log_loaded.substrate != null); // filter 活性 -> substrate
+}
+
+test "load_log with non-existent branch returns LogLoadFailed (phase 3b #1)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    var spec = FilterSpec.init();
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "no-such-branch") });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_load_failed);
+    try std.testing.expect(std.mem.indexOf(u8, msg.log_load_failed.error_text, "no-such-branch") != null);
+}
+
+test "load_log with blob hash returns LogLoadFailed (^{commit} peel, phase 3b #1)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    var r = try process.run(a, io, &.{ "git", "rev-parse", "HEAD:a.txt" }, repo.cwd());
+    defer r.deinit(a);
+    // ★所有権: blob の dupe は addCondition へ移譲し runOwned → filter.deinit が解放（codex BLOCKER3）。
+    //   `defer spec.deinit` は runOwned と二重 free になる（FilterSpec は by-value copy で ArrayList を共有）。
+    var spec = FilterSpec.init();
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, std.mem.trimEnd(u8, r.stdout, "\n")) });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_load_failed);
+}
+
+test "load_log with annotated tag resolves to commit (^{commit} peel, phase 3b #1 spec §8.3)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c1" });
+    // annotated tag（tag object → ^{commit} で commit へ peel）。
+    try repo.git(a, io, &.{ "git", "tag", "-a", "v1", "-m", "release" });
+    var spec = FilterSpec.init();
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "v1") });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expectEqual(@as(usize, 1), msg.log_loaded.entries.len); // c1 のみ
+    try std.testing.expect(msg.log_loaded.substrate != null);
+}
+
+test "load_log with branch + author composes (phase 3b #1)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var repo = try TmpRepo.init(a, io);
+    defer repo.deinit();
+    // c1 を author "alex" で作成（compose 実証のため・codex MAJOR）。
+    // ★--author=t は部分文字列 match のため 't' を含まない name/email にする（"other" は 't' を含むので不適）。
+    try repo.writeFile(io, "a.txt", "a\n");
+    try repo.git(a, io, &.{ "git", "add", "a.txt" });
+    try repo.git(a, io, &.{ "git", "-c", "user.name=alex", "-c", "user.email=a@a", "commit", "-q", "-m", "c1" });
+    // c2 をデフォルト author "t" で作成。
+    try repo.writeFile(io, "b.txt", "b\n");
+    try repo.git(a, io, &.{ "git", "add", "b.txt" });
+    try repo.git(a, io, &.{ "git", "commit", "-q", "-m", "c2" });
+    try repo.git(a, io, &.{ "git", "branch", "dev" }); // dev -> c2 (c1, c2 到達可能)
+    // branch=dev (c1,c2) + author=t → c1 は author 不一致で除外 → c2 のみ（compose 実証）。
+    var spec = FilterSpec.init();
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "dev") });
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    var msg = try runOwned(a, io, repo.cwd(), .{ .load_log = .{
+        .skip = 0, .max_count = 100, .generation = 1, .filter = spec,
+    } });
+    defer msg.deinit(a);
+    try std.testing.expect(msg == .log_loaded);
+    try std.testing.expectEqual(@as(usize, 1), msg.log_loaded.entries.len); // c2 のみ（c1 は author 除外）
+    try std.testing.expectEqualStrings("c2", msg.log_loaded.entries[0].subject);
+    try std.testing.expect(msg.log_loaded.substrate != null);
 }
 
 test "load_log with empty filter returns LogLoaded with null substrate (phase 3b #2)" {

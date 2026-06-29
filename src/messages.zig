@@ -85,11 +85,13 @@ pub const Msg = union(enum) {
         request_generation: u64,
     };
     pub const ApplyFilter = struct {
+        branch: ?[]u8 = null, // ★phase 3b #1: branch/revspec（空なら null・default で既存リテラル省略可）
         author: ?[]u8,
         since: ?[]u8,
         until: ?[]u8,
         paths: [][]u8,
         pub fn deinit(self: *ApplyFilter, a: std.mem.Allocator) void {
+            if (self.branch) |x| a.free(x); // ★phase 3b #1
             if (self.author) |x| a.free(x);
             if (self.since) |x| a.free(x);
             if (self.until) |x| a.free(x);
@@ -557,6 +559,18 @@ test "Msg.apply_filter (ApplyFilter) deinit with nulls and empty paths" {
         .since = null,
         .until = null,
         .paths = empty_paths,
+    } };
+    msg.deinit(a);
+}
+
+test "Msg.apply_filter (ApplyFilter) deinit frees branch field (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, "dev"),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
     } };
     msg.deinit(a);
 }

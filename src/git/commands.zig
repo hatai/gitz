@@ -256,6 +256,28 @@ pub fn revParseHeadArgv() []const []const u8 {
     return &.{ "git", "rev-parse", "--verify", "HEAD" };
 }
 
+/// `git rev-parse --verify --end-of-options <rev>^{commit}` argv（branch/revspec 解決用・phase 3b #1）。
+/// ★--end-of-options: 先頭 `-` の入力を option ではなく revspec として扱い injection を防ぐ（真の安全境界・実証済み）。
+/// ★^{commit}: blob/tree hash を弾き commit のみ受理（peel 失敗は exit≠0 → null・実証済み）。
+/// revspec から "<rev>^{commit}" を生成し owned へ追跡（logArgv の --author 文字列と同型・OwnedArgv.deinit が free・二重 free 無し）。
+pub fn revParseVerifyArgv(a: std.mem.Allocator, revspec: []const u8) !OwnedArgv {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(a);
+    var owned: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (owned.items) |s| a.free(s);
+        owned.deinit(a);
+    }
+    try list.appendSlice(a, &.{ "git", "rev-parse", "--verify", "--end-of-options" });
+    const rev_with_peel = std.fmt.allocPrint(a, "{s}^{{commit}}", .{revspec}) catch return error.OutOfMemory;
+    owned.append(a, rev_with_peel) catch {
+        a.free(rev_with_peel);
+        return error.OutOfMemory;
+    };
+    try list.append(a, rev_with_peel);
+    return .{ .args = try list.toOwnedSlice(a), .owned = owned };
+}
+
 /// `git rev-list --topo-order --parents <snapshot_tip>` argv（phase 3b #2 graph 投影用 substrate）。
 /// 全履歴の hash + 実 parents を取得（フィルタ無し）。snapshot_tip は借用（logArgv と同型・owned に入れない）。
 pub fn revListParentsArgv(a: std.mem.Allocator, snapshot_tip: []const u8) !OwnedArgv {
@@ -270,6 +292,18 @@ pub fn revListParentsArgv(a: std.mem.Allocator, snapshot_tip: []const u8) !Owned
 /// headState が .ok のときだけ呼ぶことを前提（.unborn/.err は呼出元で処理済み）。
 pub fn revParseHead(a: std.mem.Allocator, io: std.Io, cwd: Cwd) !?[]u8 {
     var res = try process.run(a, io, revParseHeadArgv(), cwd);
+    defer res.deinit(a);
+    if (res.exit_code != 0) return null;
+    const trimmed = std.mem.trimEnd(u8, res.stdout, "\n");
+    return try a.dupe(u8, trimmed);
+}
+
+/// revspec を commit hash へ解決（呼出側 free）。exit≠0（不明 branch/rev・blob/tree・peel 失敗）は null。
+/// ★phase 3b #1: branch フィルタの snapshot_tip 解決に使用（revParseHead の汎化版）。
+pub fn revParseVerify(a: std.mem.Allocator, io: std.Io, cwd: Cwd, revspec: []const u8) !?[]u8 {
+    var argv = try revParseVerifyArgv(a, revspec);
+    defer argv.deinit(a);
+    var res = try process.run(a, io, argv.args, cwd);
     defer res.deinit(a);
     if (res.exit_code != 0) return null;
     const trimmed = std.mem.trimEnd(u8, res.stdout, "\n");
@@ -572,6 +606,27 @@ test "revParseHeadArgv returns git rev-parse --verify HEAD" {
     try std.testing.expectEqualStrings("HEAD", argv[3]);
 }
 
+test "revParseVerifyArgv: git rev-parse --verify --end-of-options <rev>^{commit} (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var argv = try revParseVerifyArgv(a, "dev");
+    defer argv.deinit(a);
+    try std.testing.expectEqual(@as(usize, 5), argv.args.len);
+    try std.testing.expectEqualStrings("git", argv.args[0]);
+    try std.testing.expectEqualStrings("rev-parse", argv.args[1]);
+    try std.testing.expectEqualStrings("--verify", argv.args[2]);
+    try std.testing.expectEqualStrings("--end-of-options", argv.args[3]);
+    try std.testing.expectEqualStrings("dev^{commit}", argv.args[4]);
+    try std.testing.expectEqual(@as(usize, 1), argv.owned.items.len);
+    try std.testing.expectEqualStrings("dev^{commit}", argv.owned.items[0]);
+}
+
+test "revParseVerifyArgv: UTF-8 revspec preserved in peel suffix" {
+    const a = std.testing.allocator;
+    var argv = try revParseVerifyArgv(a, "feature/日本語");
+    defer argv.deinit(a);
+    try std.testing.expectEqualStrings("feature/日本語^{commit}", argv.args[4]);
+}
+
 test "revListParentsArgv: git rev-list --topo-order --parents <snapshot_tip> (phase 3b #2)" {
     const a = std.testing.allocator;
     var argv = try revListParentsArgv(a, "snap9999");
@@ -746,6 +801,37 @@ test "logArgv: --fixed-strings only when author present" {
         if (std.mem.eql(u8, arg, "--fixed-strings")) has_fixed = true;
     }
     try std.testing.expect(!has_fixed);
+}
+
+test "logArgv: branch condition does not leak into argv (revision-side only, phase 3b #1)" {
+    // ★B3 解法の核心不変条件: branch は runLogInt が snapshot_tip 解決に消費し、logArgv の argv へは
+    //   一切出ない（--branches も branch 文字列も無い）。paths 等の他フィルタは従来通り argv 末尾へ。
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "dev") });
+    const paths = try a.alloc([]u8, 1);
+    paths[0] = try a.dupe(u8, "src/");
+    try spec.addCondition(a, .{ .paths = paths });
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var has_branch_leak = false;
+    for (argv.args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--branches")) has_branch_leak = true;
+        if (std.mem.eql(u8, arg, "dev")) has_branch_leak = true;
+    }
+    try std.testing.expect(!has_branch_leak);
+    // paths は snapshot_tip の後の -- 以降へ（author/date と compose 可能）。
+    var snapshot_idx: ?usize = null;
+    var dd_idx: ?usize = null;
+    for (argv.args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "snap1234")) snapshot_idx = i;
+        if (std.mem.eql(u8, arg, "--")) dd_idx = i;
+    }
+    try std.testing.expect(snapshot_idx != null);
+    try std.testing.expect(dd_idx != null);
+    try std.testing.expect(snapshot_idx.? < dd_idx.?);
+    try std.testing.expectEqualStrings("src/", argv.args[dd_idx.? + 1]);
 }
 
 test {

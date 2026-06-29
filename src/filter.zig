@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const max_author_runes: usize = 256;
+pub const max_branch_runes: usize = 256; // ★phase 3b #1: branch/revspec
 pub const max_date_runes: usize = 16;
 pub const max_path_runes: usize = 1024;
 pub const max_path_count: usize = 16;
@@ -12,6 +13,7 @@ pub const Error = error{ AuthorTooLong, OutOfMemory };
 
 pub const FilterCondition = union(enum) {
     author: []u8,
+    branch: []u8, // ★phase 3b #1: branch/revspec（runLogInt が snapshot_tip 解決に使用・logArgv は無視）
     since: []u8,
     until: []u8,
     paths: [][]u8,
@@ -60,6 +62,14 @@ pub const FilterSpec = struct {
     pub fn getAuthor(self: FilterSpec) ?[]const u8 {
         for (self.conditions.items) |c| switch (c) {
             .author => |t| return t,
+            else => {},
+        };
+        return null;
+    }
+
+    pub fn getBranch(self: FilterSpec) ?[]const u8 {
+        for (self.conditions.items) |c| switch (c) {
+            .branch => |t| return t,
             else => {},
         };
         return null;
@@ -118,7 +128,7 @@ pub const FilterSpec = struct {
 
 fn deinitCondition(a: std.mem.Allocator, cond: FilterCondition) void {
     switch (cond) {
-        .author, .since, .until => |t| a.free(t),
+        .author, .branch, .since, .until => |t| a.free(t),
         .paths => |list| {
             for (list) |p| a.free(p);
             a.free(list);
@@ -129,6 +139,7 @@ fn deinitCondition(a: std.mem.Allocator, cond: FilterCondition) void {
 fn cloneCondition(a: std.mem.Allocator, cond: FilterCondition) std.mem.Allocator.Error!FilterCondition {
     return switch (cond) {
         .author => |t| .{ .author = try a.dupe(u8, t) },
+        .branch => |t| .{ .branch = try a.dupe(u8, t) },
         .since => |t| .{ .since = try a.dupe(u8, t) },
         .until => |t| .{ .until = try a.dupe(u8, t) },
         .paths => |list| blk: {
@@ -151,6 +162,7 @@ fn conditionEql(a_cond: FilterCondition, b_cond: FilterCondition) bool {
     if (std.meta.activeTag(a_cond) != std.meta.activeTag(b_cond)) return false;
     return switch (a_cond) {
         .author => |t| std.mem.eql(u8, t, b_cond.author),
+        .branch => |t| std.mem.eql(u8, t, b_cond.branch),
         .since => |t| std.mem.eql(u8, t, b_cond.since),
         .until => |t| std.mem.eql(u8, t, b_cond.until),
         .paths => |list| blk: {
@@ -393,6 +405,70 @@ test "FilterSpec: accessor 群 (getAuthor/getSince/getUntil/getPaths) borrow (m3
 
 test "FilterSpec: max_author_runes constant preserved" {
     try std.testing.expectEqual(@as(usize, 256), max_author_runes);
+}
+
+test "FilterSpec: branch variant addCondition/getBranch/clone/eql/deinit (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try std.testing.expectEqual(@as(?[]const u8, null), spec.getBranch());
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "dev") });
+    try std.testing.expect(!spec.isEmpty());
+    try std.testing.expectEqualStrings("dev", spec.getBranch().?);
+    var cloned = try spec.clone(a);
+    defer cloned.deinit(a);
+    try std.testing.expect(spec.eql(cloned));
+    try std.testing.expectEqualStrings("dev", cloned.getBranch().?);
+    try std.testing.expect(spec.getBranch().?.ptr != cloned.getBranch().?.ptr);
+    spec.removeVariant(a, .branch);
+    try std.testing.expectEqual(@as(?[]const u8, null), spec.getBranch());
+    try std.testing.expect(spec.isEmpty());
+}
+
+test "FilterSpec: duplicate branch overwrites (codex m1)" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "dev") });
+    try std.testing.expectEqual(@as(usize, 1), spec.conditions.items.len);
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "main") });
+    try std.testing.expectEqual(@as(usize, 1), spec.conditions.items.len);
+    try std.testing.expectEqualStrings("main", spec.getBranch().?);
+}
+
+test "FilterSpec: branch + author + paths multi-variant clone no leak (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "dev") });
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "foo") });
+    const paths = try a.alloc([]u8, 1);
+    paths[0] = try a.dupe(u8, "src/");
+    try spec.addCondition(a, .{ .paths = paths });
+    var cloned = try spec.clone(a);
+    defer cloned.deinit(a);
+    try std.testing.expect(spec.eql(cloned));
+    try std.testing.expectEqualStrings("dev", cloned.getBranch().?);
+    try std.testing.expectEqualStrings("foo", cloned.getAuthor().?);
+    try std.testing.expectEqual(@as(usize, 1), cloned.getPaths().len);
+}
+
+test "FilterSpec: max_branch_runes constant preserved" {
+    try std.testing.expectEqual(@as(usize, 256), max_branch_runes);
+}
+
+test "FilterSpec: addCondition branch OOM frees payload (M3, phase 3b #1)" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, addConditionBranchOomHelper, .{});
+}
+
+fn addConditionBranchOomHelper(a: std.mem.Allocator) !void {
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .author = try a.dupe(u8, "first") });
+    const branch = try a.dupe(u8, "dev");
+    spec.addCondition(a, .{ .branch = branch }) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
 }
 
 test "FilterSpec: UTF-8 author preserved through clone" {

@@ -763,6 +763,24 @@ fn handleApplyFilter(model: *Model, af: Msg.ApplyFilter) !AppCmd {
             }
         }
     }
+    if (af.branch) |text| {
+        if (text.len > 0) {
+            // ★codex MAJOR: argv builder（revParseVerifyArgv の --end-of-options）が真の安全境界だが、
+            //   ここで弾いて「分かりやすい日本語エラー」を先に出す（defense in depth・UX 層）。
+            if (text[0] == '-') {
+                try model.setLogLoadError("ブランチ/リビジョン名が不正です（先頭に - は使えません）");
+                return .none;
+            }
+            const count = std.unicode.utf8CountCodepoints(text) catch {
+                try model.setLogLoadError("ブランチ/リビジョン名が長すぎます（256 Unicode scalar まで）");
+                return .none;
+            };
+            if (count > filter_mod.max_branch_runes) {
+                try model.setLogLoadError("ブランチ/リビジョン名が長すぎます（256 Unicode scalar まで）");
+                return .none;
+            }
+        }
+    }
     if (af.since) |text| {
         if (text.len > 0) {
             _ = filter_mod.parseDate(text) catch {
@@ -808,6 +826,11 @@ fn handleApplyFilter(model: *Model, af: Msg.ApplyFilter) !AppCmd {
     if (af.author) |text| {
         if (text.len > 0) {
             try new_spec.addCondition(a, .{ .author = try a.dupe(u8, text) });
+        }
+    }
+    if (af.branch) |text| {
+        if (text.len > 0) {
+            try new_spec.addCondition(a, .{ .branch = try a.dupe(u8, text) });
         }
     }
     if (af.since) |text| {
@@ -890,15 +913,23 @@ fn handleCloseFilterModal(model: *Model) !AppCmd {
     return .none;
 }
 
-/// §4.3: `filter_focus_next` arm。u2 wrapping add で 3→0 へ。
+/// phase 3b #1: フィルタモーダルの欄数（Branch/Author/Since/Until/Path = 5）。
+/// u3（0-4）の wrap 上限。`+%= 1` は u2 専用（u3 では wrap しない）なので明示的 bound を使う。
+const filter_field_count: u3 = 5;
+
+/// §4.3: `filter_focus_next` arm。明示的 bound で 4→0 へ wrap（u3・codex §4.1）。
 fn handleFilterFocusNext(model: *Model) !AppCmd {
-    model.filter_modal_focus +%= 1;
+    model.filter_modal_focus =
+        if (model.filter_modal_focus == filter_field_count - 1) 0
+        else model.filter_modal_focus + 1;
     return .none;
 }
 
-/// §4.3: `filter_focus_prev` arm。0→3 へ wrap。
+/// §4.3: `filter_focus_prev` arm。0→4 へ wrap。
 fn handleFilterFocusPrev(model: *Model) !AppCmd {
-    model.filter_modal_focus = if (model.filter_modal_focus == 0) 3 else model.filter_modal_focus - 1;
+    model.filter_modal_focus =
+        if (model.filter_modal_focus == 0) filter_field_count - 1
+        else model.filter_modal_focus - 1;
     return .none;
 }
 
@@ -3652,24 +3683,24 @@ test "apply_filter: UnterminatedQuote sets log_load_error" {
     try std.testing.expect(m.log_load_error.len > 0);
 }
 
-test "filter_focus_next: wraps 3→0 (m2)" {
+test "filter_focus_next: wraps 4→0 (u3, 5 fields, phase 3b #1)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 0);
     defer m.deinit();
-    m.filter_modal_focus = 3;
+    m.filter_modal_focus = 4;
     var cmd = try update(&m, .filter_focus_next);
     defer cmd.deinit(a);
-    try std.testing.expectEqual(@as(u2, 0), m.filter_modal_focus);
+    try std.testing.expectEqual(@as(u3, 0), m.filter_modal_focus);
 }
 
-test "filter_focus_prev: wraps 0→3" {
+test "filter_focus_prev: wraps 0→4 (phase 3b #1)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 0);
     defer m.deinit();
     m.filter_modal_focus = 0;
     var cmd = try update(&m, .filter_focus_prev);
     defer cmd.deinit(a);
-    try std.testing.expectEqual(@as(u2, 3), m.filter_modal_focus);
+    try std.testing.expectEqual(@as(u3, 4), m.filter_modal_focus);
 }
 
 test "open_filter_modal: resets focus to 0 (§4.4)" {
@@ -3680,7 +3711,88 @@ test "open_filter_modal: resets focus to 0 (§4.4)" {
     var cmd = try update(&m, .open_filter_modal);
     defer cmd.deinit(a);
     try std.testing.expect(m.filter_modal_open);
-    try std.testing.expectEqual(@as(u2, 0), m.filter_modal_focus);
+    try std.testing.expectEqual(@as(u3, 0), m.filter_modal_focus);
+}
+
+test "apply_filter: branch only validates and stores (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, "dev"),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expectEqualStrings("dev", m.filter_state.getBranch().?);
+    try std.testing.expect(cmd == .load_log);
+}
+
+test "apply_filter: branch leading dash rejected (phase 3b #1 §3.4)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.filter_modal_open = true; // 実運用では open_filter_modal で true 済みの状態で apply
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, "-all"),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(m.filter_state.isEmpty());
+    try std.testing.expect(cmd == .none);
+    try std.testing.expect(m.filter_modal_open); // モーダル維持
+    try std.testing.expect(std.mem.indexOf(u8, m.log_load_error, "先頭に - は使えません") != null);
+}
+
+test "apply_filter: branch too long rejected (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    m.filter_modal_open = true;
+    const long = try a.alloc(u8, 257);
+    defer a.free(long);
+    @memset(long, 'x');
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, long),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expect(m.filter_state.isEmpty());
+    try std.testing.expect(cmd == .none);
+    try std.testing.expect(std.mem.indexOf(u8, m.log_load_error, "長すぎます") != null);
+}
+
+test "apply_filter: branch empty normalizes to no branch condition (phase 3b #1)" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    var msg = Msg{ .apply_filter = .{
+        .branch = try a.dupe(u8, ""),
+        .author = null,
+        .since = null,
+        .until = null,
+        .paths = try a.alloc([]u8, 0),
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, msg);
+    defer cmd.deinit(a);
+    try std.testing.expectEqual(@as(?[]const u8, null), m.filter_state.getBranch());
+    try std.testing.expect(m.filter_state.isEmpty());
+    try std.testing.expect(cmd == .load_log); // 空 filter → 全件 reload (HEAD)
 }
 
 test "apply_filter: addCondition OOM no payload leak (M3)" {

@@ -74,7 +74,7 @@ pub const Model = struct {
     // --- TODO 2 phase 3a/3b: filter UI state ---
     filter_state: FilterSpec,
     filter_modal_open: bool,
-    filter_modal_focus: u2,
+    filter_modal_focus: u3,
     log_load_error: []u8,
 
     pub fn init(a: std.mem.Allocator, repo_root: []const u8) !Model {
@@ -1010,7 +1010,7 @@ test "Model.setFilterState swaps and frees old (transactional)" {
 test "Model.filter_modal_focus initializes to 0" {
     var m = try Model.init(std.testing.allocator, "/r");
     defer m.deinit();
-    try std.testing.expectEqual(@as(u2, 0), m.filter_modal_focus);
+    try std.testing.expectEqual(@as(u3, 0), m.filter_modal_focus);
 }
 
 test "Model.setLogLoadError replaces and frees old" {
