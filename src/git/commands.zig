@@ -803,6 +803,37 @@ test "logArgv: --fixed-strings only when author present" {
     try std.testing.expect(!has_fixed);
 }
 
+test "logArgv: branch condition does not leak into argv (revision-side only, phase 3b #1)" {
+    // ★B3 解法の核心不変条件: branch は runLogInt が snapshot_tip 解決に消費し、logArgv の argv へは
+    //   一切出ない（--branches も branch 文字列も無い）。paths 等の他フィルタは従来通り argv 末尾へ。
+    const a = std.testing.allocator;
+    var spec = FilterSpec.init();
+    defer spec.deinit(a);
+    try spec.addCondition(a, .{ .branch = try a.dupe(u8, "dev") });
+    const paths = try a.alloc([]u8, 1);
+    paths[0] = try a.dupe(u8, "src/");
+    try spec.addCondition(a, .{ .paths = paths });
+    var argv = try logArgv(a, 0, 100, "snap1234", spec);
+    defer argv.deinit(a);
+    var has_branch_leak = false;
+    for (argv.args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--branches")) has_branch_leak = true;
+        if (std.mem.eql(u8, arg, "dev")) has_branch_leak = true;
+    }
+    try std.testing.expect(!has_branch_leak);
+    // paths は snapshot_tip の後の -- 以降へ（author/date と compose 可能）。
+    var snapshot_idx: ?usize = null;
+    var dd_idx: ?usize = null;
+    for (argv.args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "snap1234")) snapshot_idx = i;
+        if (std.mem.eql(u8, arg, "--")) dd_idx = i;
+    }
+    try std.testing.expect(snapshot_idx != null);
+    try std.testing.expect(dd_idx != null);
+    try std.testing.expect(snapshot_idx.? < dd_idx.?);
+    try std.testing.expectEqualStrings("src/", argv.args[dd_idx.? + 1]);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
