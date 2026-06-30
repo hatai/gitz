@@ -73,7 +73,7 @@ Phase 1（低リスク局所最適化）完了後の計測。`bench/report-befor
 - [x] 所有権規約不改変（Msg/AppCmd ペイロード複製所有・move semantics は Phase 2）
 - [x] after 計測で spec §2.4 Phase 1 exit gate 達成
 - [x] `zig build bench` 動作（Debug + ReleaseFast）
-- [ ] tmux pty で描画崩れなし（手動検証・Task 10 Step 4 review で確認）
+- [x] tmux pty（120x42）で描画崩れなし: wide-branches（グラフセル `│●` 整列）・long-subject-refs（East Asian Width truncation 正常）を確認
 - [ ] whole-branch review 合格・main へ no-ff マージ（user 確認後）
 
 ## Phase 2/3 への引き継ぎ（Phase 1 完了後）
