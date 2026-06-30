@@ -9,11 +9,29 @@ const log = @import("git/log.zig");
 const show = @import("git/show.zig");
 const topology = @import("git/topology.zig");
 const msgs = @import("messages.zig");
+const config = @import("config.zig");
 const Msg = msgs.Msg;
 const AppCmd = msgs.AppCmd;
 const FilterSpec = msgs.FilterSpec;
 
 const Cwd = process.Cwd;
+
+/// substrate（`rev-list --parents`）stdout 上限。perf phase1/§5.5・codex B2/B3。
+/// 既定 64MiB（10万コミット・≈15-18MiB 出力の余裕）。env `GIT_TUI_SUBSTRATE_LIMIT`（MiB）
+/// で上書き。`std.process.getEnvVar` は非存在のため、main 起動時に `init.environ_map.get`
+/// で取得し `setSubstrateLimit` へ注入（テストは既定値を使用）。
+var substrate_limit: std.Io.Limit = .limited(64 * 1024 * 1024);
+
+/// env 値（MiB・?[]const u8）から std.Io.Limit への純粋変換（config.parseLimitValue 使用）。
+pub fn substrateLimit(env_value: ?[]const u8) std.Io.Limit {
+    const mib = config.parseLimitValue(env_value, 64);
+    return .limited(mib * 1024 * 1024);
+}
+
+/// main 起動時に env 反映済みの limit を設定（以降の runLogInt/fetchSubstrate で使用）。
+pub fn setSubstrateLimit(limit: std.Io.Limit) void {
+    substrate_limit = limit;
+}
 
 /// AppCmd を実行し、結果 Msg を返す（呼び出し側が Msg を deinit）。
 pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
@@ -106,8 +124,8 @@ pub fn run(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
         // --- TODO 2 phase 1: log/detail 副作用コマンド ---
         // load_log は headState tri-state を取る（unborn/err 対応）。load_log_page は tip 固定で
         // bad revision 検出を行うため runLogPageInt へ分離（H-06/H-07/M-12）。
-        .load_log => |c| return runLogInt(a, io, cwd, c, process.default_stream_limit),
-        .load_log_page => |c| return runLogPageInt(a, io, cwd, c, process.default_stream_limit),
+        .load_log => |c| return runLogInt(a, io, cwd, c, substrate_limit),
+        .load_log_page => |c| return runLogPageInt(a, io, cwd, c, substrate_limit),
         .load_commit_detail => |hash_req| {
             const argv = try cmds.showNameStatusArgv(a, hash_req);
             defer a.free(argv);
@@ -400,6 +418,18 @@ fn runOwned(a: std.mem.Allocator, io: std.Io, cwd: Cwd, cmd: AppCmd) !Msg {
     var c = cmd;
     defer c.deinit(a);
     return run(a, io, cwd, c);
+}
+
+test "substrateLimit: env 値を byte の Io.Limit へ（perf phase1/B2）" {
+    // 正常値: MiB → byte。
+    try std.testing.expectEqual(std.Io.Limit.limited(128 * 1024 * 1024), substrateLimit("128"));
+    try std.testing.expectEqual(std.Io.Limit.limited(1 * 1024 * 1024), substrateLimit("1"));
+    // null（env 未設定）・不正値・0 は既定 64MiB。
+    try std.testing.expectEqual(std.Io.Limit.limited(64 * 1024 * 1024), substrateLimit(null));
+    try std.testing.expectEqual(std.Io.Limit.limited(64 * 1024 * 1024), substrateLimit("abc"));
+    try std.testing.expectEqual(std.Io.Limit.limited(64 * 1024 * 1024), substrateLimit("0"));
+    // 前後空白は許容。
+    try std.testing.expectEqual(std.Io.Limit.limited(256 * 1024 * 1024), substrateLimit(" 256 "));
 }
 
 test "refresh_status on empty repo with one untracked file" {
