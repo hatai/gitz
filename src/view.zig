@@ -459,7 +459,9 @@ fn laneColor(lane: u16) zz.Color {
 /// 1 コミット分のグラフセルを ANSI 色付き文字列へ組み立てる（Task 9）。
 /// 各セルは接続情報（up/down/left/right/is_node）から box-drawing 文字を選び、
 /// レーン色（`laneColor`）で着色する。ノードは太字。`max_width` で列数をクランプ。
-fn renderGraphCells(a: std.mem.Allocator, row: graph_mod.GraphRow, max_width: u16) []const u8 {
+/// Phase 0 perf-tuning 計測用に pub 化（renderGraphCells の per-row alloc 負荷を bench から計測）。
+/// Task 7（M7）で cache handle 化される際に再整理。
+pub fn renderGraphCells(a: std.mem.Allocator, row: graph_mod.GraphRow, max_width: u16) []const u8 {
     if (max_width == 0) return "";
     var parts: std.ArrayList([]const u8) = .empty;
     const w: usize = @min(@as(usize, max_width), row.cells.len);
@@ -683,7 +685,8 @@ fn renderDetailDiff(model: *Model, ctx: *const zz.Context, height: u16) []const 
 ///   `joinHorizontal` 連結後に端末幅を超えてターミナルが行を折り返す。折り返しで各行が複数
 ///   物理行を占有し、フレーム全体が端末高を超えて上段がスクロールアウトする（実機で確認した
 ///   「上段が空白」の原因）。各行を幅に収めれば 1 論理行 = 1 物理行となり崩れない。
-fn fitPane(a: std.mem.Allocator, content: []const u8, r: Rect) []const u8 {
+/// Phase 0 perf-tuning 計渜用に pub 化（fitPane の East Asian Width/truncate 負荷を bench から計測）。
+pub fn fitPane(a: std.mem.Allocator, content: []const u8, r: Rect) []const u8 {
     // 高さクランプ: 先頭 r.h 行だけ残す（r.h==0 は 1 行に丸める）。
     const max_lines: usize = if (r.h == 0) 1 else r.h;
     var clamped = content;
