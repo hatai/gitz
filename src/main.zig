@@ -762,6 +762,8 @@ pub fn main(init: std.process.Init) !void {
     // 打ち切り、同一ポインタの二重 free を防ぐ（review Issue 1）。
     handed_off = true;
 
+    // perf phase1/M7: グラフセル ANSI render cache はグローバル（program と別寿命）・main 出口で解放。
+    defer viewmod.deinitGraphCellCache();
     try program.start();
     while (program.isRunning()) {
         try program.tick();

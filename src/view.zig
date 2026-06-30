@@ -451,35 +451,90 @@ fn laneColor(lane: u16) zz.Color {
     return LANE_COLORS[lane % LANE_COLORS.len];
 }
 
-/// 1 コミット分のグラフセルを ANSI 色付き文字列へ組み立てる（Task 9）。
-/// 各セルは接続情報（up/down/left/right/is_node）から box-drawing 文字を選び、
-/// レーン色（`laneColor`）で着色する。ノードは太字。`max_width` で列数をクランプ。
-/// Phase 0 perf-tuning 計測用に pub 化（renderGraphCells の per-row alloc 負荷を bench から計測）。
-/// Task 7（M7）で cache handle 化される際に再整理。
-pub fn renderGraphCells(a: std.mem.Allocator, row: graph_mod.GraphRow, max_width: u16) []const u8 {
+/// Phase 1 perf-tuning/M7: グラフセル ANSI render 結果のプロセス持続キャッシュ。
+/// 有限集合（6 色 × box 文字 8 種 × bold 2 値）の `style.render` 結果を格納し、
+/// セル描画をキャッシュ参照（alloc ゼロ）へ退化させる。使用 allocator を内部へ保持し、
+/// 別 allocator で deinit しないようガード。OOM で render/put 失敗時はキャッシュせず
+/// リテラルへフォールバック（キャッシュ値は常に所有文字列のみ）。
+pub const GraphCellCache = struct {
+    allocator: std.mem.Allocator,
+    map: std.AutoHashMap(Key, []const u8),
+
+    pub const Key = struct { fg: zz.Color, bold: bool, ch_index: u8 };
+
+    pub fn init(allocator: std.mem.Allocator) GraphCellCache {
+        return .{ .allocator = allocator, .map = .init(allocator) };
+    }
+    pub fn deinit(self: *GraphCellCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |v| self.allocator.free(v.*);
+        self.map.deinit();
+    }
+};
+
+var graph_cell_cache: ?GraphCellCache = null;
+
+/// グローバル cache を lazy 初期化（永続 allocator を内部保持）。以降の render で再利用。
+pub fn ensureGraphCellCache(persistent: std.mem.Allocator) *GraphCellCache {
+    if (graph_cell_cache == null) graph_cell_cache = GraphCellCache.init(persistent);
+    return &graph_cell_cache.?;
+}
+
+/// プロセス終了時に解放（main.zig の teardown で呼出）。
+pub fn deinitGraphCellCache() void {
+    if (graph_cell_cache) |*c| c.deinit();
+    graph_cell_cache = null;
+}
+
+/// テスト間リセット（std.testing.allocator のリーク検出と両立）。
+pub fn resetGraphCellCacheForTest() void {
+    if (graph_cell_cache) |*c| c.deinit();
+    graph_cell_cache = null;
+}
+
+const BOX_CHARS = [_][]const u8{ "●", "│", "╵", "╷", "─", "╴", "╶", " " };
+
+fn cellCharIndex(cell: graph_mod.Conn) u8 {
+    if (cell.is_node) return 0;
+    if (cell.up and cell.down) return 1;
+    if (cell.up and !cell.down) return 2;
+    if (!cell.up and cell.down) return 3;
+    if (cell.left and cell.right) return 4;
+    if (cell.left and !cell.right) return 5;
+    if (cell.right and !cell.left) return 6;
+    return 7; // 空空白
+}
+
+/// 1 コミット分のグラフセルを ANSI 色付き文字列へ組み立てる。
+/// perf phase1/M7: 各セルの `style.render` 結果を GraphCellCache で参照（2 回目以降 alloc ゼロ・
+/// 初回 miss のみ cache.allocator へ確保）。最後の join だけ frame arena `a` へ確保される。
+pub fn renderGraphCells(a: std.mem.Allocator, cache: *GraphCellCache, row: graph_mod.GraphRow, max_width: u16) []const u8 {
     if (max_width == 0) return "";
     var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(a); // perf phase1/M7: 本番は frame arena だが任意 allocator でもリークフリーに
     const w: usize = @min(@as(usize, max_width), row.cells.len);
     for (row.cells[0..w], 0..) |cell, i| {
         const lane: u16 = @intCast(i);
-        const ch: []const u8 = if (cell.is_node)
-            "●"
-        else if (cell.up and cell.down)
-            "│"
-        else if (cell.up and !cell.down)
-            "╵"
-        else if (!cell.up and cell.down)
-            "╷"
-        else if (cell.left and cell.right)
-            "─"
-        else if (cell.left and !cell.right)
-            "╴"
-        else if (cell.right and !cell.left)
-            "╶"
-        else
-            " ";
-        const style = zz.Style{ .foreground = laneColor(lane), .bold_attr = cell.is_node };
-        const styled = style.render(a, ch) catch ch;
+        const ch_index = cellCharIndex(cell);
+        const ch = BOX_CHARS[ch_index];
+        const fg = laneColor(lane);
+        const key = GraphCellCache.Key{ .fg = fg, .bold = cell.is_node, .ch_index = ch_index };
+        if (cache.map.get(key)) |cached| {
+            parts.append(a, cached) catch {};
+            continue;
+        }
+        const style = zz.Style{ .foreground = fg, .bold_attr = cell.is_node };
+        const styled = style.render(cache.allocator, ch) catch {
+            // render OOM: リテラルへフォールバック（キャッシュしない・所有権問題回避）。
+            parts.append(a, ch) catch {};
+            continue;
+        };
+        cache.map.put(key, styled) catch {
+            // put OOM: styled は孤立するので即解放しリテラルへフォールバック。
+            cache.allocator.free(styled);
+            parts.append(a, ch) catch {};
+            continue;
+        };
         parts.append(a, styled) catch {};
     }
     return std.mem.join(a, "", parts.items) catch "";
@@ -549,7 +604,9 @@ fn renderLog(model: *Model, ctx: *const zz.Context, height: u16, pane_w: u16) []
         var parts: std.ArrayList([]const u8) = .empty;
         // グラフセル（グラフが有効かつペイン幅 >= 30 のとき先頭に描く）
         if (show_graph and graph_rows != null and i < graph_rows.?.len) {
-            const graph_str = renderGraphCells(a, graph_rows.?[i], 20);
+            // perf phase1/M7: 永続 GraphCellCache で ANSI render 結果をキャッシュ。
+            const cache = ensureGraphCellCache(ctx.persistent_allocator);
+            const graph_str = renderGraphCells(a, cache, graph_rows.?[i], 20);
             parts.append(a, graph_str) catch {};
             parts.append(a, " ") catch {};
         }
@@ -821,6 +878,42 @@ test "ensureVisible: 結果は常に selected 以下（perf phase1/§5.2・clamp
         const r = ensureVisible(case[0], case[1], case[2]);
         try std.testing.expect(r <= case[1]);
     }
+}
+
+test "GraphCellCache: renderGraphCells 2 回目は cache hit で要素数不変（perf phase1/M7）" {
+    const a = std.testing.allocator;
+    var cache = GraphCellCache.init(a);
+    defer cache.deinit();
+    // node / vertical / horizontal の3セル。
+    var cells = [_]graph_mod.Conn{
+        .{ .is_node = true },
+        .{ .up = true, .down = true },
+        .{ .left = true, .right = true },
+    };
+    const row = graph_mod.GraphRow{ .node_lane = 0, .cells = &cells };
+    // 1 回目: 全 (fg,bold,ch) が miss → cache へ格納。
+    const out1 = renderGraphCells(a, &cache, row, 3);
+    defer a.free(out1);
+    try std.testing.expect(out1.len > 0);
+    const count_after_1 = cache.map.count();
+    try std.testing.expect(count_after_1 > 0);
+    // 2 回目: 同セル構成 → 全て cache hit・map 要素数は不変（新規確保無し）。
+    const out2 = renderGraphCells(a, &cache, row, 3);
+    defer a.free(out2);
+    try std.testing.expectEqual(count_after_1, cache.map.count());
+    // 出力は等価（セル内容・順序が同一）。
+    try std.testing.expectEqualStrings(out1, out2);
+}
+
+test "GraphCellCache: max_width=0 は空文字列・キャッシュ汚染なし（perf phase1/M7）" {
+    const a = std.testing.allocator;
+    var cache = GraphCellCache.init(a);
+    defer cache.deinit();
+    var cells = [_]graph_mod.Conn{.{ .is_node = true }};
+    const row = graph_mod.GraphRow{ .node_lane = 0, .cells = &cells };
+    const out = renderGraphCells(a, &cache, row, 0);
+    try std.testing.expectEqualStrings("", out);
+    try std.testing.expectEqual(@as(u32, 0), cache.map.count());
 }
 
 test "layout splits width 40/60 and reserves commit+status rows" {

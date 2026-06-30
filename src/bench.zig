@@ -248,9 +248,12 @@ fn benchView(gpa: std.mem.Allocator, io: std.Io, commits: []const log.Commit) ?F
     defer arena.deinit();
     var ca = CountingAlloc.init(arena.allocator());
     const a = ca.allocator();
+    // perf phase1/M7: renderGraphCells は GraphCellCache handle 必須。bench は局所 cache を使用。
+    var cache = viewmod.GraphCellCache.init(arena.allocator());
+    defer cache.deinit();
     const t0 = nowNs(io);
     for (win) |row| {
-        _ = viewmod.renderGraphCells(a, row, 40);
+        _ = viewmod.renderGraphCells(a, &cache, row, 40);
     }
     _ = viewmod.fitPane(a, sample, .{ .x = 0, .y = 0, .w = 80, .h = 40 });
     const t1 = nowNs(io);
