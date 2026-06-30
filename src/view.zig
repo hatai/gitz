@@ -308,20 +308,15 @@ fn renderDiff(model: *Model, ctx: *const zz.Context, height: u16) []const u8 {
 
     const limit: usize = if (height == 0) 1 else height;
 
-    // 総行数。
-    var total_lines: usize = 0;
-    {
-        var cit = std.mem.splitScalar(u8, model.diff_text, '\n');
-        while (cit.next()) |_| total_lines += 1;
-    }
-
-    // focus==.diff のときカーソル行を可視範囲に収める（diff_scroll writer のうち renderDiff 側。
-    // もう一方は update.scroll_diff_down/up の行数クランプ。ensureVisible はカーソルが窓の外なら
-    // scroll を最小限ずらす（マウス当たり判定と一致）。
+    // perf phase1/§5.2: 総行数の事前カウント（splitScalar 全走査）を廃止し描画 1 回走査へ統合。
+    // scroll_off は total 無しで valid: reducer 不変条件（diff_scroll ∈ [0, total-1]・
+    // scroll_diff_down/up と diff_text 変更時の 0 リセットが維持）と、ensureVisible
+    // （cursor ∈ [0,total-1] なら結果も [0,total-1]）により既に [0,total-1] に収まる。
+    // 従って clampScroll(total) は冗長。残行数は描画ループで limit 到達時に break して捨てる。
     if (model.focus == .diff) {
         model.diff_scroll = ensureVisible(model.diff_scroll, model.diff_cursor, limit);
     }
-    const scroll_off = clampScroll(model.diff_scroll, total_lines);
+    const scroll_off = model.diff_scroll;
 
     // 選択レンジ（reducer の stage 対象と同一式 → 見えている選択 == stage 対象）。
     // ハイライトは anchor 非 null のときだけ（anchor==null は単一行 = カーソルマーカーのみ）。
@@ -803,6 +798,29 @@ test "clampScroll caps offset at total-1 and handles empty" {
     try std.testing.expectEqual(@as(usize, 3), clampScroll(3, 10)); // 範囲内は据え置き
     try std.testing.expectEqual(@as(usize, 9), clampScroll(100, 10)); // 超過は total-1 にクランプ
     try std.testing.expectEqual(@as(usize, 0), clampScroll(100, 1)); // 1 行なら先頭固定
+}
+
+test "ensureVisible: 結果は常に selected 以下（perf phase1/§5.2・clampScroll 削除の根拠）" {
+    // renderDiff の 1 回走査化で clampScroll(total) を廃止した。これが安全な根拠:
+    // cursor(=selected) ∈ [0, total-1] のとき ensureVisible の結果は常に [0, selected] ⊆ [0, total-1]。
+    // すなわち total を知らなくても scroll_off は valid 範囲に収まる。
+    // (a) selected < scroll → selected を返す（<= selected）
+    try std.testing.expectEqual(@as(usize, 2), ensureVisible(5, 2, 4));
+    try std.testing.expect(ensureVisible(5, 2, 4) <= 2);
+    // (b) selected >= scroll+visible → selected-visible+1 を返す（<= selected）
+    try std.testing.expectEqual(@as(usize, 7), ensureVisible(0, 10, 4));
+    try std.testing.expect(ensureVisible(0, 10, 4) <= 10);
+    // (c) 窓内 → scroll を返す（<= selected）
+    try std.testing.expectEqual(@as(usize, 3), ensureVisible(3, 4, 4));
+    try std.testing.expect(ensureVisible(3, 4, 4) <= 4);
+    // 代表値で result <= selected を検証（= total 無しでも valid）
+    for ([_]struct { usize, usize, usize }{
+        .{ 0, 0, 1 },   .{ 0, 99, 10 }, .{ 50, 50, 5 },
+        .{ 10, 5, 3 },  .{ 3, 9, 4 },   .{ 100, 100, 1 },
+    }) |case| {
+        const r = ensureVisible(case[0], case[1], case[2]);
+        try std.testing.expect(r <= case[1]);
+    }
 }
 
 test "layout splits width 40/60 and reserves commit+status rows" {
