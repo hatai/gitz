@@ -83,12 +83,20 @@ pub const GraphState = union(enum) {
     }
 };
 
-/// 初回（skip=0）/全再計算: 全コミットを一括で処理。
-pub fn computeAll(
+/// Phase 0 perf-tuning 計測用: `computeAllTracked` が各コミット処理後の frontier 幅
+/// (同時生存分岐数) の最大値を記録（codex m10）。本番 `computeAll` は `tracker = null`
+/// で計測オーバーヘッドなし。Phase 2 の SBO 上限設計資料。
+pub const FrontierTracker = struct {
+    max_frontier: usize = 0,
+};
+
+/// 計測付き全計算（`tracker` 非 null なら frontier 幅 max を記録）。
+pub fn computeAllTracked(
     a: std.mem.Allocator,
     commits: []const log.Commit,
     generation: u64,
     tip_hash: ?[]const u8,
+    tracker: ?*FrontierTracker,
 ) !GraphState {
     var rows: std.ArrayList(GraphRow) = .empty;
     errdefer {
@@ -102,6 +110,9 @@ pub fn computeAll(
         var row = try processCommit(a, &frontier, c);
         errdefer row.deinit(a);
         try rows.append(a, row);
+        if (tracker) |t| {
+            if (frontier.slots.items.len > t.max_frontier) t.max_frontier = frontier.slots.items.len;
+        }
     }
 
     const tip_owned: ?[]u8 = if (tip_hash) |t| try a.dupe(u8, t) else null;
@@ -114,6 +125,17 @@ pub fn computeAll(
         .rows = rows,
         .frontier = frontier,
     } };
+}
+
+/// 初回（skip=0）/全再計算: 全コミットを一括で処理。
+/// 計測不要経路（本番）・`computeAllTracked(..., null)` の薄い wrapper（API 互換・codex m10）。
+pub fn computeAll(
+    a: std.mem.Allocator,
+    commits: []const log.Commit,
+    generation: u64,
+    tip_hash: ?[]const u8,
+) !GraphState {
+    return computeAllTracked(a, commits, generation, tip_hash, null);
 }
 
 /// 増分: 入力 GraphState を消費（所有権移行）し、delta rows + 新 frontier を構築 → 新 state 返却。
@@ -504,6 +526,31 @@ test "computeAll: merge (D=merge(B,C), B←A, C←A)" {
 
     // Row 3 (A): lane 0 (compacted)
     try std.testing.expectEqual(@as(u16, 0), v.rows.items[3].node_lane);
+}
+
+test "computeAllTracked: frontier 幅 max を記録・null tracker は本番等価 (Phase 0 perf/m10)" {
+    const a = std.testing.allocator;
+    // merge: D=merge(B,C), B←A, C←A, A root。topo: D, C, B, A
+    var commits: [4]log.Commit = undefined;
+    commits[0] = try mkCommit(a, "D", &.{ "B", "C" });
+    commits[1] = try mkCommit(a, "C", &.{"A"});
+    commits[2] = try mkCommit(a, "B", &.{"A"});
+    commits[3] = try mkCommit(a, "A", &.{});
+    defer for (&commits) |*c| c.deinit(a);
+
+    // null tracker は本番 computeAll と等価（rows 4 件・計測オーバーヘッドなし）。
+    var gs_null = try computeAllTracked(a, &commits, 1, null, null);
+    defer gs_null.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), gs_null.valid.rows.items.len);
+
+    // tracker 付き: merge 履歴で frontier 幅 >= 2 を記録（D 処理後 B,C が生存）。
+    var tracker = FrontierTracker{};
+    var gs = try computeAllTracked(a, &commits, 1, null, &tracker);
+    defer gs.deinit(a);
+    try std.testing.expect(tracker.max_frontier >= 2);
+
+    // tracker は統計記録のみ・gs の内容は null 版と等価。
+    try std.testing.expectEqual(@as(usize, 4), gs.valid.rows.items.len);
 }
 
 test "computeAll: dense compaction removes interior holes (M-01)" {
