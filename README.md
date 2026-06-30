@@ -34,6 +34,10 @@ zig-out/bin/git-tui
 
 - `--no-mouse` : マウストラッキングを無効化する。
 
+環境変数:
+
+- `GIT_TUI_SUBSTRATE_LIMIT` : フィルタ活性時の graph 投影用 substrate（`git rev-list --parents`）stdout 上限を MiB 単位で指定（既定 64）。大規模リポジトリで `StreamTooLong` が出る場合に引き上げてください。不正値・0 以下は既定へフォールバックします。
+
 git リポジトリ外で起動した場合は、日本語のエラーメッセージを表示して終了コード 1 で終了します。
 
 ## テスト
@@ -43,6 +47,22 @@ zig build test
 # 詳細サマリ付き
 zig build test --summary all
 ```
+
+## ベンチマーク（パフォーマンス計測）
+
+主要フェンス（`topology.parse` / `graph.computeAll` / `graph_project.project` / `runLogInt` / `view.render` 系）の ms・alloc 数・peak heap を計測します。`bench/gen-history.sh` で大規模履歴を生成してから実行します（`bench/repos/` は git-ignore 対象）。
+
+```sh
+# 1000 コミット × 6 プロファイルを生成
+for p in linear wide-branches periodic-merge path-filter-sparse author-filter-sparse long-subject-refs; do
+  ./bench/gen-history.sh "$p" 1000 "bench/repos/$p-1000"
+done
+# Debug（correctness + alloc 数）と ReleaseFast（fps/latency）
+zig build bench
+zig build bench -Doptimize=ReleaseFast
+```
+
+結果は Markdown 表で stdout へ。基線レポートは `bench/report-before.md` を参照。
 
 ## 操作キー
 
