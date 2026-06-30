@@ -40,4 +40,25 @@ pub fn build(b: *std.Build) void {
     });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // Performance benchmark (Phase 0 perf-tuning). Debug 既定・-Doptimize=ReleaseFast で配布相当。
+    // codex M4 反映: view.render 系計測（renderDiff/renderGraphCells/fitPane）のため zigzag import 必須。
+    const bench_exe = b.addExecutable(.{
+        .name = "git-tui-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigzag", .module = zigzag_mod },
+            },
+        }),
+    });
+    b.installArtifact(bench_exe);
+
+    const bench_cmd = b.addRunArtifact(bench_exe);
+    bench_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| bench_cmd.addArgs(args);
+    const bench_step = b.step("bench", "Run performance benchmarks (Phase 0 perf-tuning)");
+    bench_step.dependOn(&bench_cmd.step);
 }
