@@ -42,14 +42,19 @@ pub fn project(
     }
     for (visible) |c| {
         const proj = try projectedParents(a, substrate, visible_set, &memo, c.hash);
+        // perf phase1/M8: mkDerived 成功時に proj を consume するので、失敗時のみ proj を解放。
+        // proj_consumed フラグで disarm（二重 free 回避）。
+        var proj_consumed = false;
         defer {
-            for (proj) |p| a.free(p);
-            a.free(proj);
+            if (!proj_consumed) {
+                for (proj) |p| a.free(p);
+                a.free(proj);
+            }
         }
         var derived = try mkDerived(a, c.hash, proj);
-        // mkDerived 成功後、out.append が OOM でバッファ成長に失敗すると derived が
-        // out.items 未登録のまま孤立しリークする。一旦変数へ取り errdefer で保護する
-        // （log.zig:84-91 / topology.zig の所有権管理と同型）。deinit は *Commit を取るので var。
+        // mkDerived 成功 → proj は derived.parents へ移譲済み。以降の失敗（out.append OOM）時は
+        // derived.deinit が proj 含む全フィールドを解放するので proj 側 defer は disarm。
+        proj_consumed = true;
         errdefer derived.deinit(a);
         try out.append(a, derived);
     }
@@ -139,21 +144,13 @@ fn nearestVisibleAncestor(
     return result;
 }
 
-/// derived log.Commit を構築（hash/parents のみ実値・他は空）。proj（所有 slice）を消費して parents へ。
+/// derived log.Commit を構築（hash/parents のみ実値・他は空）。
+/// perf phase1/M8: `proj`（projectedParents が dupe 済みの所有 parents slice）を
+/// **消費**して derived.parents へ（dupe しない・二重コピー廃止）。
+/// 所有権: 成功時 proj は derived へ移譲（呼出側は proj を解放しない）。
+/// 失敗時は fallible な dupe を proj より前に全て行うため proj は未触→呼出側が解放。
 fn mkDerived(a: std.mem.Allocator, hash: []const u8, proj: [][]u8) std.mem.Allocator.Error!log.Commit {
-    // proj を所有 slice のまま parents へ（dupe 済み）。但し errdefer 整合のため新 slice へ移す必要は無い:
-    // proj は projectedParents の所有物。ここで所有権を derived へ移譲。呼出側で proj deinit されるので
-    // 新バッファへコピーして derived が独立所有する（proj は呼出側で free されるため二重管理を避ける）。
-    const parents = try a.alloc([]u8, proj.len);
-    var pinit: usize = 0;
-    errdefer {
-        for (parents[0..pinit]) |p| a.free(p);
-        a.free(parents);
-    }
-    for (proj, 0..) |p, i| {
-        parents[i] = try a.dupe(u8, p);
-        pinit = i + 1;
-    }
+    // まず fallible な dupe を全て（proj は触らない・失敗時は呼出側の defer が proj を解放）。
     const h = try a.dupe(u8, hash);
     errdefer a.free(h);
     const author = try a.dupe(u8, "");
@@ -162,9 +159,10 @@ fn mkDerived(a: std.mem.Allocator, hash: []const u8, proj: [][]u8) std.mem.Alloc
     errdefer a.free(subject);
     const refs = try a.dupe(u8, "");
     errdefer a.free(refs);
+    // ここから infallible: proj の所有権を derived.parents へ移譲（dupe 無し・M8）。
     return .{
         .hash = h,
-        .parents = parents,
+        .parents = proj,
         .author = author,
         .epoch_sec = 0,
         .subject = subject,
