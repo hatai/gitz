@@ -32,7 +32,8 @@ init_repo() {
 extract() {
     git -C "$OUT" rev-list --topo-order --parents HEAD > "$OUT/substrate.txt"
     # %H hash, %P parents (space), %an author name, %at author epoch, %s subject, %d refs
-    git -C "$OUT" log --pretty=format:'%H%x00%P%x00%an%x00%at%x00%s%x00%d' -z --decorate=short --no-color --max-count="$COUNT" > "$OUT/log.txt"
+    # --topo-order は本番 commands.zig:93 logArgv と一致させるため（codex review Important）。
+    git -C "$OUT" -c core.quotePath=false log --topo-order --pretty=format:'%H%x00%P%x00%an%x00%at%x00%s%x00%d' -z --decorate=short --no-color --max-count="$COUNT" > "$OUT/log.txt"
 }
 
 # linear: 親1 のみを N 件一直線。
@@ -53,7 +54,9 @@ gen_periodic_merge() {
         git -C "$OUT" commit --allow-empty -q -m "commit $i"
         if (( i % 7 == 0 )); then
             git -C "$OUT" branch -q tmp-merge
+            git -C "$OUT" checkout -q tmp-merge
             git -C "$OUT" commit --allow-empty -q -m "side $i"
+            git -C "$OUT" checkout -q main
             git -C "$OUT" merge -q --no-ff -m "merge $i" tmp-merge
             git -C "$OUT" branch -q -D tmp-merge
         fi
@@ -130,7 +133,7 @@ gen_author_sparse() {
 gen_long_subject_refs() {
     init_repo
     local i
-    local long_subject="これはパフォーマンス計測用の非常に長いコミットメッセージの件名です。East Asian Width 計算の負荷を測るため、わざと長くしています。"
+    local long_subject="これはパフォーマンス計測用の非常に長いコミットメッセージの件名です。East Asian Width 計算の負荷を測るため、わざと長くしています。本番のコミットメッセージには稀に長大な件名が含まれることがあり、それらの描画コスト（truncation・幅計算・スクロール）を正しく計測するための意図的な長文サンプルとして機能します。"
     for i in $(seq 1 "$COUNT"); do
         git -C "$OUT" commit --allow-empty -q -m "$long_subject (commit $i)"
         if (( i % 100 == 0 )); then
