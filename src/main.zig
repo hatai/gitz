@@ -682,6 +682,10 @@ pub fn main(init: std.process.Init) !void {
 
     const no_mouse = parseNoMouse(init);
 
+    // perf phase1/§5.5・codex B2: env GIT_TUI_SUBSTRATE_LIMIT（MiB）で substrate 取得上限を上書き。
+    // std.process.getEnvVar は非存在のため init.environ_map.get で取得（既定 64MiB）。
+    appcmd.setSubstrateLimit(appcmd.substrateLimit(init.environ_map.get("GIT_TUI_SUBSTRATE_LIMIT")));
+
     // 1. repoRoot 解決（.inherit = プロセスの cwd）。null なら TUI を起動せずエラー終了（spec §8）。
     const root = (try cmds.repoRoot(gpa, io, .inherit)) orelse {
         std.Io.File.stderr().writeStreamingAll(io, "git-tui: ここは git リポジトリではありません (git rev-parse --show-toplevel が失敗)\n") catch {};
@@ -762,6 +766,8 @@ pub fn main(init: std.process.Init) !void {
     // 打ち切り、同一ポインタの二重 free を防ぐ（review Issue 1）。
     handed_off = true;
 
+    // perf phase1/M7: グラフセル ANSI render cache はグローバル（program と別寿命）・main 出口で解放。
+    defer viewmod.deinitGraphCellCache();
     try program.start();
     while (program.isRunning()) {
         try program.tick();

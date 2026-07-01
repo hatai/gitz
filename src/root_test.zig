@@ -24,4 +24,6 @@ test {
     _ = @import("git/graph_project.zig"); // TODO 2 phase 3b #2: nearest-visible-parent 投影
     _ = @import("filter.zig"); // TODO 2 phase 3a: ログフィルタ
     _ = @import("main.zig"); // TODO 2 phase 3b #4: busy lifecycle runtime 層
+    _ = @import("bench.zig"); // perf Phase 0: benchmark (formatMs/CountingAlloc tests)
+    _ = @import("config.zig"); // perf Phase 1: parseLimitValue (substrate limit env)
 }

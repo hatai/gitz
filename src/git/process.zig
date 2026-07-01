@@ -22,10 +22,12 @@ pub const RunResult = struct {
     }
 };
 
-/// std.process.run の既定ストリーム上限（16MiB）。
+/// std.process.run の既定ストリーム上限。
 /// 注意: `run` では stdout/stderr 両方へ適用するが、`runWithLimit` では
 /// stderr のみへ適用する（stdout は注入引数 `stdout_limit` で置換）。
-pub const default_stream_limit: std.Io.Limit = .limited(16 * 1024 * 1024);
+/// perf phase1/§5.5: 10万コミットの `rev-list --parents` 出力（≈15-18MiB）を見越し
+/// 16MiB → 64MiB へ引き上げ（env GIT_TUI_SUBSTRATE_LIMIT で更に上書き可能）。
+pub const default_stream_limit: std.Io.Limit = .limited(64 * 1024 * 1024);
 
 /// argv を cwd で実行し、stdout/stderr と正規化した exit code を返す。
 /// `stdout_limit` は呼び出し側が指定（テストでの StreamTooLong 再現用 seam）。

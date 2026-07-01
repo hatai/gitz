@@ -276,27 +276,34 @@ pub const Model = struct {
         self.log_commits = next;
     }
 
-    /// 既存 log_commits.items と入力 new_entries を全て deep-copy した unified list を構築 → swap（H6/R1）。
+    /// 既存 log_commits.items の所有権を保持したまま新規 entries のみ deep-copy して append（H6/R1・perf phase1/M6）。
+    /// 従来は既存+新規を全て再 clone して unified list を swap していた（既存 items の再 dup が無駄）。
+    /// M6 手順: (1) 新規分だけ先行 clone → (2) 既存 log_commits へ ensureTotalCapacity →
+    /// (3) appendSliceAssumeCapacity（浅い copy・所有 ptr 複製）→ (4) 即座に disarm。
+    /// 強例外保証: OOM は (1)/(2) のみで失敗し既存 items は無傷。
     pub fn appendLogCommits(self: *Model, new_entries: []const log_mod.Commit) !void {
         const a = self.allocator;
-        var next: std.ArrayList(log_mod.Commit) = .empty;
+        // (1) 新規分だけ先行 clone（OOM で既存無傷・appended を errdefer で解放）。
+        var appended: std.ArrayList(log_mod.Commit) = .empty;
         errdefer {
-            for (next.items) |*c| c.deinit(a);
-            next.deinit(a);
+            for (appended.items) |*c| c.deinit(a);
+            appended.deinit(a);
         }
-        for (self.log_commits.items) |c| {
-            var cloned = try cloneCommit(a, c);
-            errdefer cloned.deinit(a);
-            try next.append(a, cloned);
-        }
+        try appended.ensureTotalCapacity(a, new_entries.len);
         for (new_entries) |e| {
             var cloned = try cloneCommit(a, e);
             errdefer cloned.deinit(a);
-            try next.append(a, cloned);
+            appended.appendAssumeCapacity(cloned);
         }
-        for (self.log_commits.items) |*c| c.deinit(a);
-        self.log_commits.deinit(a);
-        self.log_commits = next;
+        // (2) 既存 log_commits へ容量確保（OOM は上記 errdefer が新規 clone 解放・既存は無傷）。
+        try self.log_commits.ensureTotalCapacity(a, self.log_commits.items.len + appended.items.len);
+        // ここから先は infallible。
+        // (3) 浅い copy（Commit 構造体の所有 ptr を複製・既存 items は再 dup しない）。
+        self.log_commits.appendSliceAssumeCapacity(appended.items);
+        // (4) 即座に disarm: appended.items.len = 0 で要素参照を外し、deinit は buffer のみ解放
+        //     （要素所有権は log_commits へ移譲済み・二重 free しない）。
+        appended.items.len = 0;
+        appended.deinit(a);
     }
 
     /// detail_files への適用。NameStatus も deep-copy し append 毎に errdefer。
@@ -903,6 +910,96 @@ test "appendLogCommits deep-copies new entries to existing list (H6/R1)" {
     try std.testing.expectEqual(@as(usize, 2), m.log_commits.items.len);
     try std.testing.expectEqualStrings("h1", m.log_commits.items[0].hash);
     try std.testing.expectEqualStrings("h2", m.log_commits.items[1].hash);
+}
+
+// --- perf phase1/M6 テスト用ヘルパ（入力所有の Commit を構築/解放） ---
+// checkAllAllocationFailures で各 dupe が OOM になっても部分構築が漏れないよう errdefer で安全化。
+fn inputCommit(a: std.mem.Allocator, hash: []const u8, subject: []const u8) !log_mod.Commit {
+    var c: log_mod.Commit = undefined;
+    c.hash = try a.dupe(u8, hash);
+    errdefer a.free(c.hash);
+    c.parents = try a.alloc([]u8, 0);
+    errdefer a.free(c.parents);
+    c.author = try a.dupe(u8, "au");
+    errdefer a.free(c.author);
+    c.subject = try a.dupe(u8, subject);
+    errdefer a.free(c.subject);
+    c.refs = try a.dupe(u8, "");
+    c.epoch_sec = 1;
+    return c;
+}
+fn freeInputCommit(a: std.mem.Allocator, c: log_mod.Commit) void {
+    a.free(c.hash);
+    a.free(c.parents);
+    a.free(c.author);
+    a.free(c.subject);
+    a.free(c.refs);
+}
+
+test "appendLogCommits: 既存 items は再 dup せず所有権 move（perf phase1/M6）" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const c1 = try inputCommit(a, "h1", "s1");
+    defer freeInputCommit(a, c1);
+    const c2 = try inputCommit(a, "h2", "s2");
+    defer freeInputCommit(a, c2);
+    try m.replaceLogCommits(&.{ c1, c2 });
+    // 既存 items の所有 ptr を記録（再 dup で別 ptr にならないことを検証するため）。
+    const hash0_ptr = m.log_commits.items[0].hash.ptr;
+    const hash1_ptr = m.log_commits.items[1].hash.ptr;
+    const c3 = try inputCommit(a, "h3", "s3");
+    defer freeInputCommit(a, c3);
+    try m.appendLogCommits(&.{c3});
+    try std.testing.expectEqual(@as(usize, 3), m.log_commits.items.len);
+    // 既存 items の ptr が同一（move されて再 dup されていないこと）。
+    try std.testing.expectEqual(hash0_ptr, m.log_commits.items[0].hash.ptr);
+    try std.testing.expectEqual(hash1_ptr, m.log_commits.items[1].hash.ptr);
+    try std.testing.expectEqualStrings("h3", m.log_commits.items[2].hash);
+}
+
+test "appendLogCommits: OOM で既存 items 無傷・新規分解放・二重 free 無し（perf phase1/M6）" {
+    // checkAllAllocationFailures は各 allocation を OOM 化し allocated==freed（リーク/二重 free 無し）を検証。
+    // appendLogCommits 内部の cloneCommit/ensureTotalCapacity 失敗時も既存 items は触れず新規 clone のみ
+    // errdefer 解放されるため、全 fail_index で allocated==freed となる（M6 強例外保証）。
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, appendLogCommitsOomHelper, .{});
+}
+
+fn appendLogCommitsOomHelper(a: std.mem.Allocator) !void {
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    const c1 = try inputCommit(a, "h1", "s1");
+    defer freeInputCommit(a, c1);
+    try m.replaceLogCommits(&.{c1});
+    const c2 = try inputCommit(a, "h2", "s2");
+    defer freeInputCommit(a, c2);
+    // OOM は伝播 → framework が allocated==freed を検証（catch して void 返却すると Swallowed 扱い）。
+    try m.appendLogCommits(&.{c2});
+}
+
+test "appendLogCommits: paging で alloc 数は既存に比例せず新規分のみ（perf phase1/M6）" {
+    const a = std.testing.allocator;
+    var m = try Model.init(a, "/r");
+    defer m.deinit();
+    // 100 件 seed。
+    var seed: [1]log_mod.Commit = undefined;
+    seed[0] = try inputCommit(a, "seed", "s");
+    defer freeInputCommit(a, seed[0]);
+    try m.replaceLogCommits(&seed);
+    // 100 → +100 → +100 で append（move なので既存の再 dup 無し）。
+    var page1: [1]log_mod.Commit = undefined;
+    page1[0] = try inputCommit(a, "p1a", "s");
+    defer freeInputCommit(a, page1[0]);
+    try m.appendLogCommits(&page1);
+    var page2: [1]log_mod.Commit = undefined;
+    page2[0] = try inputCommit(a, "p2a", "s");
+    defer freeInputCommit(a, page2[0]);
+    try m.appendLogCommits(&page2);
+    // 主要点: 複数回 append 後もポインタ安定・リークゼロ（std.testing.allocator が検出）。
+    try std.testing.expectEqual(@as(usize, 3), m.log_commits.items.len);
+    try std.testing.expectEqualStrings("seed", m.log_commits.items[0].hash);
+    try std.testing.expectEqualStrings("p1a", m.log_commits.items[1].hash);
+    try std.testing.expectEqualStrings("p2a", m.log_commits.items[2].hash);
 }
 
 test "setDetailOwnerHash / clearDetailOwner cycle without leak" {

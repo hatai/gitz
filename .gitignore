@@ -3,3 +3,6 @@ zig-out/
 zig-pkg/
 
 .worktrees/
+
+# perf Phase 0 benchmark (生成物・commit しない)
+bench/repos/
