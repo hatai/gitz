@@ -97,4 +97,5 @@ Phase 2（所有権 / arena 統合）完了後の計測。`bench/report-before.m
 - [x] topology.parse allocs 有意減少（4016 → 20）・computeAll（4007 → 2009）・runLogInt filter clone 廃止
 - [x] `checkAllAllocationFailures` で handleLogLoaded/parse/project の OOM safety
 - [x] CLAUDE.md/AGENTS.md へ所有権 move 例外追記（§8）
+- [x] tmux pty（120x40）で描画崩れなし: wide-branches（`│●`）・periodic-merge（merge `●╷`）を確認
 - [ ] whole-branch review 合格・main へ no-ff マージ（user 確認後）
