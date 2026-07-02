@@ -18,10 +18,23 @@ const graph_mod = @import("git/graph.zig");
 const graph_project = @import("git/graph_project.zig");
 const topology_mod = @import("git/topology.zig");
 
+/// テスト用 helper（perf phase2/§6.1）: literal/借用 Msg を `var` 化して `&msg` へ包む。
+/// **deinit しない** — 呼出側が所有しない payload（unit/借用/外部所有）のみ想定。reducer は
+/// これらのバリアントを take しないため msg 所有権は従来（by-value で未 deinit）と等価。
+/// 所有 payload（log_loaded 等）は呼出側で `var msg = ...; defer msg.deinit(a)` から
+/// `update(&m, &msg)` へ直接渡す（deinit が request_tip/entries を解放・substrate は §6.2 で disarm）。
+fn updateRef(model: *Model, msg: Msg) !AppCmd {
+    var m = msg;
+    return update(model, &m);
+}
+
 /// Model を破壊的に更新し、必要な副作用を AppCmd で返す。
 /// 返した AppCmd は呼び出し側（解釈器/テスト）が deinit する。
-pub fn update(model: *Model, msg: Msg) !AppCmd {
-    switch (msg) {
+/// perf phase2/§6.1: `msg: *Msg`（ポインタ渡し）。reducer が Msg フィールドを take できる
+/// （現状は LogLoaded.substrate のみ・§6.2）。take したフィールドは null 化（disarm）し、
+/// 呼出側の `msg.deinit` が二重解放しないよう設計。zigzag trait（RuntimeModel.update）は不変。
+pub fn update(model: *Model, msg: *Msg) !AppCmd {
+    switch (msg.*) {
         .key_down => {
             if (model.selected + 1 < model.files.items.len) model.selected += 1;
             model.diff_scroll = 0;
@@ -1139,10 +1152,10 @@ test "key_down moves selection within bounds" {
     try addFile(&m, "a", .unstaged);
     try addFile(&m, "b", .unstaged);
     try std.testing.expectEqual(@as(usize, 0), m.selected);
-    var c1 = try update(&m, .key_down);
+    var c1 = try updateRef(&m, .key_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), m.selected);
-    var c2 = try update(&m, .key_down);
+    var c2 = try updateRef(&m, .key_down);
     c2.deinit(a); // 末尾で止まる
     try std.testing.expectEqual(@as(usize, 1), m.selected);
 }
@@ -1152,7 +1165,7 @@ test "toggle_stage on unstaged returns stage cmd with copied path" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     try addFile(&m, "f.txt", .unstaged);
-    var cmd = try update(&m, .toggle_stage);
+    var cmd = try updateRef(&m, .toggle_stage);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .stage);
     try std.testing.expectEqualStrings("f.txt", cmd.stage.path);
@@ -1162,7 +1175,7 @@ test "request_commit with empty message sets error and no commit" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
-    var cmd = try update(&m, .request_commit);
+    var cmd = try updateRef(&m, .request_commit);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expect(m.error_text.len > 0);
@@ -1173,10 +1186,10 @@ test "commit_text_changed syncs TextArea value (incl. Japanese) and request_comm
     var m = try Model.init(a, "/r");
     defer m.deinit();
     // view が TextArea から同期してくる想定（多行・日本語も TextArea が編集済み）
-    var c0 = try update(&m, .{ .commit_text_changed = "1行目\n2行目 日本語" });
+    var c0 = try updateRef(&m, .{ .commit_text_changed = "1行目\n2行目 日本語" });
     c0.deinit(a);
     try std.testing.expectEqualStrings("1行目\n2行目 日本語", m.commit_message);
-    var c1 = try update(&m, .request_commit);
+    var c1 = try updateRef(&m, .request_commit);
     defer c1.deinit(a);
     try std.testing.expect(c1 == .commit);
     try std.testing.expectEqualStrings("1行目\n2行目 日本語", c1.commit);
@@ -1188,7 +1201,7 @@ test "request_commit while busy returns none and emits no commit" {
     defer m.deinit();
     try m.setStr(&m.commit_message, "msg"); // メッセージは非空（空エラーと区別する）
     m.busy = true;
-    var cmd = try update(&m, .request_commit);
+    var cmd = try updateRef(&m, .request_commit);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none); // busy ゲートで commit を発行しない
     try std.testing.expect(m.error_text.len == 0); // 空メッセージエラーでもない
@@ -1200,7 +1213,7 @@ test "key_down requests diff reload for new selection" {
     defer m.deinit();
     try addFile(&m, "a", .unstaged);
     try addFile(&m, "b", .unstaged);
-    var cmd = try update(&m, .key_down);
+    var cmd = try updateRef(&m, .key_down);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_diff);
     try std.testing.expectEqualStrings("b", cmd.load_diff.path);
@@ -1211,12 +1224,12 @@ test "scroll_diff adjusts offset and clamps at zero" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     try m.setStr(&m.diff_text, "a\nb\nc\n"); // 4トークン（trailing 含む）→ cap 3。+=1 が従来どおり起きる。
-    var c1 = try update(&m, .scroll_diff_down);
+    var c1 = try updateRef(&m, .scroll_diff_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), m.diff_scroll);
-    var c2 = try update(&m, .scroll_diff_up);
+    var c2 = try updateRef(&m, .scroll_diff_up);
     c2.deinit(a);
-    var c3 = try update(&m, .scroll_diff_up);
+    var c3 = try updateRef(&m, .scroll_diff_up);
     c3.deinit(a); // 0 で止まる
     try std.testing.expectEqual(@as(usize, 0), m.diff_scroll);
 }
@@ -1229,7 +1242,7 @@ test "scroll_diff_down stops at diffLineCount(text) - 1 (constraint 4 root fix)"
     try m.setStr(&m.diff_text, "a\nb\nc\n");
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        var c = try update(&m, .scroll_diff_down);
+        var c = try updateRef(&m, .scroll_diff_down);
         c.deinit(a);
     }
     try std.testing.expectEqual(@as(usize, 3), m.diff_scroll);
@@ -1240,7 +1253,7 @@ test "scroll_diff_down on empty diff_text is no-op (no underflow)" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     // diff_text 未設定（空文字列=1トークン）→ cap 0。+=1 は起きない。
-    var c = try update(&m, .scroll_diff_down);
+    var c = try updateRef(&m, .scroll_diff_down);
     c.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), m.diff_scroll);
 }
@@ -1254,7 +1267,7 @@ test "git_error preserves file list and only sets error_text" {
     m.busy = true;
     var msg = Msg{ .git_error = try a.dupe(u8, "fatal: boom") };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), m.files.items.len); // ファイル一覧は保持
     try std.testing.expect(m.busy); // reducer は busy を触らない（runtime 所有）
@@ -1266,7 +1279,7 @@ test "reducer leaves busy untouched on status_loaded" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     m.busy = true;
-    var cmd = try update(&m, .{ .status_loaded = &.{} });
+    var cmd = try updateRef(&m, .{ .status_loaded = &.{} });
     defer cmd.deinit(a);
     try std.testing.expect(m.busy); // reducer は busy を下ろさない
 }
@@ -1278,7 +1291,7 @@ test "reducer leaves busy untouched on diff_loaded" {
     m.busy = true;
     var msg = Msg{ .diff_loaded = try a.dupe(u8, "diff --git a/x b/x\n") };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(m.busy);
 }
@@ -1288,7 +1301,7 @@ test "reducer leaves busy untouched on committed" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     m.busy = true;
-    var cmd = try update(&m, .committed);
+    var cmd = try updateRef(&m, .committed);
     defer cmd.deinit(a); // .refresh_status
     try std.testing.expect(m.busy);
 }
@@ -1320,15 +1333,15 @@ test "diff_cursor_down/up skip @@ headers and clamp to body lines" {
     defer m.deinit();
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 4; // h0 本文先頭 ' a'
-    var c1 = try update(&m, .diff_cursor_down);
+    var c1 = try updateRef(&m, .diff_cursor_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 5), m.diff_cursor); // '-b'
     m.diff_cursor = 6; // h0 末尾本文 '+B'
-    var c2 = try update(&m, .diff_cursor_down);
+    var c2 = try updateRef(&m, .diff_cursor_down);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // @@h1(7) を飛ばして ' x'(8)
     m.diff_cursor = 8;
-    var c3 = try update(&m, .diff_cursor_up);
+    var c3 = try updateRef(&m, .diff_cursor_up);
     c3.deinit(a);
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // 戻りも @@h1 を飛ばす
 }
@@ -1341,21 +1354,21 @@ test "cursor stays within anchor's hunk while selecting (no cross-hunk selection
     // 選択中（anchor=h0 内）はカーソルが h1 へ越えない。
     m.diff_cursor = 6; // h0 末尾本文 '+B'
     m.diff_anchor = 5; // h0 内
-    var c1 = try update(&m, .diff_cursor_down);
+    var c1 = try updateRef(&m, .diff_cursor_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // h1(8) へ移らず据え置き
     // anchor を外すと次ハンクへ自由移動。
     m.diff_anchor = null;
-    var c2 = try update(&m, .diff_cursor_down);
+    var c2 = try updateRef(&m, .diff_cursor_down);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // h1 本文先頭
     // 上方向も anchor のハンク本文先頭で止まり h0 へ越えない。
     m.diff_cursor = 9; // h1 '+Y'
     m.diff_anchor = 9; // h1
-    var c3 = try update(&m, .diff_cursor_up);
+    var c3 = try updateRef(&m, .diff_cursor_up);
     c3.deinit(a);
     try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // h1 本文先頭 ' x'
-    var c4 = try update(&m, .diff_cursor_up); // これ以上 h0 へ越えない
+    var c4 = try updateRef(&m, .diff_cursor_up); // これ以上 h0 へ越えない
     c4.deinit(a);
     try std.testing.expectEqual(@as(usize, 8), m.diff_cursor);
 }
@@ -1367,11 +1380,11 @@ test "diff_hunk_next/prev jump to hunk body tops and clear anchor" {
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 4; // h0
     m.diff_anchor = 4;
-    var c1 = try update(&m, .diff_hunk_next);
+    var c1 = try updateRef(&m, .diff_hunk_next);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 8), m.diff_cursor); // h1 本文先頭
     try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
-    var c2 = try update(&m, .diff_hunk_prev);
+    var c2 = try updateRef(&m, .diff_hunk_prev);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 4), m.diff_cursor); // h0 本文先頭
 }
@@ -1382,10 +1395,10 @@ test "toggle_line_selection sets then clears anchor" {
     defer m.deinit();
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 5;
-    var c1 = try update(&m, .toggle_line_selection);
+    var c1 = try updateRef(&m, .toggle_line_selection);
     c1.deinit(a);
     try std.testing.expectEqual(@as(?usize, 5), m.diff_anchor);
-    var c2 = try update(&m, .toggle_line_selection);
+    var c2 = try updateRef(&m, .toggle_line_selection);
     c2.deinit(a);
     try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
 }
@@ -1398,7 +1411,7 @@ test "stage_lines on unstaged builds apply_patch for the cursor line and clears 
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 6; // '+B'（h0 の変更行）
     m.diff_anchor = 6;
-    var cmd = try update(&m, .stage_lines);
+    var cmd = try updateRef(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .apply_patch);
     try std.testing.expect(!cmd.apply_patch.reverse);
@@ -1413,7 +1426,7 @@ test "stage_lines on staged sets reverse=true" {
     try addFile(&m, "f.txt", .staged);
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 6;
-    var cmd = try update(&m, .stage_lines);
+    var cmd = try updateRef(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .apply_patch);
     try std.testing.expect(cmd.apply_patch.reverse);
@@ -1427,7 +1440,7 @@ test "stage_lines on context-only selection is no-op (null patch)" {
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 4; // ' a' 文脈行のみ
     m.diff_anchor = 4; // 選択あり → null パスでも消費されること
-    var cmd = try update(&m, .stage_lines);
+    var cmd = try updateRef(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?usize, null), m.diff_anchor); // 選択ハイライトを残さない
@@ -1451,7 +1464,7 @@ test "stage_lines on untracked builds apply_patch (reverse=false) for partial st
         "+L2\n" ++
         "+L3\n");
     m.diff_cursor = 7; // +L2 の絶対行（file_header 5 行 + @@ が行5, +L1=6, +L2=7, +L3=8）
-    var cmd = try update(&m, .stage_lines);
+    var cmd = try updateRef(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .apply_patch);
     try std.testing.expect(!cmd.apply_patch.reverse); // untracked は reverse=false
@@ -1487,7 +1500,7 @@ test "stage_lines on 2 RM unstaged entry (orig_path=null) builds apply_patch (re
         " e\n");
     m.diff_cursor = 7; // +X の絶対行（file_header 4 行 + @@ が行4, ' a'=5, '-b'=6, '+X'=7）
     m.diff_anchor = 7;
-    var cmd = try update(&m, .stage_lines);
+    var cmd = try updateRef(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .apply_patch);
     try std.testing.expect(!cmd.apply_patch.reverse); // unstaged → forward
@@ -1526,7 +1539,7 @@ test "stage_lines on staged rename entry (orig_path!=null, section=staged) is gu
         " c\n");
     m.diff_cursor = 9; // -b の絶対行（file_header 7 行 + @@ 行7, ' a'=8, '-b'=9）
     m.diff_anchor = 9;
-    var cmd = try update(&m, .stage_lines);
+    var cmd = try updateRef(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none); // ガードでブロック
     try std.testing.expect(m.error_text.len > 0); // ガイドメッセージ
@@ -1562,7 +1575,7 @@ test "stage_lines on 2 .R unstaged entry (orig_path!=null, section=unstaged) is 
         " c\n");
     m.diff_cursor = 9;
     m.diff_anchor = 9;
-    var cmd = try update(&m, .stage_lines);
+    var cmd = try updateRef(&m, .stage_lines);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none); // ガードでブロック
     try std.testing.expect(m.error_text.len > 0);
@@ -1576,7 +1589,7 @@ test "stage_lines guards: busy" {
     try addFile(&m, "f.txt", .unstaged);
     try seedTwoHunkDiff(&m);
     m.busy = true;
-    var c = try update(&m, .stage_lines);
+    var c = try updateRef(&m, .stage_lines);
     defer c.deinit(a);
     try std.testing.expect(c == .none);
 }
@@ -1589,7 +1602,7 @@ test "diff_loaded clamps cursor into a hunk body and validates anchor" {
     m.diff_anchor = 3; // @@ ヘッダ行 (start_line==3) → isBodyLine=false → cond-a fail → null 化
     const diff = try a.dupe(u8, "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,1 +1,2 @@\n a\n+B\n");
     defer a.free(diff); // diff_loaded は setStr で複製するため呼び出し側が原本を解放（所有権規約）
-    var cmd = try update(&m, .{ .diff_loaded = diff });
+    var cmd = try updateRef(&m, .{ .diff_loaded = diff });
     cmd.deinit(a);
     // ヘッダ3行(0..2) / @@=3 / ' a'=4 / '+B'=5 → 範囲外 999 は先頭ハンク本文先頭(start_line+1=4) へ。
     try std.testing.expectEqual(@as(usize, 4), m.diff_cursor);
@@ -1602,7 +1615,7 @@ test "select_line_at moves cursor, sets diff focus, clears anchor" {
     defer m.deinit();
     try seedTwoHunkDiff(&m);
     m.diff_anchor = 4;
-    var cmd = try update(&m, .{ .select_line_at = 9 }); // h1 '+Y'
+    var cmd = try updateRef(&m, .{ .select_line_at = 9 }); // h1 '+Y'
     cmd.deinit(a);
     try std.testing.expectEqual(@as(usize, 9), m.diff_cursor);
     try std.testing.expect(m.focus == .diff);
@@ -1621,7 +1634,7 @@ test "loadDiffCmd records diff_owner for selected file (Layer 1)" {
         .{ .path = try a.dupe(u8, "f.txt"), .orig_path = null, .section = .unstaged },
     };
     defer for (e) |entry| a.free(entry.path);
-    var cmd = try update(&m, .{ .status_loaded = &e });
+    var cmd = try updateRef(&m, .{ .status_loaded = &e });
     defer cmd.deinit(a); // load_diff を返す
     // status_loaded → replaceFiles → loadDiffCmd で diff_owner が selected ファイルへ記録される
     try std.testing.expect(m.diff_owner != null);
@@ -1636,7 +1649,7 @@ test "loadDiffCmd clears diff_owner when files empty (Layer 1)" {
     // 手動で diff_owner を設定（ファイル無しの状態）
     try m.setDiffOwner("stale.txt", .unstaged);
     // status_loaded で空エントリ → replaceFiles で files 空 → loadDiffCmd で diff_owner クリア
-    var cmd = try update(&m, .{ .status_loaded = &.{} });
+    var cmd = try updateRef(&m, .{ .status_loaded = &.{} });
     cmd.deinit(a); // .none を返す（ファイル無し）
     try std.testing.expect(m.diff_owner == null);
 }
@@ -1696,7 +1709,7 @@ test "Bug 1 Layer 1: diff_loaded clears anchor when selected file changed (codex
     // g.txt の diff_loaded が届いたとする（テストでは同じ diff_text を再利用）
     const diff_copy = try a.dupe(u8, m.diff_text);
     defer a.free(diff_copy);
-    var cmd = try update(&m, .{ .diff_loaded = diff_copy });
+    var cmd = try updateRef(&m, .{ .diff_loaded = diff_copy });
     cmd.deinit(a);
     // ★層 1: owner(f.txt) != selected(g.txt) → anchor clear
     try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
@@ -1767,7 +1780,7 @@ test "select_line_at still clears anchor after Bug 1 fix (regression)" {
     m.diff_cursor = 4;
     m.diff_anchor = 5; // 選択あり（h0 内）
     // 同じ h0 内の行6 へクリック（cond-b は pass してしまう → explicit clear が必須）
-    var cmd = try update(&m, .{ .select_line_at = 6 });
+    var cmd = try updateRef(&m, .{ .select_line_at = 6 });
     cmd.deinit(a);
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
     try std.testing.expect(m.focus == .diff);
@@ -1789,12 +1802,12 @@ test "Bug 1 e2e: range selection survives diff_loaded (auto-refresh simulation)"
 
     // 1) v で選択開始 (cursor=5 → anchor=5)
     m.diff_cursor = 5;
-    var c1 = try update(&m, .toggle_line_selection);
+    var c1 = try updateRef(&m, .toggle_line_selection);
     c1.deinit(a);
     try std.testing.expectEqual(@as(?usize, 5), m.diff_anchor);
 
     // 2) j で選択拡張 (cursor=5 → 6)
-    var c2 = try update(&m, .diff_cursor_down);
+    var c2 = try updateRef(&m, .diff_cursor_down);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
     try std.testing.expectEqual(@as(?usize, 5), m.diff_anchor); // 選択維持
@@ -1805,7 +1818,7 @@ test "Bug 1 e2e: range selection survives diff_loaded (auto-refresh simulation)"
     //    ★層 2: validateAnchor が anchor=5(h0 本文) と cursor=6(同 h0) を確認 → 保持
     const same_diff = try a.dupe(u8, m.diff_text);
     defer a.free(same_diff);
-    var c3 = try update(&m, .{ .diff_loaded = same_diff });
+    var c3 = try updateRef(&m, .{ .diff_loaded = same_diff });
     c3.deinit(a);
     try std.testing.expectEqual(@as(?usize, 5), m.diff_anchor); // ★Bug 1 の核心: 保持される
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
@@ -1814,7 +1827,7 @@ test "Bug 1 e2e: range selection survives diff_loaded (auto-refresh simulation)"
     //    ★Bug 1 無修正なら anchor が diff_loaded で null 化し、selectionRange(6,null)={6,6}
     //      なので '-b' は未選択→文脈化(' b')されてパッチから消え、'+B' のみ残る。
     //      修正後は anchor=5 保持で selectionRange(6,5)={5,6} となり、'-b' も選択→保持される。
-    var c4 = try update(&m, .stage_lines);
+    var c4 = try updateRef(&m, .stage_lines);
     defer c4.deinit(a);
     try std.testing.expect(c4 == .apply_patch);
     try std.testing.expect(std.mem.indexOf(u8, c4.apply_patch.patch, "+B\n") != null); // 選択された追加行
@@ -1829,7 +1842,7 @@ test "select_hunk sets anchor=body top, cursor=body bottom, focus=diff" {
     try seedTwoHunkDiff(&m); // h0 本文 4-6, h1 本文 8-10
     m.diff_cursor = 5; // h0 本文
     m.focus = .changes; // diff フォーカスで無い状態から
-    var cmd = try update(&m, .select_hunk);
+    var cmd = try updateRef(&m, .select_hunk);
     defer cmd.deinit(a);
     try std.testing.expect(m.focus == .diff);
     try std.testing.expectEqual(@as(usize, 4), m.diff_anchor.?); // h0 本文先頭
@@ -1843,7 +1856,7 @@ test "select_hunk on empty diff (no hunks) is no-op" {
     try addFile(&m, "f.txt", .unstaged);
     try m.setStr(&m.diff_text, ""); // ハンク無し
     m.diff_cursor = 0;
-    var cmd = try update(&m, .select_hunk);
+    var cmd = try updateRef(&m, .select_hunk);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?usize, null), m.diff_anchor);
@@ -1856,7 +1869,7 @@ test "select_hunk picks the hunk containing cursor even on @@ header" {
     try addFile(&m, "f.txt", .unstaged);
     try seedTwoHunkDiff(&m); // @@h0 = 行3
     m.diff_cursor = 3; // @@h0 ヘッダ行
-    var cmd = try update(&m, .select_hunk);
+    var cmd = try updateRef(&m, .select_hunk);
     defer cmd.deinit(a);
     try std.testing.expectEqual(@as(usize, 4), m.diff_anchor.?); // h0 本文先頭
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor); // h0 本文末尾
@@ -1870,7 +1883,7 @@ test "stage_hunk builds apply_patch for whole hunk body" {
     try seedTwoHunkDiff(&m); // h0 本文 4-6: ' a', '-b', '+B'
     m.diff_cursor = 5;
     m.focus = .diff;
-    var cmd = try update(&m, .stage_hunk);
+    var cmd = try updateRef(&m, .stage_hunk);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .apply_patch);
     try std.testing.expect(!cmd.apply_patch.reverse); // unstaged → forward
@@ -1886,7 +1899,7 @@ test "stage_hunk on empty diff is no-op" {
     defer m.deinit();
     try addFile(&m, "f.txt", .unstaged);
     try m.setStr(&m.diff_text, "");
-    var cmd = try update(&m, .stage_hunk);
+    var cmd = try updateRef(&m, .stage_hunk);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -1899,7 +1912,7 @@ test "stage_hunk respects busy guard" {
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 5;
     m.busy = true;
-    var cmd = try update(&m, .stage_hunk);
+    var cmd = try updateRef(&m, .stage_hunk);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -1916,7 +1929,7 @@ test "stage_hunk respects rename guard (orig_path != null)" {
     });
     try seedTwoHunkDiff(&m);
     m.diff_cursor = 5;
-    var cmd = try update(&m, .stage_hunk);
+    var cmd = try updateRef(&m, .stage_hunk);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expect(m.error_text.len > 0);
@@ -1932,14 +1945,14 @@ test "select_hunk followed by auto-refresh preserves anchor (Bug 1 e2e analog)" 
     try seedTwoHunkDiff(&m); // h0 本文 4-6
     try m.setDiffOwner("f.txt", .unstaged); // 層 1 セットアップ
     m.diff_cursor = 5;
-    var c1 = try update(&m, .select_hunk);
+    var c1 = try updateRef(&m, .select_hunk);
     c1.deinit(a);
     try std.testing.expectEqual(@as(?usize, 4), m.diff_anchor);
     try std.testing.expectEqual(@as(usize, 6), m.diff_cursor);
     // auto-refresh シミュレーション: 同じ diff で diff_loaded 再送
     const same = try a.dupe(u8, m.diff_text);
     defer a.free(same);
-    var c2 = try update(&m, .{ .diff_loaded = same });
+    var c2 = try updateRef(&m, .{ .diff_loaded = same });
     c2.deinit(a);
     // 層 1（owner 一致）+ 層 2（anchor=h0本文, cursor=同h0）で保持
     try std.testing.expectEqual(@as(?usize, 4), m.diff_anchor);
@@ -1999,7 +2012,7 @@ test "toggle_view_mode: changes→log sets view_mode/focus/generation, clears lo
     var m = try Model.init(a, "/r");
     defer m.deinit();
     try std.testing.expectEqual(ViewMode.changes, m.view_mode);
-    var cmd = try update(&m, .toggle_view_mode);
+    var cmd = try updateRef(&m, .toggle_view_mode);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     try std.testing.expectEqual(@as(usize, 0), cmd.load_log.skip);
@@ -2018,7 +2031,7 @@ test "toggle_view_mode: log→changes increments generation, clears page, return
     defer m.deinit();
     m.log_request_generation = 5; // 既に増分済みの前提
     m.log_page_requested = 100; // in-flight ページ要求あり
-    var cmd = try update(&m, .toggle_view_mode);
+    var cmd = try updateRef(&m, .toggle_view_mode);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .refresh_status);
     try std.testing.expectEqual(ViewMode.changes, m.view_mode);
@@ -2038,7 +2051,7 @@ test "log_cursor_down: empty log clears detail state and returns none (R2)" {
     try m.setDetailOwnerHash("stale");
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f.txt"));
     try m.setStr(&m.detail_diff, "stale");
-    var cmd = try update(&m, .log_cursor_down);
+    var cmd = try updateRef(&m, .log_cursor_down);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?[]u8, null), m.detail_owner_hash);
@@ -2050,7 +2063,7 @@ test "log_cursor_down: moves selection and loads commit_detail" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 3);
     defer m.deinit();
-    var cmd = try update(&m, .log_cursor_down);
+    var cmd = try updateRef(&m, .log_cursor_down);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail);
     try std.testing.expectEqual(@as(usize, 1), m.log_selected);
@@ -2063,7 +2076,7 @@ test "log_cursor_down: clamps at last commit" {
     var m = try seedLogModel(a, 2);
     defer m.deinit();
     m.log_selected = 1; // 末尾
-    var cmd = try update(&m, .log_cursor_down);
+    var cmd = try updateRef(&m, .log_cursor_down);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail);
     try std.testing.expectEqual(@as(usize, 1), m.log_selected); // 末尾で停止
@@ -2075,7 +2088,7 @@ test "log_cursor_down: triggers paging when has_more and near end (R17 len>=5)" 
     defer m.deinit();
     m.log_selected = 0; // まだ境界外（selected < len-5 == 0）
     // 1 回目の down: selected=0→1。1 >= len-5(0) を満たすので page が発火する。
-    var c1 = try update(&m, .log_cursor_down);
+    var c1 = try updateRef(&m, .log_cursor_down);
     defer c1.deinit(a);
     try std.testing.expect(c1 == .load_log_page);
     try std.testing.expectEqual(@as(usize, 1), m.log_selected);
@@ -2088,7 +2101,7 @@ test "log_cursor_down: R17 prevents underflow when len < 5" {
     var m = try seedLogModel(a, 3); // len < 5 → len-5 underflow するはずの条件
     defer m.deinit();
     m.log_selected = 2; // 末尾
-    var cmd = try update(&m, .log_cursor_down);
+    var cmd = try updateRef(&m, .log_cursor_down);
     defer cmd.deinit(a);
     // len >= 5 を満たさないので page 発火せず load_commit_detail
     try std.testing.expect(cmd == .load_commit_detail);
@@ -2099,7 +2112,7 @@ test "log_cursor_down: R18 gates load_commit_detail during in-flight page" {
     var m = try seedLogModel(a, 3);
     defer m.deinit();
     m.log_page_requested = 100; // page in-flight
-    var cmd = try update(&m, .log_cursor_down);
+    var cmd = try updateRef(&m, .log_cursor_down);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none); // R18: detail load を発火しない
     try std.testing.expectEqual(@as(usize, 1), m.log_selected); // 選択移動は起きる
@@ -2112,7 +2125,7 @@ test "log_cursor_up: empty log returns none (R2)" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     m.view_mode = .log;
-    var cmd = try update(&m, .log_cursor_up);
+    var cmd = try updateRef(&m, .log_cursor_up);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2122,7 +2135,7 @@ test "log_cursor_up: moves selection down and loads detail" {
     var m = try seedLogModel(a, 3);
     defer m.deinit();
     m.log_selected = 2;
-    var cmd = try update(&m, .log_cursor_up);
+    var cmd = try updateRef(&m, .log_cursor_up);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail);
     try std.testing.expectEqual(@as(usize, 1), m.log_selected);
@@ -2135,7 +2148,7 @@ test "log_cursor_up: clamps at 0" {
     var m = try seedLogModel(a, 3);
     defer m.deinit();
     m.log_selected = 0;
-    var cmd = try update(&m, .log_cursor_up);
+    var cmd = try updateRef(&m, .log_cursor_up);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail);
     try std.testing.expectEqual(@as(usize, 0), m.log_selected);
@@ -2146,7 +2159,7 @@ test "log_cursor_up: R18 gates detail load during in-flight page" {
     var m = try seedLogModel(a, 3);
     defer m.deinit();
     m.log_page_requested = 50;
-    var cmd = try update(&m, .log_cursor_up);
+    var cmd = try updateRef(&m, .log_cursor_up);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2158,7 +2171,7 @@ test "log_open_detail: empty returns none (R2)" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     m.view_mode = .log;
-    var cmd = try update(&m, .log_open_detail);
+    var cmd = try updateRef(&m, .log_open_detail);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2168,7 +2181,7 @@ test "log_open_detail: loads detail for current selection" {
     var m = try seedLogModel(a, 3);
     defer m.deinit();
     m.log_selected = 2;
-    var cmd = try update(&m, .log_open_detail);
+    var cmd = try updateRef(&m, .log_open_detail);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail);
     try std.testing.expectEqualStrings("h0002", cmd.load_commit_detail);
@@ -2179,7 +2192,7 @@ test "log_open_detail: R18 gates during in-flight page" {
     var m = try seedLogModel(a, 3);
     defer m.deinit();
     m.log_page_requested = 50;
-    var cmd = try update(&m, .log_open_detail);
+    var cmd = try updateRef(&m, .log_open_detail);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2190,15 +2203,15 @@ test "log_scroll_down/up adjust log_scroll without affecting selection or paging
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 5);
     defer m.deinit();
-    var c1 = try update(&m, .log_scroll_down);
+    var c1 = try updateRef(&m, .log_scroll_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), m.log_scroll);
     try std.testing.expectEqual(@as(usize, 0), m.log_selected); // 選択は不変
-    var c2 = try update(&m, .log_scroll_up);
+    var c2 = try updateRef(&m, .log_scroll_up);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), m.log_scroll);
     // 0 未満へは行かない
-    var c3 = try update(&m, .log_scroll_up);
+    var c3 = try updateRef(&m, .log_scroll_up);
     c3.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), m.log_scroll);
 }
@@ -2209,7 +2222,7 @@ test "log_scroll_down clamps at log_commits length" {
     defer m.deinit();
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        var c = try update(&m, .log_scroll_down);
+        var c = try updateRef(&m, .log_scroll_down);
         c.deinit(a);
     }
     try std.testing.expectEqual(@as(usize, 3), m.log_scroll);
@@ -2221,10 +2234,10 @@ test "detail_files_scroll_down/up adjust detail_scroll" {
     defer m.deinit();
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f2"));
-    var c1 = try update(&m, .detail_files_scroll_down);
+    var c1 = try updateRef(&m, .detail_files_scroll_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), m.detail_scroll);
-    var c2 = try update(&m, .detail_files_scroll_up);
+    var c2 = try updateRef(&m, .detail_files_scroll_up);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), m.detail_scroll);
 }
@@ -2234,18 +2247,18 @@ test "detail_diff_scroll clamps at line count - 1 (empty is no-op)" {
     var m = try seedLogModel(a, 1);
     defer m.deinit();
     // 空 diff は no-op
-    var c0 = try update(&m, .detail_diff_scroll_down);
+    var c0 = try updateRef(&m, .detail_diff_scroll_down);
     c0.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), m.detail_diff_scroll);
     // 4 トークン（"a\nb\nc\n" → cap 3）
     try m.setStr(&m.detail_diff, "a\nb\nc\n");
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        var c = try update(&m, .detail_diff_scroll_down);
+        var c = try updateRef(&m, .detail_diff_scroll_down);
         c.deinit(a);
     }
     try std.testing.expectEqual(@as(usize, 3), m.detail_diff_scroll);
-    var c2 = try update(&m, .detail_diff_scroll_up);
+    var c2 = try updateRef(&m, .detail_diff_scroll_up);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), m.detail_diff_scroll);
 }
@@ -2256,10 +2269,10 @@ test "detail_cursor_down/up: empty detail_files is no-op (R2)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 1);
     defer m.deinit();
-    var c1 = try update(&m, .detail_cursor_down);
+    var c1 = try updateRef(&m, .detail_cursor_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), m.detail_selected);
-    var c2 = try update(&m, .detail_cursor_up);
+    var c2 = try updateRef(&m, .detail_cursor_up);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), m.detail_selected);
 }
@@ -2271,16 +2284,16 @@ test "detail_cursor_down/up: move detail_selected and return none" {
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f2"));
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f3"));
-    var c1 = try update(&m, .detail_cursor_down);
+    var c1 = try updateRef(&m, .detail_cursor_down);
     c1.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), m.detail_selected);
-    var c2 = try update(&m, .detail_cursor_down);
+    var c2 = try updateRef(&m, .detail_cursor_down);
     c2.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), m.detail_selected);
-    var c3 = try update(&m, .detail_cursor_down);
+    var c3 = try updateRef(&m, .detail_cursor_down);
     c3.deinit(a); // 末尾で停止
     try std.testing.expectEqual(@as(usize, 2), m.detail_selected);
-    var c4 = try update(&m, .detail_cursor_up);
+    var c4 = try updateRef(&m, .detail_cursor_up);
     c4.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), m.detail_selected);
 }
@@ -2291,7 +2304,7 @@ test "detail_select_file: empty detail_files is no-op (R2)" {
     const a = std.testing.allocator;
     var m = try seedLogModel(a, 1);
     defer m.deinit();
-    var cmd = try update(&m, .detail_select_file);
+    var cmd = try updateRef(&m, .detail_select_file);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2301,7 +2314,7 @@ test "detail_select_file: sets detail_kind=.diff and returns load_detail_diff (R
     var m = try seedLogModel(a, 1);
     defer m.deinit();
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "src/f.txt"));
-    var cmd = try update(&m, .detail_select_file);
+    var cmd = try updateRef(&m, .detail_select_file);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_detail_diff);
     try std.testing.expectEqualStrings("h0000", cmd.load_detail_diff.hash);
@@ -2318,7 +2331,7 @@ test "detail_select_file: R18 gates during in-flight page" {
     defer m.deinit();
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f.txt"));
     m.log_page_requested = 100;
-    var cmd = try update(&m, .detail_select_file);
+    var cmd = try updateRef(&m, .detail_select_file);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(DetailKind.files, m.detail_kind); // 切替無し
@@ -2334,7 +2347,7 @@ test "detail_back_to_files: resets state to .files, clears diff and owner" {
     try m.setStr(&m.detail_diff, "diff body");
     m.detail_diff_scroll = 5;
     try m.setDetailDiffOwner("h0000", "f.txt");
-    var cmd = try update(&m, .detail_back_to_files);
+    var cmd = try updateRef(&m, .detail_back_to_files);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(DetailKind.files, m.detail_kind);
@@ -2351,7 +2364,7 @@ test "log_select_index: sets log_selected and focus=.changes, loads detail" {
     var m = try seedLogModel(a, 5);
     defer m.deinit();
     m.focus = .commit;
-    var cmd = try update(&m, .{ .log_select_index = 3 });
+    var cmd = try updateRef(&m, .{ .log_select_index = 3 });
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail);
     try std.testing.expectEqual(@as(usize, 3), m.log_selected);
@@ -2364,7 +2377,7 @@ test "log_select_index: empty returns none (R2)" {
     var m = try Model.init(a, "/r");
     defer m.deinit();
     m.view_mode = .log;
-    var cmd = try update(&m, .{ .log_select_index = 0 });
+    var cmd = try updateRef(&m, .{ .log_select_index = 0 });
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2374,7 +2387,7 @@ test "log_select_index: out-of-range is ignored but focus set, returns detail fo
     var m = try seedLogModel(a, 3);
     defer m.deinit();
     m.log_selected = 1;
-    var cmd = try update(&m, .{ .log_select_index = 99 }); // 範囲外
+    var cmd = try updateRef(&m, .{ .log_select_index = 99 }); // 範囲外
     defer cmd.deinit(a);
     // log_selected は変化しない（範囲外は無視）。detail load は現選択で発火。
     try std.testing.expect(cmd == .load_commit_detail);
@@ -2388,7 +2401,7 @@ test "log_select_index: R18 gates detail load but updates selection and focus" {
     defer m.deinit();
     m.log_page_requested = 100;
     m.focus = .commit;
-    var cmd = try update(&m, .{ .log_select_index = 2 });
+    var cmd = try updateRef(&m, .{ .log_select_index = 2 });
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(usize, 2), m.log_selected);
@@ -2403,7 +2416,7 @@ test "detail_select_index: .files mode sets detail_selected and focus=.diff" {
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f2"));
     m.detail_kind = .files;
     m.focus = .commit;
-    var cmd = try update(&m, .{ .detail_select_index = 1 });
+    var cmd = try updateRef(&m, .{ .detail_select_index = 1 });
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(usize, 1), m.detail_selected);
@@ -2417,7 +2430,7 @@ test "detail_select_index: out-of-range in .files mode is ignored" {
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
     m.detail_kind = .files;
     m.detail_selected = 0;
-    var cmd = try update(&m, .{ .detail_select_index = 99 });
+    var cmd = try updateRef(&m, .{ .detail_select_index = 99 });
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(usize, 0), m.detail_selected); // 変化無し
@@ -2430,7 +2443,7 @@ test "detail_select_index: .diff mode ignores click (no file move)" {
     try m.detail_files.append(a, try mkNameStatus(a, 'M', "f1"));
     m.detail_kind = .diff;
     m.detail_selected = 0;
-    var cmd = try update(&m, .{ .detail_select_index = 0 });
+    var cmd = try updateRef(&m, .{ .detail_select_index = 0 });
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     // .diff 中はマウスクリックでファイル選択を変更しない
@@ -2449,7 +2462,7 @@ test "request_refresh in log mode: increments generation, saves restore hash, cl
     var ns = try mkNameStatus(a, 'M', "f.txt");
     try m.replaceDetailFiles(&.{ns});
     ns.deinit(a);
-    var cmd = try update(&m, .request_refresh);
+    var cmd = try updateRef(&m, .request_refresh);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     try std.testing.expectEqual(@as(u64, 6), cmd.load_log.generation); // R3 +1
@@ -2472,7 +2485,7 @@ test "request_refresh in log mode: empty log clears restore hash instead of savi
     m.view_mode = .log;
     m.log_request_generation = 1;
     try m.setLogRestoreHash("stale");
-    var cmd = try update(&m, .request_refresh);
+    var cmd = try updateRef(&m, .request_refresh);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     try std.testing.expectEqual(@as(?[]u8, null), m.log_restore_hash); // 空なので clear
@@ -2482,7 +2495,7 @@ test "request_refresh in changes mode: returns refresh_status (unchanged)" {
     const a = std.testing.allocator;
     var m = try Model.init(a, "/r");
     defer m.deinit();
-    var cmd = try update(&m, .request_refresh);
+    var cmd = try updateRef(&m, .request_refresh);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .refresh_status);
 }
@@ -2501,7 +2514,7 @@ test "log_loaded: rejects when not in log mode (R3 stale)" {
         .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len); // 適用されない
@@ -2519,7 +2532,7 @@ test "log_loaded: rejects when generation mismatch (H1 stale)" {
         .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2535,7 +2548,7 @@ test "log_loaded: rejects when skip != 0 (H3 stale)" {
         .request_tip = try a.dupe(u8, ""),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2554,7 +2567,7 @@ test "log_loaded: fresh apply with restore hash restores selection (R4)" {
         .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail);
     try std.testing.expectEqual(@as(usize, 3), m.log_commits.items.len);
@@ -2578,7 +2591,7 @@ test "log_loaded: has_more is false when entries < max_count (M3)" {
         .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(!m.log_has_more);
 }
@@ -2597,7 +2610,7 @@ test "log_loaded: has_more is true when entries >= max_count (M3)" {
         .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(m.log_has_more);
 }
@@ -2614,7 +2627,7 @@ test "log_loaded: empty result clears detail state (R2)" {
         .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(usize, 0), m.log_commits.items.len);
@@ -2637,7 +2650,7 @@ test "log_page_loaded: rejects when generation mismatch (H1 stale)" {
         .entries = entries,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?usize, 3), m.log_page_requested); // 変化無し
@@ -2656,7 +2669,7 @@ test "log_page_loaded: rejects when skip != log_page_requested (R11 stale)" {
         .entries = entries,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2674,7 +2687,7 @@ test "log_page_loaded: rejects when log_page_requested already null" {
         .entries = entries,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2697,7 +2710,7 @@ test "log_page_loaded: appends entries, clears page_requested (R22), reloads det
         .entries = entries,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail); // R10
     try std.testing.expectEqual(@as(usize, 5), m.log_commits.items.len); // 3 + 2
@@ -2722,7 +2735,7 @@ test "log_page_loaded: empty append is no-op for detail but still clears page_re
         .entries = entries,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_commit_detail); // 既存 3 件あるので R10 で再ロード
     try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
@@ -2739,7 +2752,7 @@ test "log_page_failed: clears page_requested and sets error_text" {
         .request_skip = 5, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
@@ -2756,7 +2769,7 @@ test "log_page_failed: rejects on generation mismatch" {
         .request_skip = 5, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested); // 変化無し
@@ -2772,7 +2785,7 @@ test "log_page_failed: rejects on skip mismatch (R11)" {
         .request_skip = 99, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested); // 変化無し
@@ -2787,7 +2800,7 @@ test "log_page_failed: rejects when page_requested already null" {
         .request_skip = 5, .request_generation = 1, .error_text = try a.dupe(u8, "boom"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqualStrings("", m.error_text);
@@ -2803,7 +2816,7 @@ test "log_page_failed_silent: clears page_requested without setting error_text" 
     try m.setStr(&m.error_text, "preexisting");
     var msg = Msg{ .log_page_failed_silent = .{ .request_skip = 5, .request_generation = 1 } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?usize, null), m.log_page_requested);
@@ -2818,7 +2831,7 @@ test "log_page_failed_silent: rejects on stale generation" {
     m.log_request_generation = 99;
     var msg = Msg{ .log_page_failed_silent = .{ .request_skip = 5, .request_generation = 1 } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested); // 変化無し
@@ -2836,7 +2849,7 @@ test "commit_detail_loaded: rejects when not in log mode (R3 stale)" {
     entries[0] = try mkNameStatus(a, 'M', "f.txt");
     var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "h0000"), .entries = entries } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(usize, 0), m.detail_files.items.len); // 適用されない
@@ -2851,7 +2864,7 @@ test "commit_detail_loaded: rejects when hash mismatch (H1 stale)" {
     entries[0] = try mkNameStatus(a, 'M', "f.txt");
     var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "DIFFERENT"), .entries = entries } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(usize, 0), m.detail_files.items.len); // 適用されない
@@ -2866,7 +2879,7 @@ test "commit_detail_loaded: rejects when detail_owner_hash is null" {
     entries[0] = try mkNameStatus(a, 'M', "f.txt");
     var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "h0000"), .entries = entries } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
 }
@@ -2883,7 +2896,7 @@ test "commit_detail_loaded: fresh apply replaces detail_files and resets selecti
     entries[1] = try mkNameStatus(a, 'A', "f2");
     var msg = Msg{ .commit_detail_loaded = .{ .request_hash = try a.dupe(u8, "h0000"), .entries = entries } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqual(@as(usize, 2), m.detail_files.items.len);
@@ -2906,7 +2919,7 @@ test "detail_diff_loaded: rejects when not in log mode (R3 stale)" {
         .text = try a.dupe(u8, "diff body"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqualStrings("", m.detail_diff); // 適用されない
@@ -2923,7 +2936,7 @@ test "detail_diff_loaded: rejects when hash mismatch (H1 stale)" {
         .text = try a.dupe(u8, "diff body"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqualStrings("", m.detail_diff);
@@ -2940,7 +2953,7 @@ test "detail_diff_loaded: rejects when path mismatch (H1 stale)" {
         .text = try a.dupe(u8, "diff body"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqualStrings("", m.detail_diff);
@@ -2958,7 +2971,7 @@ test "detail_diff_loaded: fresh apply sets detail_diff and resets scroll" {
         .text = try a.dupe(u8, "diff body\n+new line\n"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqualStrings("diff body\n+new line\n", m.detail_diff);
@@ -2976,7 +2989,7 @@ test "detail_diff_loaded: rejects when owner is null" {
         .text = try a.dupe(u8, "diff body"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqualStrings("", m.detail_diff);
@@ -3008,7 +3021,7 @@ test "end-to-end: toggle_view_mode then log_loaded then log_cursor_down coordina
     var m = try Model.init(a, "/r");
     defer m.deinit();
     // 1) toggle → load_log
-    var c1 = try update(&m, .toggle_view_mode);
+    var c1 = try updateRef(&m, .toggle_view_mode);
     defer c1.deinit(a);
     try std.testing.expect(c1 == .load_log);
     const gen = c1.load_log.generation;
@@ -3021,12 +3034,12 @@ test "end-to-end: toggle_view_mode then log_loaded then log_cursor_down coordina
         .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var c2 = try update(&m, msg);
+    var c2 = try update(&m, &msg);
     defer c2.deinit(a);
     try std.testing.expect(c2 == .load_commit_detail); // 初回詳細ロード
     try std.testing.expectEqualStrings("h0000", m.detail_owner_hash.?);
     // 3) log_cursor_down → 次のコミットへ
-    var c3 = try update(&m, .log_cursor_down);
+    var c3 = try updateRef(&m, .log_cursor_down);
     defer c3.deinit(a);
     try std.testing.expect(c3 == .load_commit_detail);
     try std.testing.expectEqual(@as(usize, 1), m.log_selected);
@@ -3043,7 +3056,7 @@ test "end-to-end: paging flow (cursor near end → page → append → detail re
     // log_has_more=true なので、selected を境界まで進めると page trigger
     m.log_selected = 0;
     // selected >= len-5 == 0 を満たす（selected=0 は既に境界）→ 次の down で page
-    var c1 = try update(&m, .log_cursor_down);
+    var c1 = try updateRef(&m, .log_cursor_down);
     defer c1.deinit(a);
     try std.testing.expect(c1 == .load_log_page); // page 発火
     try std.testing.expectEqual(@as(?usize, 5), m.log_page_requested);
@@ -3058,13 +3071,13 @@ test "end-to-end: paging flow (cursor near end → page → append → detail re
         .entries = entries,
     } };
     defer msg.deinit(a);
-    var c2 = try update(&m, msg);
+    var c2 = try update(&m, &msg);
     defer c2.deinit(a);
     try std.testing.expect(c2 == .load_commit_detail); // R10: 選択 hash で再ロード
     try std.testing.expectEqual(@as(usize, 7), m.log_commits.items.len); // 5 + 2
     try std.testing.expectEqual(@as(?usize, null), m.log_page_requested); // クリア
     // page 完了後は通常の down が detail ロードを発火できる
-    var c3 = try update(&m, .log_cursor_down);
+    var c3 = try updateRef(&m, .log_cursor_down);
     defer c3.deinit(a);
     try std.testing.expect(c3 == .load_commit_detail);
 }
@@ -3088,7 +3101,7 @@ test "log_loaded: builds graph state on success" {
         .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // H-05: graph state が .valid で構築されていること。
     try std.testing.expect(m.log_graph_state == .valid);
@@ -3105,7 +3118,7 @@ test "git_error in log mode is .none (phase 3a §4.8: no full refresh)" {
     try m.setLogSnapshotTip("h0000");
     var msg = Msg{ .git_error = try a.dupe(u8, "tip expired") };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // §4.8/M3: log 中の git_error は無条件 .none（busy を触らない・安全側）。
     try std.testing.expect(cmd == .none);
@@ -3131,7 +3144,7 @@ test "handleLogLoaded: stores snapshot_tip from request_tip (B1)" {
         .request_tip = try a.dupe(u8, "deadbeef"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // B1: snapshot_tip は appcmd が解決した request_tip から保存される（items[0].hash ではない）。
     try std.testing.expectEqualStrings("deadbeef", m.log_snapshot_tip.?);
@@ -3151,7 +3164,7 @@ test "handleLogLoaded: filter active + no substrate -> suppressed (phase 3b #2)"
         .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // substrate 無（取得失敗等）→ suppress へ劣化・graph 計算スキップ・log_graph_state は .invalid。
     try std.testing.expectEqual(GraphRenderPolicy.suppressed, m.graph_render_policy);
@@ -3174,7 +3187,7 @@ test "handleLogLoaded: filter + substrate -> projected graph valid (phase 3b #2)
         .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = entries, .substrate = sub,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // 投影 graph 構築: rows==commits(2)・policy=.auto・substrate 保存。
     try std.testing.expect(m.log_graph_state == .valid);
@@ -3203,7 +3216,7 @@ test "handleLogPageLoaded: filter+substrate -> re-project-all reconnects cross-p
         .request_tip = try a.dupe(u8, "snap"), .is_unborn = false, .entries = e1, .substrate = sub,
     } };
     defer msg.deinit(a);
-    var c1 = try update(&m, msg);
+    var c1 = try update(&m, &msg);
     defer c1.deinit(a);
     try std.testing.expect(m.log_graph_state == .valid);
     // page1: rows=[E, C]。C(row1) は A 未ロードのため一時 root → down 無し。
@@ -3218,7 +3231,7 @@ test "handleLogPageLoaded: filter+substrate -> re-project-all reconnects cross-p
         .request_tip = try a.dupe(u8, "snap"), .entries = e2,
     } };
     defer lpl_msg.deinit(a);
-    var c2 = try update(&m, lpl_msg);
+    var c2 = try update(&m, &lpl_msg);
     defer c2.deinit(a);
     try std.testing.expect(m.log_graph_state == .valid);
     try std.testing.expectEqual(@as(usize, 3), m.log_graph_state.valid.rows.items.len); // E, C, A
@@ -3241,7 +3254,7 @@ test "handleLogLoaded: clears log_load_error on success (M-N8)" {
         .request_tip = try a.dupe(u8, "snap"),         .is_unborn = false, .entries = entries, .substrate = null,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // M-N8: 成功時は log_load_error がクリアされる。
     try std.testing.expectEqualStrings("", m.log_load_error);
@@ -3262,7 +3275,7 @@ test "handleLogPageLoaded: rejects stale snapshot_tip mismatch (B1)" {
         .request_tip = try a.dupe(u8, "bbb222"), .entries = entries,
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // 不一致 → 破棄・commits は増えない。
     try std.testing.expect(cmd == .none);
@@ -3280,7 +3293,7 @@ test "handleLogPageFailed: clears snapshot_tip for bad revision recovery (MINOR2
         .request_skip = 3, .request_generation = 1, .error_text = try a.dupe(u8, "tip expired"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     // 次回 LoadLog で再解決させるため snapshot_tip をクリア。
@@ -3297,7 +3310,7 @@ test "buildLoadLogCmd: clones current filter_state into load_log (M5)" {
     m.setFilterState(spec);
     // toggle_view_mode で load_log 発火 → filter が伝播しているか。
     m.view_mode = .changes;
-    var cmd = try update(&m, .toggle_view_mode);
+    var cmd = try updateRef(&m, .toggle_view_mode);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     try std.testing.expectEqual(@as(u64, 43), cmd.load_log.generation);
@@ -3315,7 +3328,7 @@ test "handleRequestRefreshLog: clears snapshot_tip + keeps filter (M5/MINOR2)" {
     var spec = FilterSpec.init();
     try spec.addCondition(a, .{ .author = try a.dupe(u8, "bob") });
     m.setFilterState(spec);
-    var cmd = try update(&m, .request_refresh);
+    var cmd = try updateRef(&m, .request_refresh);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     // snapshot_tip はクリア（次回 LoadLog で再解決）。
@@ -3337,7 +3350,7 @@ test "handleLogCursorDown: load_log_page clones filter + uses snapshot_tip (B1/M
     try spec.addCondition(a, .{ .author = try a.dupe(u8, "carol") });
     m.setFilterState(spec);
     m.log_selected = 0; // len-5 == 0 境界 → 次の down で page trigger
-    var cmd = try update(&m, .log_cursor_down);
+    var cmd = try updateRef(&m, .log_cursor_down);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log_page);
     // tip_hash は snapshot_tip から dupe。
@@ -3363,7 +3376,7 @@ test "apply_filter: payload-first transactional success (M4/M-N7)" {
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // load_log 発火・filter が payload から構築されて clone 伝播。
     try std.testing.expect(cmd == .load_log);
@@ -3392,7 +3405,7 @@ test "apply_filter: empty payload normalizes to null filter" {
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     // 空文字 → null 正規化・isEmpty==true。
@@ -3415,7 +3428,7 @@ test "apply_filter: AuthorTooLong sets log_load_error, Model unchanged" {
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     // AuthorTooLong → .none・Model 不変。
     try std.testing.expect(cmd == .none);
@@ -3435,7 +3448,7 @@ test "apply_filter: UTF-8 author preserved through payload → filter" {
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     try std.testing.expectEqualStrings("山田太郎", cmd.load_log.filter.getAuthor().?);
@@ -3453,7 +3466,7 @@ test "clear_filter: resets to auto + isEmpty filter + load_log (B2/M5)" {
     m.graph_render_policy = .suppressed;
     m.log_request_generation = 10;
     try m.setLogSnapshotTip("tip123");
-    var cmd = try update(&m, .clear_filter);
+    var cmd = try updateRef(&m, .clear_filter);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     // filter は空。
@@ -3472,11 +3485,11 @@ test "open_filter_modal / close_filter_modal: toggle flag" {
     var m = try seedLogModel(a, 1);
     defer m.deinit();
     try std.testing.expect(!m.filter_modal_open);
-    var c1 = try update(&m, .open_filter_modal);
+    var c1 = try updateRef(&m, .open_filter_modal);
     defer c1.deinit(a);
     try std.testing.expect(m.filter_modal_open);
     try std.testing.expect(c1 == .none);
-    var c2 = try update(&m, .close_filter_modal);
+    var c2 = try updateRef(&m, .close_filter_modal);
     defer c2.deinit(a);
     try std.testing.expect(!m.filter_modal_open);
     try std.testing.expect(c2 == .none);
@@ -3494,7 +3507,7 @@ test "log_load_failed: stale reject by generation (B4/M3)" {
         .error_text = try a.dupe(u8, "boom"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     // commits はそのまま・error 未設定。
@@ -3513,7 +3526,7 @@ test "log_load_failed: sets log_load_error + clears commits (B4/M3)" {
         .error_text = try a.dupe(u8, "HEAD 解決失敗"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expectEqualStrings("HEAD 解決失敗", m.log_load_error);
@@ -3536,7 +3549,7 @@ test "log_load_failed: null request_tip clears snapshot_tip" {
         .error_text = try a.dupe(u8, "spawn 失敗"),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     // request_tip 無し → snapshot_tip クリア。
@@ -3551,14 +3564,14 @@ test "log_load_failed_silent: generation check only (OOM 極限)" {
     // generation 一致 → .none（log_load_error は触らない）。
     var msg1 = Msg{ .log_load_failed_silent = .{ .request_generation = 5 } };
     defer msg1.deinit(a);
-    var c1 = try update(&m, msg1);
+    var c1 = try update(&m, &msg1);
     defer c1.deinit(a);
     try std.testing.expect(c1 == .none);
     try std.testing.expectEqualStrings("", m.log_load_error);
     // generation 不一致 → .none。
     var msg2 = Msg{ .log_load_failed_silent = .{ .request_generation = 99 } };
     defer msg2.deinit(a);
-    var c2 = try update(&m, msg2);
+    var c2 = try update(&m, &msg2);
     defer c2.deinit(a);
     try std.testing.expect(c2 == .none);
 }
@@ -3575,11 +3588,11 @@ test "apply_filter then clear_filter: policy auto throughout (phase 3b #2 — su
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg1.deinit(a);
-    var c1 = try update(&m, msg1);
+    var c1 = try update(&m, &msg1);
     defer c1.deinit(a);
     try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
     // clear_filter → .auto・substrate 解放。
-    var c2 = try update(&m, .clear_filter);
+    var c2 = try updateRef(&m, .clear_filter);
     defer c2.deinit(a);
     try std.testing.expectEqual(GraphRenderPolicy.auto, m.graph_render_policy);
     try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
@@ -3594,7 +3607,7 @@ test "handleClearFilter: clears topology_substrate (phase 3b #2)" {
     m.setTopologySubstrate(sub);
     try std.testing.expect(m.topology_substrate != null);
     try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
-    var cmd = try update(&m, .clear_filter);
+    var cmd = try updateRef(&m, .clear_filter);
     defer cmd.deinit(a);
     try std.testing.expectEqual(@as(?topology_mod.TopologySubstrate, null), m.topology_substrate);
     try std.testing.expect(m.filter_state.isEmpty());
@@ -3611,7 +3624,7 @@ test "apply_filter: since only validates and stores" {
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     try std.testing.expectEqualStrings("2026-06-01", m.filter_state.getSince().?);
@@ -3632,7 +3645,7 @@ test "apply_filter: paths only parses and stores" {
         },
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .load_log);
     const paths = m.filter_state.getPaths();
@@ -3653,7 +3666,7 @@ test "apply_filter: InvalidDateFormat sets log_load_error, modal stays open (D8)
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expect(m.filter_modal_open);
@@ -3676,7 +3689,7 @@ test "apply_filter: UnterminatedQuote sets log_load_error" {
         },
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(cmd == .none);
     try std.testing.expect(m.filter_state.isEmpty());
@@ -3688,7 +3701,7 @@ test "filter_focus_next: wraps 4→0 (u3, 5 fields, phase 3b #1)" {
     var m = try seedLogModel(a, 0);
     defer m.deinit();
     m.filter_modal_focus = 4;
-    var cmd = try update(&m, .filter_focus_next);
+    var cmd = try updateRef(&m, .filter_focus_next);
     defer cmd.deinit(a);
     try std.testing.expectEqual(@as(u3, 0), m.filter_modal_focus);
 }
@@ -3698,7 +3711,7 @@ test "filter_focus_prev: wraps 0→4 (phase 3b #1)" {
     var m = try seedLogModel(a, 0);
     defer m.deinit();
     m.filter_modal_focus = 0;
-    var cmd = try update(&m, .filter_focus_prev);
+    var cmd = try updateRef(&m, .filter_focus_prev);
     defer cmd.deinit(a);
     try std.testing.expectEqual(@as(u3, 4), m.filter_modal_focus);
 }
@@ -3708,7 +3721,7 @@ test "open_filter_modal: resets focus to 0 (§4.4)" {
     var m = try seedLogModel(a, 0);
     defer m.deinit();
     m.filter_modal_focus = 2;
-    var cmd = try update(&m, .open_filter_modal);
+    var cmd = try updateRef(&m, .open_filter_modal);
     defer cmd.deinit(a);
     try std.testing.expect(m.filter_modal_open);
     try std.testing.expectEqual(@as(u3, 0), m.filter_modal_focus);
@@ -3726,7 +3739,7 @@ test "apply_filter: branch only validates and stores (phase 3b #1)" {
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expectEqualStrings("dev", m.filter_state.getBranch().?);
     try std.testing.expect(cmd == .load_log);
@@ -3745,7 +3758,7 @@ test "apply_filter: branch leading dash rejected (phase 3b #1 §3.4)" {
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(m.filter_state.isEmpty());
     try std.testing.expect(cmd == .none);
@@ -3769,7 +3782,7 @@ test "apply_filter: branch too long rejected (phase 3b #1)" {
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expect(m.filter_state.isEmpty());
     try std.testing.expect(cmd == .none);
@@ -3788,7 +3801,7 @@ test "apply_filter: branch empty normalizes to no branch condition (phase 3b #1)
         .paths = try a.alloc([]u8, 0),
     } };
     defer msg.deinit(a);
-    var cmd = try update(&m, msg);
+    var cmd = try update(&m, &msg);
     defer cmd.deinit(a);
     try std.testing.expectEqual(@as(?[]const u8, null), m.filter_state.getBranch());
     try std.testing.expect(m.filter_state.isEmpty());
