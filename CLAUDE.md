@@ -55,6 +55,7 @@ MVP に含めなかった機能は **`TODO.md` に Goal / Description / Sub Task
 ## 所有権の規約
 - `Msg`/`AppCmd` のペイロードは Model を**借用せず複製所有**し、**消費者が `deinit`**（main が Msg を、解釈器が AppCmd を解放）。
 - `Model` の文字列は persistent allocator 所有、置換時に旧を free（`setStr`/`replaceFiles` はトランザクショナル）。
+- **例外（パフォーマンスチューニング・2026-07-02）**: 現時点では **`Msg.LogLoaded.substrate` のみ**、reducer が Model へ所有権を **move（take）** できる。このため純粋 reducer `update` は `msg: *Msg`（ポインタ渡し）で、`Msg.LogLoaded.takeSubstrate()` が substrate を null 化（disarm）して `Msg.deinit` の二重解放を防ぐ。take は stale reject 通過後・Model 適用成功後に限定。**`AppCmd` は現行どおり**（解釈器が複製所有）。他の Msg バリアントへ move 例外を広げる場合は**個別 spec + `takeXxx()` helper + `checkAllAllocationFailures` による OOM safety test を必須**とする。
 
 ## 描画の gotcha（過去に表示崩れバグを生んだ箇所）
 - **`view.fitPane` は各行をペイン幅に切り詰める**。切り詰めを外すと長い diff 行がオーバーフロー→端末折り返し→上段がスクロールアウトする。
