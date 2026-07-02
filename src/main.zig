@@ -230,7 +230,7 @@ fn applyAppCmd(app: *App, program: anytype, cmd: AppCmd) void {
 /// （所有権規約: Msg の消費者＝ここ）。
 fn step(app: *App, program: anytype, msg_in: Msg) void {
     var msg = msg_in;
-    var cmd = update.update(&app.model, msg) catch |err| {
+    var cmd = update.update(&app.model, &msg) catch |err| {
         msg.deinit(app.gpa);
         // reducer 内 OOM 等。エラー文を Model に載せて継続。
         app.model.setStr(&app.model.error_text, @errorName(err)) catch {};
@@ -644,7 +644,7 @@ fn handleMouse(app: *App, program: *ProgramT, m: zz.MouseEvent) void {
 fn seedInitialStatus(app: *App) void {
     var first = appcmd.run(app.gpa, app.io, app.cwd, .refresh_status) catch return;
     // first を reducer に流す（消費後 deinit）。返り値 AppCmd（多くは load_diff）を 1 回だけ実行。
-    var cmd1 = update.update(&app.model, first) catch {
+    var cmd1 = update.update(&app.model, &first) catch {
         first.deinit(app.gpa);
         return;
     };
@@ -653,7 +653,7 @@ fn seedInitialStatus(app: *App) void {
     switch (cmd1) {
         .load_diff, .stage, .unstage, .commit, .refresh_status, .load_log, .load_log_page, .load_commit_detail, .load_detail_diff => {
             var second = appcmd.run(app.gpa, app.io, app.cwd, cmd1) catch return;
-            var cmd2 = update.update(&app.model, second) catch {
+            var cmd2 = update.update(&app.model, &second) catch {
                 second.deinit(app.gpa);
                 return;
             };
@@ -920,7 +920,7 @@ test "M-N9 race: stale drained git_error does not clear new worker busy" {
     var local: std.ArrayList(Msg) = .empty;
     defer local.deinit(a);
     app.queue.drain(app.io, a, &local);
-    for (local.items) |m| {
+    for (local.items) |*m| {
         var c = update.update(&app.model, m) catch unreachable;
         c.deinit(a);
         try std.testing.expect(app.model.busy); // ← 修正前はここで false（バグ）

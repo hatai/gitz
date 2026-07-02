@@ -209,10 +209,76 @@ pub fn computeIncremental(
     } };
 }
 
+/// Small-buffer optimization（perf phase2/§6.3・codex MAJOR 4 解消）。
+/// `match_lanes` / `before_has` / `agg_lanes` 等、processCommit 内の小アロケーションを
+/// 固定長 `[N]T` へ格納し frontier 幅 ≤ N は alloc ゼロに。超過時は `std.ArrayList(T)` へ
+/// heap fallback（描画欠落/panic/silent truncation 回避）。N=32 は Phase 0 実測 frontier max=1-3
+/// + 実運用同時分岐（10-20）+ 余裕。append 用途と index set/get 用途の両方をサポート。
+fn SmallBuf(comptime T: type, comptime N: usize) type {
+    return struct {
+        const Self = @This();
+        fixed: [N]T = undefined,
+        len: usize = 0,
+        heap: ?std.ArrayList(T) = null,
+
+        pub fn deinit(self: *Self, a: std.mem.Allocator) void {
+            if (self.heap) |*h| h.deinit(a);
+            self.heap = null;
+            self.len = 0;
+        }
+
+        /// append 用途（match_lanes / agg_lanes）。N までは alloc 不要。
+        pub fn append(self: *Self, a: std.mem.Allocator, v: T) !void {
+            if (self.heap) |*h| {
+                try h.append(a, v);
+                return;
+            }
+            if (self.len < N) {
+                self.fixed[self.len] = v;
+                self.len += 1;
+                return;
+            }
+            // overflow → heap fallback（fixed の内容をコピー）
+            var h: std.ArrayList(T) = .empty;
+            try h.ensureTotalCapacity(a, self.len + 1);
+            for (self.fixed[0..self.len]) |x| h.appendAssumeCapacity(x);
+            try h.append(a, v);
+            self.heap = h;
+        }
+
+        /// index 用途（before_has）。サイズ n を確保（n > N は heap）。
+        pub fn ensureSize(self: *Self, a: std.mem.Allocator, n: usize) !void {
+            if (n > N) {
+                var h: std.ArrayList(T) = .empty;
+                try h.resize(a, n);
+                self.heap = h;
+            }
+            self.len = n;
+        }
+        pub fn set(self: *Self, i: usize, v: T) void {
+            if (self.heap) |*h| {
+                h.items[i] = v;
+                return;
+            }
+            self.fixed[i] = v;
+        }
+        pub fn get(self: *const Self, i: usize) T {
+            if (self.heap) |*h| return h.items[i];
+            return self.fixed[i];
+        }
+
+        /// 全要素 slice（append 系・index 系どちらも）。`match_lanes.items` / `before_has[i]` 等。
+        pub fn items(self: *const Self) []const T {
+            if (self.heap) |*h| return h.items;
+            return self.fixed[0..self.len];
+        }
+    };
+}
+
 /// 1 コミットを処理し GraphRow を構築。frontier を破壊的に更新する。
 fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !GraphRow {
     // (1) c.hash と一致する frontier slot を全て列挙（H-01: 重複親の集約）
-    var match_lanes: std.ArrayList(usize) = .empty;
+    var match_lanes: SmallBuf(usize, 32) = .{};
     defer match_lanes.deinit(a);
     for (frontier.slots.items, 0..) |slot, i| {
         if (slot) |h| {
@@ -226,15 +292,17 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
     // 新規 tip append 前に取得することで、追加 slot に up 接続が付かないようにする
     // （新規 tip は前行から伝播していないため up=false が正）。
     const before_len = frontier.slots.items.len;
-    var before_has: []bool = try a.alloc(bool, before_len);
-    defer a.free(before_has);
+    var before_has: SmallBuf(bool, 32) = .{};
+    defer before_has.deinit(a);
+    try before_has.ensureSize(a, before_len);
     for (frontier.slots.items, 0..) |slot, i| {
-        before_has[i] = slot != null;
+        before_has.set(i, slot != null);
     }
 
     // 代表 lane の決定
-    const node_lane: u16 = if (match_lanes.items.len > 0)
-        @intCast(match_lanes.items[0])
+    const ml_items = match_lanes.items();
+    const node_lane: u16 = if (ml_items.len > 0)
+        @intCast(ml_items[0])
     else blk: {
         // 新規 tip: frontier 末尾へ append
         const h = try a.dupe(u8, c.hash);
@@ -248,10 +316,10 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
     frontier.slots.items[node_lane] = null;
 
     // 水平接続: H-01 で集約される余分 match の記録用
-    var agg_lanes: std.ArrayList(usize) = .empty;
+    var agg_lanes: SmallBuf(usize, 32) = .{};
     defer agg_lanes.deinit(a);
-    if (match_lanes.items.len > 1) {
-        for (match_lanes.items[1..]) |ml| {
+    if (ml_items.len > 1) {
+        for (ml_items[1..]) |ml| {
             try agg_lanes.append(a, ml);
             if (frontier.slots.items[ml]) |h| a.free(h);
             frontier.slots.items[ml] = null;
@@ -326,7 +394,7 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
 
     // up 接続: before frontier の各 slot が非 null だった列
     for (0..before_len) |i| {
-        if (i < w and before_has[i]) cells[i].up = true;
+        if (i < w and before_has.get(i)) cells[i].up = true;
     }
     // down 接続: after frontier の各 slot が非 null の列
     for (0..after_len) |i| {
@@ -336,7 +404,7 @@ fn processCommit(a: std.mem.Allocator, frontier: *Frontier, c: log.Commit) !Grap
     cells[node_lane].is_node = true;
 
     // 水平接続（集約）: agg_lanes の各 lane から node_lane へ
-    for (agg_lanes.items) |al| {
+    for (agg_lanes.items()) |al| {
         const lo = @min(al, @as(usize, node_lane));
         const hi = @max(al, @as(usize, node_lane));
         if (lo < w) cells[lo].right = true;
@@ -651,6 +719,51 @@ fn computeAllAndFree(a: std.mem.Allocator, raw: []const u8) !void {
     }
     var state = try computeAll(a, commits, 1, "E");
     state.deinit(a);
+}
+
+test "SmallBuf: append は N 以内で alloc ゼロ・N 超過で heap fallback（perf phase2/§6.3）" {
+    const a = std.testing.allocator;
+    // N=4 で検証（境界値明確化）。
+    var buf: SmallBuf(usize, 4) = .{};
+    defer buf.deinit(a);
+    // N 以内: 固定バッファへ（heap null のまま）
+    for (0..4) |i| try buf.append(a, i);
+    try std.testing.expectEqual(@as(usize, 4), buf.items().len);
+    try std.testing.expect(buf.heap == null);
+    try std.testing.expectEqual(@as(usize, 0), buf.items()[0]);
+    try std.testing.expectEqual(@as(usize, 3), buf.items()[3]);
+    // N 超過（5 件目）: heap fallback・fixed の内容もコピー
+    try buf.append(a, 100);
+    try std.testing.expect(buf.heap != null);
+    try std.testing.expectEqual(@as(usize, 5), buf.items().len);
+    try std.testing.expectEqual(@as(usize, 0), buf.items()[0]);
+    try std.testing.expectEqual(@as(usize, 3), buf.items()[3]);
+    try std.testing.expectEqual(@as(usize, 100), buf.items()[4]);
+}
+
+test "SmallBuf: ensureSize/set/get は N 以内で alloc ゼロ・N 超過で heap（perf phase2/§6.3）" {
+    const a = std.testing.allocator;
+    var buf: SmallBuf(bool, 4) = .{};
+    defer buf.deinit(a);
+    // N 以内
+    try buf.ensureSize(a, 3);
+    try std.testing.expect(buf.heap == null);
+    buf.set(0, true);
+    buf.set(1, false);
+    buf.set(2, true);
+    try std.testing.expectEqual(true, buf.get(0));
+    try std.testing.expectEqual(false, buf.get(1));
+    try std.testing.expectEqual(true, buf.get(2));
+    try std.testing.expectEqual(@as(usize, 3), buf.items().len);
+    // N 超過: heap fallback
+    var big: SmallBuf(bool, 4) = .{};
+    defer big.deinit(a);
+    try big.ensureSize(a, 6);
+    try std.testing.expect(big.heap != null);
+    for (0..6) |i| big.set(i, (i % 2) == 0);
+    try std.testing.expectEqual(true, big.get(0));
+    try std.testing.expectEqual(false, big.get(1));
+    try std.testing.expectEqual(true, big.get(4));
 }
 
 test {

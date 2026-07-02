@@ -75,6 +75,14 @@ pub const Msg = union(enum) {
         is_unborn: bool, // appcmd が headState tri-state で判定
         entries: []@import("git/log.zig").Commit,
         substrate: ?topology.TopologySubstrate, // ★phase 3b #2: filter 活性で非null・投影用 substrate
+
+        /// perf phase2/§6.2: substrate の所有権を Model へ move（take）。フィールドを null 化（disarm）
+        /// して呼出側の Msg.deinit が二重解放しないようにする。stale reject 通過後・Model 適用成功後に限定。
+        pub fn takeSubstrate(self: *LogLoaded) ?topology.TopologySubstrate {
+            const s = self.substrate;
+            self.substrate = null;
+            return s;
+        }
     };
     pub const LogLoadFailed = struct {
         request_generation: u64,

@@ -7,51 +7,25 @@ const std = @import("std");
 pub const Entry = struct {
     hash: []u8,
     parents: [][]u8,
-    pub fn deinit(self: *Entry, a: std.mem.Allocator) void {
-        a.free(self.hash);
-        for (self.parents) |p| a.free(p);
-        a.free(self.parents);
-    }
+    // perf phase2/§6.2: hash/parents は backing arena 内（個別 free 不要）。Entry.deinit は提供しない。
 };
 
+/// phase 3b #2 + perf phase2/§6.2: 全 hash/parents 文字列を **backing arena** へ一括配置し、
+/// parse の O(N×P) 個別 dupe を arena 配下へ集約（`std.testing.allocator` 視点で alloc 数大幅減）。
+/// `hash_index` は backing と別（呼出側 allocator `a`）で keys は entries[].hash を借用。
+/// clone は廃止・Msg から Model へ take（move）で所有権移譲（§6.1 `*Msg` API と組合せ）。
 pub const TopologySubstrate = struct {
-    entries: []Entry, // topo 順（newest-first・rev-list 出力順）
-    hash_index: std.StringHashMap(usize), // hash -> entries index（keys は entries[].hash を借用）
+    arena: std.heap.ArenaAllocator,
+    entries: []Entry, // arena 内（topo 順・newest-first・rev-list 出力順）
+    hash_index: std.StringHashMap(usize), // a 上・hash -> entries index（keys は entries[].hash を借用 = arena 内）
 
     pub fn deinit(self: *TopologySubstrate, a: std.mem.Allocator) void {
-        // StringHashMap は keys を free しない（構造体のみ）→ entries 先に解放しても安全。
-        for (self.entries) |*e| e.deinit(a);
-        a.free(self.entries);
+        // 順序厳守: hash_index 先（keys は entries[].hash を借用 = arena 内・hash_index は keys を free しない）。
+        //   arena を先に解放すると keys が消え hash_index.deinit が freed memory を触り得るため逆順。
+        //   `a` は署名互換で残す（hash_index は init(a) で allocator を内部保持・arena も自己管理）。
+        _ = a;
         self.hash_index.deinit();
-    }
-
-    pub fn clone(self: TopologySubstrate, a: std.mem.Allocator) std.mem.Allocator.Error!TopologySubstrate {
-        const out_entries = try a.alloc(Entry, self.entries.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (out_entries[0..initialized]) |*e| e.deinit(a);
-            a.free(out_entries);
-        }
-        for (self.entries, 0..) |e, i| {
-            const h = try a.dupe(u8, e.hash);
-            errdefer a.free(h);
-            const ps = try a.alloc([]u8, e.parents.len);
-            var pinit: usize = 0;
-            errdefer {
-                for (ps[0..pinit]) |p| a.free(p);
-                a.free(ps);
-            }
-            for (e.parents, 0..) |p, j| {
-                ps[j] = try a.dupe(u8, p);
-                pinit = j + 1;
-            }
-            out_entries[i] = .{ .hash = h, .parents = ps };
-            initialized = i + 1;
-        }
-        var idx = std.StringHashMap(usize).init(a);
-        errdefer idx.deinit();
-        for (out_entries, 0..) |e, i| try idx.put(e.hash, i);
-        return .{ .entries = out_entries, .hash_index = idx };
+        self.arena.deinit();
     }
 };
 
@@ -59,50 +33,35 @@ pub const ParseError = error{ OutOfMemory };
 
 /// `git rev-list --topo-order --parents <tip>` 出力をパース。
 /// 空入力（unborn 等）= entries 空・hash_index 空（valid）。
+/// perf phase2/§6.2: 全 hash/parents を backing arena へ（O(N×P) dupe を arena 配下へ集約）。
+/// hash_index は `a`（呼出側）上へ・keys は entries[].hash を借用。
 pub fn parse(a: std.mem.Allocator, raw: []const u8) ParseError!TopologySubstrate {
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
     var entries_list: std.ArrayList(Entry) = .empty;
-    errdefer {
-        for (entries_list.items) |*e| e.deinit(a);
-        entries_list.deinit(a);
-    }
     var line_it = std.mem.splitScalar(u8, raw, '\n');
     while (line_it.next()) |line| {
         if (line.len == 0) continue; // 末尾改行等の空行
         var tok_it = std.mem.splitScalar(u8, line, ' ');
         const hash_tok = tok_it.next() orelse continue;
-        const hash = try a.dupe(u8, hash_tok);
-        errdefer a.free(hash);
+        const hash = try aa.dupe(u8, hash_tok);
         var parents: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (parents.items) |p| a.free(p);
-            parents.deinit(a);
-        }
         while (tok_it.next()) |pt| {
             if (pt.len == 0) continue;
-            const pd = try a.dupe(u8, pt);
-            errdefer a.free(pd);
-            try parents.append(a, pd);
+            const pd = try aa.dupe(u8, pt);
+            try parents.append(aa, pd);
         }
-        const parents_slice = try parents.toOwnedSlice(a);
-        // toOwnedSlice 後は parents ArrayList は空になり元の errdefer は無害化するので、
-        // 新たに parents_slice の解放を登録する（後続 append 失敗時のリーク防止・log.zig:67-73 と同型）。
-        errdefer {
-            for (parents_slice) |p| a.free(p);
-            a.free(parents_slice);
-        }
-        try entries_list.append(a, .{ .hash = hash, .parents = parents_slice });
+        const parents_slice = try parents.toOwnedSlice(aa);
+        try entries_list.append(aa, .{ .hash = hash, .parents = parents_slice });
     }
-    const entries = try entries_list.toOwnedSlice(a);
-    // toOwnedSlice 後は entries_list の errdefer は無害化（items 空）。entries の各内容を解放する errdefer を登録。
-    errdefer {
-        for (entries) |*e| e.deinit(a);
-        a.free(entries);
-    }
-    var idx = std.StringHashMap(usize).init(a);
+    const entries = try entries_list.toOwnedSlice(aa);
+    var idx = std.StringHashMap(usize).init(a); // hash_index は呼出側 allocator 上
     errdefer idx.deinit();
     for (entries, 0..) |e, i| try idx.put(e.hash, i);
-    return .{ .entries = entries, .hash_index = idx };
+    return .{ .arena = arena, .entries = entries, .hash_index = idx };
 }
+
 
 test "parse: linear (3 commits, each 1 parent)" {
     const a = std.testing.allocator;
@@ -145,17 +104,14 @@ test "parse: trailing newline only yields empty" {
     try std.testing.expectEqual(@as(usize, 0), sub.entries.len);
 }
 
-test "clone: deep-copies entries and hash_index (no shared pointers)" {
+test "parse: arena backing - entries/hash_index が解放されリークゼロ（perf phase2/§6.2）" {
     const a = std.testing.allocator;
     var sub = try parse(a, "C B\nB A\nA\n");
     defer sub.deinit(a);
-    var c = try sub.clone(a);
-    defer c.deinit(a);
-    try std.testing.expectEqual(@as(usize, 3), c.entries.len);
-    try std.testing.expectEqualStrings("C", c.entries[0].hash);
-    try std.testing.expectEqual(@as(?usize, 0), c.hash_index.get("C"));
-    // 独立メモリ
-    try std.testing.expect(sub.entries[0].hash.ptr != c.entries[0].hash.ptr);
+    try std.testing.expectEqual(@as(usize, 3), sub.entries.len);
+    try std.testing.expectEqualStrings("C", sub.entries[0].hash);
+    try std.testing.expectEqual(@as(?usize, 0), sub.hash_index.get("C"));
+    // arena backing: hash 文字列は arena 内（個別 free 不要・deinit で arena 一括解放）
 }
 
 test "parse: no invalid free / leak on allocation failure" {
@@ -166,17 +122,6 @@ fn parseAndFree(a: std.mem.Allocator) !void {
     const raw = "D B C\nC A\nB A\nA\n";
     var sub = try parse(a, raw);
     sub.deinit(a);
-}
-
-test "clone: no invalid free / leak on allocation failure (phase 3b #2 M1)" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneAndFree, .{});
-}
-
-fn cloneAndFree(a: std.mem.Allocator) !void {
-    var sub = try parse(a, "D B C\nC A\nB A\nA\n");
-    defer sub.deinit(a);
-    var c = try sub.clone(a);
-    c.deinit(a);
 }
 
 test {
