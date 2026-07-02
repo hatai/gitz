@@ -338,7 +338,8 @@ pub fn update(model: *Model, msg: *Msg) !AppCmd {
         .detail_select_index => |i| return try handleDetailSelectIndex(model, i),
 
         // --- 結果系 arms（R3 view_mode 検証 + H1 stale reject）---
-        .log_loaded => |ll| return try handleLogLoaded(model, ll),
+        // perf phase2/§6.2: log_loaded は substrate を take するため *Msg を渡す（他は by-value capture のまま）。
+        .log_loaded => return try handleLogLoaded(model, msg),
         .log_page_loaded => |ll| return try handleLogPageLoaded(model, ll),
         .log_page_failed => |lpf| return try handleLogPageFailed(model, lpf.request_generation, lpf.request_skip, lpf.error_text),
         .log_page_failed_silent => |lpfs| return try handleLogPageFailedSilent(model, lpfs.request_generation, lpfs.request_skip),
@@ -563,7 +564,8 @@ fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
 /// - stale reject: view_mode / generation / skip==0 のいずれか不一致で破棄。
 /// - 適用: replaceLogCommits → R4 restore hash で選択復元 → log_has_more 設定 → R2 空 guard →
 ///   setDetailOwnerHash + load_commit_detail。
-fn handleLogLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
+fn handleLogLoaded(model: *Model, msg: *Msg) !AppCmd {
+    const ll = &msg.log_loaded;
     // ★R3/H1: stale reject。
     if (!inLogMode(model)) return .none;
     if (ll.request_generation != model.log_request_generation) return .none;
@@ -614,14 +616,11 @@ fn handleLogLoaded(model: *Model, ll: msgs.Msg.LogLoaded) !AppCmd {
         return try loadCommitDetailForSelection(model);
     }
     // filter 活性:
-    if (ll.substrate) |sub| {
-        // substrate を Model へ deep-copy（Msg は by-value で reducer へ渡るため copy 必須・元は Msg.deinit が解放）。
-        const cloned = sub.clone(model.allocator) catch {
-            model.clearTopologySubstrate();
-            model.graph_render_policy = .suppressed;
-            return try loadCommitDetailForSelection(model);
-        };
-        model.setTopologySubstrate(cloned);
+    if (ll.substrate) |_| {
+        // perf phase2/§6.2: substrate を Model へ **take（move）**（従来の deep-copy 廃止）。
+        // take は stale reject 通過後・replaceLogCommits 成功後・setTopologySubstrate 直前（§6.2 point 4）。
+        // take で ll.substrate は null 化（disarm）→ 呼出側の Msg.deinit は二重解放しない。
+        model.setTopologySubstrate(ll.takeSubstrate().?);
     } else {
         // substrate 取得失敗（StreamTooLong/exit≠0/parse 失敗）→ 従来の suppress へ劣化。
         model.clearTopologySubstrate();
@@ -1968,14 +1967,19 @@ const show_mod = @import("git/show.zig");
 
 /// テスト用 Commit を構築（全フィールド dup・呼び出し側が c.deinit(a) で解放）。
 fn mkCommit(a: std.mem.Allocator, hash: []const u8, subject: []const u8) !log_mod.Commit {
-    return .{
-        .hash = try a.dupe(u8, hash),
-        .parents = try a.alloc([]u8, 0),
-        .author = try a.dupe(u8, "tester"),
-        .epoch_sec = 1000,
-        .subject = try a.dupe(u8, subject),
-        .refs = try a.dupe(u8, ""),
-    };
+    // perf phase2/§6.2: checkAllAllocationFailures 下で部分失敗が漏れないよう errdefer で安全化。
+    var c: log_mod.Commit = undefined;
+    c.hash = try a.dupe(u8, hash);
+    errdefer a.free(c.hash);
+    c.parents = try a.alloc([]u8, 0);
+    errdefer a.free(c.parents);
+    c.author = try a.dupe(u8, "tester");
+    errdefer a.free(c.author);
+    c.subject = try a.dupe(u8, subject);
+    errdefer a.free(c.subject);
+    c.refs = try a.dupe(u8, "");
+    c.epoch_sec = 1000;
+    return c;
 }
 
 /// テスト用 NameStatus を構築（path のみ dup・呼び出し側が ns.deinit(a) で解放）。
@@ -3197,6 +3201,43 @@ test "handleLogLoaded: filter + substrate -> projected graph valid (phase 3b #2)
     // D の投影親は最近親可視祖先 A（gap C,B を飛ばす）。A は root。
     // processCommit: D(down to A), A(root)。
     try std.testing.expectEqual(@as(usize, 1), m.log_graph_state.valid.rows.items[0].cells.len);
+}
+
+test "handleLogLoaded: OOM でリーク/二重 free 無し（perf phase2/§6.2）" {
+    // replaceLogCommits + suppress 経路の全 alloc 失敗点で allocated==freed を検証。
+    // substrate-take 経路は test 3173（filter+substrate 成功・take）+ parseAndFree（substrate parse OOM 安全性）
+    // + projectAndFree（投影 OOM 安全性）+ take は自明な field-null + infallible setTopologySubstrate で担保。
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, handleLogLoadedOomHelper, .{});
+}
+
+fn handleLogLoadedOomHelper(a: std.mem.Allocator) !void {
+    var m = try seedLogModel(a, 0);
+    defer m.deinit();
+    m.log_request_generation = 1;
+    try m.filter_state.addCondition(a, .{ .author = try a.dupe(u8, "t") });
+    const entries = try a.alloc(log_mod.Commit, 2);
+    entries[0] = mkCommit(a, "D", "d") catch |e| {
+        a.free(entries);
+        return e;
+    };
+    entries[1] = mkCommit(a, "A", "a") catch |e| {
+        entries[0].deinit(a);
+        a.free(entries);
+        return e;
+    };
+    const tip = a.dupe(u8, "snap") catch |e| {
+        entries[1].deinit(a);
+        entries[0].deinit(a);
+        a.free(entries);
+        return e;
+    };
+    var msg = Msg{ .log_loaded = .{
+        .request_skip = 0, .request_max_count = 100, .request_generation = 1,
+        .request_tip = tip, .is_unborn = false, .entries = entries, .substrate = null,
+    } };
+    defer msg.deinit(a);
+    var cmd = try update(&m, &msg);
+    cmd.deinit(a);
 }
 
 test "handleLogPageLoaded: filter+substrate -> re-project-all reconnects cross-page edge (phase 3b #2, C1)" {
